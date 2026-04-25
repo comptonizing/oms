@@ -23,12 +23,15 @@
 #pragma once
 
 #include <termios.h>
+#include <regex>
+#include <map>
 
 #include <curl/curl.h>
 
 #include <indibase.h>
 #include <indiweatherinterface.h>
 #include <defaultdevice.h>
+#include <unordered_map>
 
 #include "json.hpp"
 
@@ -36,12 +39,66 @@
 
 using json = nlohmann::json;
 
+/*
+{
+    "env_temperature": 8.56,
+    "env_pressure": 967.52,
+    "env_humidity": 46.0,
+    "env_dewpoint": -2.42,
+    "ir_sky": -18.69,
+    "ir_ambient": 7.07,
+    "ir_diff": 27.25,
+    "rain_capacitance": 188.09,
+    "rain_percentage": 0.0,
+    "rain_temperature": 19.17,
+    "rain_dutycycle": 17.02,
+    "rain_heating": 0.58,
+    "sqm_ir": 0.0,
+    "sqm_full": 137.0,
+    "sqm_vis": 137.0,
+    "sqm_mpsas": 19.12,
+    "sqm_dmpsas": 0.09,
+    "sqm_integration": 600.0,
+    "sqm_gain": 9876.0,
+    "wind_speed": 0.86,
+    "wind_gust": 2.43,
+    "startup": 1.0
+}
+*/
+
+struct weatherData {
+    std::string id;
+    std::string name;
+    std::string label;
+    double minOK;
+    double maxOK;
+    double percWarn;
+    bool critical;
+};
+
+static const weatherData parameters[] = {
+    weatherData {"env_temperature", "WEATHER_TEMPERATURE", "Temperature (C)", -20, 40, 15, false},
+    weatherData {"env_pressure", "WEATHER_PRESSURE", "Pressure (mbar)", 900, 1100, 15, false},
+    weatherData {"env_humidity", "WEATHER_HUMIDITY", "Humidity (%)", 0, 100, 15, false},
+    weatherData {"env_dewpoint", "WEATHER_DEWPOINT", "Dewpoint (C)", -20, 40, 15, false},
+    weatherData {"rain_percentage", "WEATHER_RAIN_PERCENTAGE", "Rain (%)", 0, 5, 15, true},
+    weatherData {"sqm_mpsas", "WEATHER_SQM_MPSAS", "SQM (mpsas)", 15, 23, 15, true},
+    weatherData {"wind_speed", "WEATHER_WIND_SPEED", "Wind (km/h)", 0, 20, 15, true},
+    weatherData {"wind_gust", "WEATHER_WIND_GUST", "Gust (km/h)", 0, 40, 15, true},
+    weatherData {"ir_sky", "WEATHER_IR_SKY", "Sky IR (C)", -30, -15, 15, false},
+    weatherData {"ir_ambient", "WEATHER_IR_AMBIENT", "Sky ambient (C)", -20, 40, 15, false},
+    weatherData {"ir_diff", "WEATHER_IR_DIFF", "Sky difference (C)", 15, 40, 15, true},
+};
+
+
 class OMS : public INDI::DefaultDevice, public INDI::WeatherInterface {
     public:
         OMS();
         ~OMS();
     protected:
         virtual const char *getDefaultName() override;
+        virtual bool Connect() override;
+        virtual bool Disconnect() override;
         virtual bool initProperties() override;
         virtual bool updateProperties() override;
         virtual bool ISNewSwitch(const char * dev, const char * name, ISState * states, char * names[], int n) override;
@@ -53,14 +110,15 @@ class OMS : public INDI::DefaultDevice, public INDI::WeatherInterface {
         virtual bool loadConfig(bool silent = false, const char *property = nullptr) override;
         virtual IPState updateWeather() override;
 
-        ITextVectorProperty AddressTP;
-        IText AddressT[2] {};
+        ITextVectorProperty addressTP;
+        IText addressT[2] {};
     private:
         static constexpr const char *WEATHER_TAB {"Weather"};
 
-        virtual bool Handshake();
-        bool update();
-        std::string readURL(const std::string &url);
+        bool readURL(const std::string &url, std::string &response);
+        int parsePort(const char *str);
+
+        std::string m_url = "";
 };
 
 
