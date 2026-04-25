@@ -4,6 +4,10 @@ import requests
 
 api_v1_page = Blueprint("api_v1_page", __name__)
 
+@api_v1_page.route("/api/v1/id")
+def id():
+    return "OMS"
+
 @api_v1_page.route("/api/v1/weather")
 def weather():
     try:
