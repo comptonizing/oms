@@ -38,11 +38,12 @@ OMS::~OMS() {
 
 bool OMS::Connect() {
     std::string response = "";
+    std::string expected = "OMS API v1";
     if ( ! readURL("/api/v1/id", response) ) {
         return false;
     }
-    if ( response != "OMS" ) {
-        LOG_ERROR("Did not get OMS id");
+    if ( response != expected ) {
+        LOGF_ERROR("Did not get OMS id, expected \"%s\", got \"%s\"", expected.c_str(), response.c_str());
         return false;
     }
 
