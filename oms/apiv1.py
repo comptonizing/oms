@@ -41,6 +41,6 @@ def weather():
                 )
     logger.debug("Response: {}".format(r.text))
     return JSONResponse(
-        content = r.json,
+        content = json.loads(r.text),
         status_code = status.OK
         )
