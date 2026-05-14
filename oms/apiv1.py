@@ -1,6 +1,6 @@
 from nicegui import app
 from http import HTTPStatus as status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import requests
 import logging
 
@@ -13,7 +13,7 @@ __base = "/api/v1/"
 @app.get(__base + "id")
 def id():
     logger.debug("id endpoint call")
-    return "OMS API v1"
+    return Response(content="OMS API v1", media_type='text/plain')
 
 @app.get(__base + "weather")
 def weather():
