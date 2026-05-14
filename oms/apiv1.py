@@ -35,11 +35,12 @@ def weather():
                 content = {
                     "Error": "Got HTTP code {} from endpoint".format(r.status_code),
                     "Status": r.status_code,
-                    "Content": r.content
+                    "Content": r.text
                     },
                 status_code = status.SERVICE_UNAVAILABLE
                 )
+    logger.debug("Response: {}".format(
     return JSONResponse(
-        content = r.text,
+        content = r.json,
         status_code = status.OK
         )
