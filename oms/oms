@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import sys
+import logging
+import argparse
+import asyncio
+from nicegui import ui, app, background_tasks
+
+import settings as s
+import apiv1
+
+
+parser = argparse.ArgumentParser(description = "Observatory Management System")
+parser.add_argument("--settings", required=True, help="Settings json file")
+parser.add_argument("--loglevel", required=False, help="Log level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+args = parser.parse_args()
+
+logging.basicConfig(
+        level = getattr(logging, args.loglevel)
+        )
+
+logger = logging.getLogger(__name__)
+
+s.load(args.settings)
+
+#async def roof_worker():
+#    while True:
+#        try:
+#            print("running")
+#            await asyncio.sleep(0.1)
+#        except Exception as e:
+#            print(e)
+#
+#@app.on_startup
+#async def startup():
+#    background_tasks.create(roof_worker())
+
+@ui.page("/")
+def main():
+    def on_tab_change(e):
+        header_label.set_text(e.value)
+
+    with ui.left_drawer(value=False, top_corner=True, bottom_corner=True) as drawer:
+        ui.button(icon='close', on_click=drawer.hide).props('flat round')
+        with ui.tabs(on_change=on_tab_change).props("vertical") as tabs:
+            tab_status = ui.tab("Status")
+            tab_weather = ui.tab("Weather")
+            tab_roof = ui.tab("Roof")
+            tab_switches = ui.tab("Switches")
+            tab_log = ui.tab("Log")
+            tab_settings = ui.tab("Settings")
+
+    with ui.header(elevated=True).style('background-color: #3874c8').classes('items-center justify-start'):
+        ui.button(icon='menu', on_click=drawer.toggle).props('flat')
+        header_label = ui.label()
+
+    with ui.tab_panels(tabs).classes("w-full"):
+        with ui.tab_panel(tab_status).classes("w-full"):
+            with ui.grid(columns=2).classes("w-full"):
+                with ui.card().classes("w-full"):
+                    ui.image(s.q("weather", "image")).classes("w-full")
+                with ui.grid(columns=2).classes("w-full"):
+                    with ui.card().classes("w-full"):
+                        ui.label("Val 1").classes("w-full")
+                        with ui.card_section().classes("w-full"):
+                            ui.label("Val 1").classes("w-full")
+                    with ui.card().classes("w-full"):
+                        ui.label("Val 2").classes("w-full")
+                        with ui.card_section().classes("w-full"):
+                            ui.label("Val 2").classes("w-full")
+
+
+        with ui.tab_panel(tab_settings):
+            with ui.card().tight():
+                ui.label("Roof")
+                with ui.card_section():
+                    ui.label("Port: {}".format(s.q("roof", "port")))
+                    with ui.card().tight():
+                        ui.label("West")
+                        with ui.card_section():
+                            with ui.grid(columns=2):
+                                ui.label("Open:")
+                                ui.label(s.q("roof", "pins", "west", "open"))
+                                ui.label("Close:")
+                                ui.label(s.q("roof", "pins", "west", "close"))
+                    with ui.card().tight():
+                        ui.label("East")
+                        with ui.card_section():
+                            with ui.grid(columns=2):
+                                ui.label("Open:")
+                                ui.label(s.q("roof", "pins", "east", "open"))
+                                ui.label("Close:")
+                                ui.label(s.q("roof", "pins", "east", "close"))
+            with ui.card().tight():
+                ui.label("Weather")
+                with ui.card_section():
+                    ui.label("URL: {}".format(s.q("weather", "url")))
+                    with ui.card().tight():
+                        ui.label("Database")
+                        with ui.card_section():
+                            with ui.grid(columns=2):
+                                ui.label("URL:")
+                                ui.label(s.q("weather", "database", "url"))
+                                ui.label("User:")
+                                ui.label(s.q("weather", "database", "user"))
+                                ui.label("Password:")
+                                ui.label(s.q("weather", "database", "user"))
+                                ui.label("Organization")
+                                ui.label(s.q("weather", "database", "organization"))
+                                ui.label("Token")
+                                ui.label(s.q("weather", "database", "token"))
+                                ui.label("Bucket")
+                                ui.label(s.q("weather", "database", "bucket"))
+            with ui.card().tight():
+                ui.label("Switches")
+                with ui.card_section():
+                    with ui.grid(columns=3):
+                        ui.label("Switch")
+                        ui.label("Pin")
+                        ui.label("Default state")
+                        for thing in s.q("switches").keys():
+                            ui.label(thing)
+                            ui.label(s.q("switches", thing, "pin"))
+                            ui.label(s.q("switches", thing, "default"))
+
+
+    tabs.set_value("Status")
+
+ui.run(dark=True, port=s.q("network", "port"))

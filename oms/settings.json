@@ -1,0 +1,49 @@
+{
+  "network": {
+    "port": 5000
+  },
+  "roof": {
+    "port": null,
+    "pins": {
+      "west": {
+	"open": 3,
+	"close": 17
+      },
+      "east": {
+	"open": 4,
+	"close": 23
+      }
+    }
+  },
+  "weather": {
+    "refresh": 10,
+    "image": null,
+    "url": null,
+    "database": {
+      "url": null,
+      "user": null,
+      "password": null,
+      "organization": null,
+      "token": null,
+      "bucket": null
+    }
+  },
+  "switches": {
+    "Pier": {
+      "pin": 9,
+      "default": "off"
+    },
+    "PC": {
+      "pin": 7,
+      "default": "off"
+    },
+    "CCTV": {
+      "pin": 10,
+      "default": "last"
+    },
+    "Allsky": {
+      "pin": 8,
+      "default": "last"
+    }
+  }
+}
