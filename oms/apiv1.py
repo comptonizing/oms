@@ -39,7 +39,7 @@ def weather():
                     },
                 status_code = status.SERVICE_UNAVAILABLE
                 )
-    logger.debug("Response: {}".format(
+    logger.debug("Response: {}".format(r.text))
     return JSONResponse(
         content = r.json,
         status_code = status.OK
