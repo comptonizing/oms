@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 import sys
+import time
 import logging
 import argparse
 import asyncio
+import threading
+import cv2
+from PIL import Image, ImageDraw
+import base64
+from io import BytesIO
 from nicegui import ui, app, background_tasks
 
 import settings as s
@@ -34,6 +40,58 @@ s.load(args.settings)
 #async def startup():
 #    background_tasks.create(roof_worker())
 
+
+def grabRTSP(url, timeout=5):
+    logger.debug("Grabbing frame from {}".format(url))
+    try:
+        logger.debug("Opening capture")
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout * 1000)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout * 1000)
+
+        if not cap.isOpened():
+            raise Exception("Failed to open RTSP stream at {}".format(url))
+        logger.debug("Reading frame")
+        ok, frame = cap.read()
+        if not ok:
+            raise Exception("Failed to read frame from stream at {}".format(url))
+        if frame is None:
+            raise Exception("Received empty frame from {}".format(url))
+        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def create_error_image(text: str):
+    img = Image.new('RGB', (640, 360), color=(40, 40, 40))
+    draw = ImageDraw.Draw(img)
+
+    draw.text((20, 20), text, fill=(255, 255, 255))
+
+    buffer = BytesIO()
+    img.save(buffer, format='PNG')
+
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+
+    return f'data:image/png;base64,{encoded}'
+
+
+
+last_stream_image = None
+last_stream_image_lock = threading.Lock()
+
+def capture_loop():
+    global last_stream_image
+    while True:
+        try:
+            frame = grabRTSP(s.q("stream", "rtsp"))
+        except Exception as e:
+            frame = create_error_image(e)
+        with last_stream_image_lock:
+            last_stream_image = frame
+
+
 @ui.page("/")
 def main():
     def on_tab_change(e):
@@ -55,9 +113,11 @@ def main():
 
     with ui.tab_panels(tabs).classes("w-full"):
         with ui.tab_panel(tab_status).classes("w-full"):
-            with ui.grid(columns=2).classes("w-full"):
+            with ui.grid(columns=3).classes("w-full"):
                 with ui.card().classes("w-full"):
-                    ui.image(s.q("weather", "image")).classes("w-full")
+                    status_allsky_image = ui.image(s.q("weather", "image")).classes("w-full")
+                with ui.card().classes("w-full"):
+                    status_stream_image = ui.image(create_error_image("Initializing ...")).classes("w-full")
                 with ui.grid(columns=2).classes("w-full"):
                     with ui.card().classes("w-full"):
                         ui.label("Val 1").classes("w-full")
@@ -134,7 +194,22 @@ def main():
                     ui.label(s.dump(indent=4))
 
 
+    def updateStream():
+        if last_stream_image is not None:
+            with last_stream_image_lock:
+                status_stream_image.set_source(last_stream_image)
 
+    ui.timer(s.q("weather", "refresh"), lambda: status_allsky_image.set_source(s.q("weather", "image") +f'?{time.time()}'))
+    ui.timer(s.q("stream", "refresh"), updateStream)
     tabs.set_value("Status")
+
+
+
+@app.on_startup
+async def startup():
+    threading.Thread(
+        target=capture_loop,
+        daemon=True,
+    ).start()
 
 ui.run(dark=True, port=s.q("network", "port"))
