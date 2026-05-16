@@ -5,6 +5,12 @@ logger = logging.getLogger(__name__)
 
 __settings = None
 
+def get():
+    global __settings
+    if __settings is None:
+        raise ValueError("Settings not initialized")
+    return __settings
+
 def load(fname):
     logger.info("Loading settings from {}".format(fname))
     global __settings
@@ -14,10 +20,7 @@ def load(fname):
 
 def query(*args):
     logger.debug("Query: {}".format(args))
-    global __settings
-    if __settings is None:
-        raise ValueError("Settings not initialized")
-    thing = __settings
+    thing = get()
     for key in args:
         thing = thing[key]
     logger.debug("Result: {}".format(thing))
@@ -25,3 +28,9 @@ def query(*args):
 
 def q(*args):
     return query(*args)
+
+def dump(**kwargs):
+    logger.debug("Settings dump")
+    settings = get()
+    d = json.dumps(settings, **kwargs)
+    return d

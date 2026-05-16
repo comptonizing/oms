@@ -28,6 +28,10 @@
       "bucket": null
     }
   },
+  "stream": {
+    "rtsp": null,
+    "refresh": 5
+  },
   "switches": {
     "Pier": {
       "pin": 9,

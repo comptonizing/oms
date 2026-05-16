@@ -68,28 +68,15 @@ def main():
                         with ui.card_section().classes("w-full"):
                             ui.label("Val 2").classes("w-full")
 
-
         with ui.tab_panel(tab_settings):
             with ui.card().tight():
-                ui.label("Roof")
+                ui.label("Stream")
                 with ui.card_section():
-                    ui.label("Port: {}".format(s.q("roof", "port")))
-                    with ui.card().tight():
-                        ui.label("West")
-                        with ui.card_section():
-                            with ui.grid(columns=2):
-                                ui.label("Open:")
-                                ui.label(s.q("roof", "pins", "west", "open"))
-                                ui.label("Close:")
-                                ui.label(s.q("roof", "pins", "west", "close"))
-                    with ui.card().tight():
-                        ui.label("East")
-                        with ui.card_section():
-                            with ui.grid(columns=2):
-                                ui.label("Open:")
-                                ui.label(s.q("roof", "pins", "east", "open"))
-                                ui.label("Close:")
-                                ui.label(s.q("roof", "pins", "east", "close"))
+                    with ui.grid(columns=2):
+                        ui.label("RTSP")
+                        ui.label(s.q("stream", "rtsp"))
+                        ui.label("Refresh")
+                        ui.label(s.q("stream", "refresh"))
             with ui.card().tight():
                 ui.label("Weather")
                 with ui.card_section():
@@ -111,6 +98,26 @@ def main():
                                 ui.label("Bucket")
                                 ui.label(s.q("weather", "database", "bucket"))
             with ui.card().tight():
+                ui.label("Roof")
+                with ui.card_section():
+                    ui.label("Port: {}".format(s.q("roof", "port")))
+                    with ui.card().tight():
+                        ui.label("West")
+                        with ui.card_section():
+                            with ui.grid(columns=2):
+                                ui.label("Open:")
+                                ui.label(s.q("roof", "pins", "west", "open"))
+                                ui.label("Close:")
+                                ui.label(s.q("roof", "pins", "west", "close"))
+                    with ui.card().tight():
+                        ui.label("East")
+                        with ui.card_section():
+                            with ui.grid(columns=2):
+                                ui.label("Open:")
+                                ui.label(s.q("roof", "pins", "east", "open"))
+                                ui.label("Close:")
+                                ui.label(s.q("roof", "pins", "east", "close"))
+            with ui.card().tight():
                 ui.label("Switches")
                 with ui.card_section():
                     with ui.grid(columns=3):
@@ -121,6 +128,11 @@ def main():
                             ui.label(thing)
                             ui.label(s.q("switches", thing, "pin"))
                             ui.label(s.q("switches", thing, "default"))
+            with ui.card().tight():
+                ui.label("Dump")
+                with ui.card_section():
+                    ui.label(s.dump(indent=4))
+
 
 
     tabs.set_value("Status")
