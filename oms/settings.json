@@ -17,6 +17,7 @@
   },
   "weather": {
     "refresh": 10,
+    "elevation": 0,
     "image": null,
     "url": null,
     "database": {

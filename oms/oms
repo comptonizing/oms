@@ -5,9 +5,10 @@ import logging
 import argparse
 import asyncio
 import threading
+import base64
+import json
 import cv2
 from PIL import Image, ImageDraw
-import base64
 from io import BytesIO
 from nicegui import ui, app, background_tasks
 
@@ -97,6 +98,20 @@ def main():
     def on_tab_change(e):
         header_label.set_text(e.value)
 
+    weather_items = {
+            "env_temperature": "Temperature",
+            "env_humidity": "Humidity",
+            "env_dewpoint": "Dewpoint",
+            "rain_percentage": "Rain",
+            "env_pressure": "Pressure",
+            "sqm_mpsas": "SQM",
+            "ir_sky": "Sky",
+            "ir_diff": "Sky difference",
+            "wind_speed": "Wind",
+            "wind_gust": "Gust"
+            }
+    weather_labels = {}
+
     with ui.left_drawer(value=False, top_corner=True, bottom_corner=True) as drawer:
         ui.button(icon='close', on_click=drawer.hide).props('flat round')
         with ui.tabs(on_change=on_tab_change).props("vertical") as tabs:
@@ -112,8 +127,8 @@ def main():
         header_label = ui.label()
 
     with ui.tab_panels(tabs).classes("w-full"):
-        with ui.tab_panel(tab_status).classes("w-full"):
-            with ui.grid(columns=3).classes("w-full"):
+        with ui.tab_panel(tab_status):
+            with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
                 with ui.card().classes("w-full"):
                     status_allsky_image = ui.image(s.q("weather", "image")).classes("w-full")
                 with ui.card().classes("w-full"):
@@ -128,6 +143,17 @@ def main():
                         with ui.card_section().classes("w-full"):
                             ui.label("Val 2").classes("w-full")
 
+        with ui.tab_panel(tab_weather):
+            with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
+                with ui.card().classes("w-full lg:col-span-1"):
+                    weather_allsky_image = ui.image(s.q("weather", "image")).classes("w-full")
+                with ui.grid().classes('grid-cols-2 lg:grid-cols-5 w-full gap-4 lg:col-span-2'):
+                    for thing in weather_items:
+                        with ui.card().classes("w-full"):
+                            ui.label(weather_items[thing])
+                            with ui.card_section().classes("w-full p-1"):
+                                weather_labels[thing] = ui.label("Loading ...").classes("w-full")
+
         with ui.tab_panel(tab_settings):
             with ui.card().tight():
                 ui.label("Stream")
@@ -140,6 +166,9 @@ def main():
             with ui.card().tight():
                 ui.label("Weather")
                 with ui.card_section():
+                    ui.label("Refresh: {}".format(s.q("weather", "refresh")))
+                    ui.label("Elevation: {}".format(s.q("weather", "elevation")))
+                    ui.label("Image: {}".format(s.q("weather", "image")))
                     ui.label("URL: {}".format(s.q("weather", "url")))
                     with ui.card().tight():
                         ui.label("Database")
@@ -199,7 +228,119 @@ def main():
             with last_stream_image_lock:
                 status_stream_image.set_source(last_stream_image)
 
+    def updateWeather():
+        try:
+            data = apiv1.weather()
+            if data.status_code != 200:
+                raise Exception("Error getting weather")
+        except:
+            for thing in weather_labels.values():
+                thing.set_text("Error")
+                thing.classes("text-xl text-red-500")
+            return
+        d = json.loads(data.body)
+        temperature = d["env_temperature"]
+        colstr = ""
+        if temperature < -20:
+            colstr = "text-red-500"
+        elif temperature < -10:
+            colstr = "text-orange-500"
+        elif temperature < 25:
+            colstr = "text-green-500"
+        elif temperature < 35:
+            colstr = "text-orange-500"
+        else:
+            colstr = "text-red-500"
+        weather_labels["env_temperature"].set_text("{:.1f} °C".format(temperature))
+        weather_labels["env_temperature"].classes("text-xl " + colstr)
+
+        humidity = d["env_humidity"]
+        if humidity < 10:
+            colstr = "text-red-500"
+        elif humidity < 20:
+            colstr = "text-orange-500"
+        elif humidity < 80:
+            colstr = "text-green-500"
+        elif humidity < 90:
+            colstr = "text-orange-500"
+        else:
+            colstr = "text-red-500"
+        weather_labels["env_humidity"].set_text("{:.1f} %".format(humidity))
+        weather_labels["env_humidity"].classes("text-xl " + colstr)
+
+        dewpoint = d["env_dewpoint"]
+        weather_labels["env_dewpoint"].set_text("{:.1f} °C".format(dewpoint))
+        weather_labels["env_dewpoint"].classes("text-xl")
+
+        rain = d["rain_percentage"]
+        if rain < 5:
+            colstr = "text-green-500"
+        elif rain < 10:
+            colstr = "text-orange-500"
+        else:
+            colstr = "text-red-500"
+        weather_labels["rain_percentage"].set_text("{:.0f} %".format(rain))
+        weather_labels["rain_percentage"].classes("text-xl " + colstr)
+
+        elevation = s.q("weather", "elevation")
+        pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
+        weather_labels["env_pressure"].set_text("{:.0f} hPa".format(pressure))
+        weather_labels["env_pressure"].classes("text-xl")
+
+        sqm = d["sqm_mpsas"]
+        if sqm < 18:
+            colstr = "text-red-500"
+        elif sqm < 20:
+            colstr = "text-orange-500"
+        else:
+            colstr = "text-green-500"
+
+        weather_labels["sqm_mpsas"].set_text("{:.1f}".format(sqm))
+        weather_labels["sqm_mpsas"].classes("text-xl " + colstr)
+
+        ir_sky = d["ir_sky"]
+        weather_labels["ir_sky"].set_text("{:.1f} °C".format(ir_sky))
+        weather_labels["ir_sky"].classes("text-xl")
+
+        ir_diff = d["ir_diff"]
+        if ir_diff < 15:
+            colstr = "text-red-500"
+        elif ir_diff < 20:
+            colstr = "text-orange-500"
+        else:
+            colstr = "text-green-500"
+        weather_labels["ir_diff"].set_text("{:.1f} °C".format(ir_diff))
+        weather_labels["ir_diff"].classes("text-xl " + colstr)
+
+        wind_speed = d["wind_speed"]
+        if wind_speed < 15:
+            colstr = "text-green-500"
+        elif wind_speed < 20:
+            colstr = "text-orange-500"
+        else:
+            colstr = "text-red-500"
+        weather_labels["wind_speed"].set_text("{:.1f} km/h".format(wind_speed))
+        weather_labels["wind_speed"].classes("text-xl " + colstr)
+
+        wind_gust = d["wind_gust"]
+        if wind_gust < 30:
+            colstr = "text-green-500"
+        elif wind_gust < 40:
+            colstr = "text-orange-500"
+        else:
+            colstr = "text-red-500"
+        weather_labels["wind_gust"].set_text("{:.1f} km/h".format(wind_gust))
+        weather_labels["wind_gust"].classes("text-xl " + colstr)
+
+
+
+
+
+    updateWeather()
+
     ui.timer(s.q("weather", "refresh"), lambda: status_allsky_image.set_source(s.q("weather", "image") +f'?{time.time()}'))
+    ui.timer(s.q("weather", "refresh"), lambda: weather_allsky_image.set_source(s.q("weather", "image") +f'?{time.time()}'))
+    ui.timer(s.q("weather", "refresh"), updateWeather)
     ui.timer(s.q("stream", "refresh"), updateStream)
     tabs.set_value("Status")
 
