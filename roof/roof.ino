@@ -78,7 +78,7 @@ void cmdStatus() {
         status |= (1 << BITS::SW6);
     }
     if ( digitalRead(PIN_SW7) ) {
-        status |= (1 << BITS::SW8);
+        status |= (1 << BITS::SW7);
     }
     if ( digitalRead(PIN_SW8) ) {
         status |= (1 << BITS::SW8);
