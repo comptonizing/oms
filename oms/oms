@@ -122,6 +122,7 @@ def query_weather(thing, start, window):
 def main():
     def on_tab_change(e):
         header_label.set_text(e.value)
+        drawer.hide()
 
     weather_items = {
             "env_temperature": "Temperature",
