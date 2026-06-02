@@ -22,8 +22,6 @@
     "url": null,
     "database": {
       "url": null,
-      "user": null,
-      "password": null,
       "organization": null,
       "token": null,
       "bucket": null

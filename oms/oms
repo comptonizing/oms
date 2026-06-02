@@ -176,10 +176,6 @@ def main():
                             with ui.grid(columns=2):
                                 ui.label("URL:")
                                 ui.label(s.q("weather", "database", "url"))
-                                ui.label("User:")
-                                ui.label(s.q("weather", "database", "user"))
-                                ui.label("Password:")
-                                ui.label(s.q("weather", "database", "user"))
                                 ui.label("Organization")
                                 ui.label(s.q("weather", "database", "organization"))
                                 ui.label("Token")
