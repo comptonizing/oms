@@ -11,6 +11,8 @@ import cv2
 from PIL import Image, ImageDraw
 from io import BytesIO
 from nicegui import ui, app, background_tasks
+import plotly.graph_objects as go
+import influxdb_client
 
 import settings as s
 import apiv1
@@ -92,6 +94,29 @@ def capture_loop():
         with last_stream_image_lock:
             last_stream_image = frame
 
+def query_weather(thing, start, window):
+    client = influxdb_client.InfluxDBClient(
+            url = s.q("weather", "database", "url"),
+            token = s.q("weather", "database", "token"),
+            org = s.q("weather", "database", "organization")
+            )
+    query_api = client.query_api()
+    query = """from(bucket: "weather")
+      |> range(start: -{})
+      |> filter(fn: (r) => r["_measurement"] == "weather")
+      |> filter(fn: (r) => r["_field"] == "{}")
+      |> aggregateWindow(every: {}, fn: mean, createEmpty: false)
+      |> yield(name: "mean")""".format(start, thing, window)
+    logger.debug("Querying weather: " + query)
+
+    vals = query_api.query(org=s.q("weather", "database", "organization"), query=query).to_values()
+    times = []
+    values = []
+    for ii in range(len(vals)):
+        times.append(list(vals[ii])[4])
+        values.append(list(vals[ii])[5])
+    return times, values
+
 
 @ui.page("/")
 def main():
@@ -111,6 +136,14 @@ def main():
             "wind_gust": "Gust"
             }
     weather_labels = {}
+
+    weather_ranges = {
+            "10m": "1s",
+            "1h": "30s",
+            "6h": "60s",
+            "12h": "120s",
+            "24h": "300s"
+            }
 
     with ui.left_drawer(value=False, top_corner=True, bottom_corner=True) as drawer:
         ui.button(icon='close', on_click=drawer.hide).props('flat round')
@@ -153,6 +186,46 @@ def main():
                             ui.label(weather_items[thing])
                             with ui.card_section().classes("w-full p-1"):
                                 weather_labels[thing] = ui.label("Loading ...").classes("w-full")
+
+            weather_range_select = ui.select(list(weather_ranges.keys()), label="Time range", value="6h").classes("w-full md:w-64 bg-zinc-800")
+            weather_plots = {}
+            with ui.grid().classes('grid-cols-1 lg:grid-cols-2 w-full gap-4'):
+                c = {
+                        "data": [],
+                        "layout": {},
+                        "config": {"displayModeBar": False, "scrollZoom": False, "doubleClick": False},
+                        }
+                with ui.card().classes('w-full'):
+                    weather_plots["Temperature"] = ui.plotly(go.Figure()).classes("w-full")
+                with ui.card().classes('w-full'):
+                    weather_plots["Sky"] = ui.plotly(go.Figure()).classes("w-full")
+                with ui.card().classes('w-full'):
+                    weather_plots["Wind"] = ui.plotly(go.Figure()).classes("w-full")
+                with ui.card().classes('w-full'):
+                    weather_plots["Humidity"] = ui.plotly(go.Figure()).classes("w-full")
+                with ui.card().classes('w-full'):
+                    weather_plots["SQM"] = ui.plotly(go.Figure()).classes("w-full")
+                with ui.card().classes('w-full'):
+                    weather_plots["Rain"] = ui.plotly(go.Figure()).classes("w-full")
+                with ui.card().classes('w-full'):
+                    weather_plots["Pressure"] = ui.plotly(go.Figure()).classes("w-full")
+                with ui.card().classes('w-full'):
+                    weather_plots["Rain Heating"] = ui.plotly(go.Figure()).classes("w-full")
+
+            for thing in weather_plots:
+                plot = weather_plots[thing]
+                fig = plot.figure
+                fig.update_layout(
+                        height = 300,
+                        font_color='white',
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        title = thing,
+                        margin = dict(l=10, r=10, t=50, b=10)
+                        )
+                fig.update_xaxes(gridcolor='#555')
+                fig.update_yaxes(gridcolor='#555')
+                plot.update()
 
         with ui.tab_panel(tab_settings):
             with ui.card().tight():
@@ -224,17 +297,125 @@ def main():
             with last_stream_image_lock:
                 status_stream_image.set_source(last_stream_image)
 
+    def updatePlots():
+        r = weather_range_select.value
+        w = weather_ranges[r]
+
+        plot = weather_plots["Temperature"]
+        fig = plot.figure
+        fig.update_yaxes(title_text="Temperature (°C)")
+        fig.data = []
+        t, v = query_weather("env_temperature", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
+        t, v = query_weather("env_dewpoint", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Dewpoint", line={"color": "orange"})
+        t, v = query_weather("inside_temperature", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "blue"})
+        plot.update()
+
+        plot = weather_plots["Sky"]
+        fig = plot.figure
+        fig.update_yaxes(title_text="Temperature (°C)")
+        fig.data = []
+        t, v = query_weather("ir_sky", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Sky", line={"color": "green"})
+        t, v = query_weather("ir_diff", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Difference", line={"color": "orange"})
+        plot.update()
+
+        plot = weather_plots["Wind"]
+        fig = plot.figure
+        fig.update_yaxes(title_text="Speed (km/h)")
+        fig.data = []
+        t, v = query_weather("wind_speed", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Speed", line={"color": "green"})
+        t, v = query_weather("wind_gust", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Gust", line={"color": "orange"})
+        plot.update()
+
+        plot = weather_plots["Humidity"]
+        fig = plot.figure
+        fig.update_yaxes(title_text="Humidity (%)")
+        fig.data = []
+        t, v = query_weather("env_humidity", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
+        t, v = query_weather("inside_humidity", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "orange"})
+        fig.update_layout(yaxis={"range": [0,100]})
+        plot.update()
+
+        plot = weather_plots["SQM"]
+        fig = plot.figure
+        fig.update_yaxes(title_text="SQM (mag/arcsec^2)")
+        fig.data = []
+        t, v = query_weather("sqm_mpsas", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
+        plot.update()
+
+        plot = weather_plots["Rain"]
+        fig = plot.figure
+        fig.data = []
+        t, v = query_weather("rain_percentage", r, w)
+        fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Amount", line={"color": "green"})
+        t, v = query_weather("rain_capacitance", r, w)
+        fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Capacitance", line={"color": "orange"})
+        fig.update_layout(
+                yaxis={"title": "Rain", "range": [0,100]},
+                yaxis2={
+                    "title": "Capacitance",
+                    "overlaying": "y",
+                    "side": "right",
+                    "range": [0,None],
+                    "gridcolor": '#555'
+                    }
+                )
+        plot.update()
+
+        plot = weather_plots["Pressure"]
+        fig = plot.figure
+        fig.update_yaxes(title_text="Pressure (hPa)")
+        fig.data = []
+        t, v = query_weather("env_pressure", r, w)
+        fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
+        plot.update()
+
+        plot = weather_plots["Rain Heating"]
+        fig = plot.figure
+        fig.data = []
+        t, v = query_weather("rain_dutycycle", r, w)
+        fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Dutycycle", line={"color": "green"})
+        t, v = query_weather("rain_temperature", r, w)
+        fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Temperature", line={"color": "blue"})
+        fig.update_layout(
+                yaxis={"title": "Heating (%)", "range": [0,100]},
+                yaxis2={
+                    "title": "Temperature (%)",
+                    "overlaying": "y",
+                    "side": "right",
+                    "gridcolor": '#555'
+                    }
+                )
+        plot.update()
+
+
+
+
     def updateWeather():
+        labelSize = "text-3xl"
         try:
             data = apiv1.weather()
             if data.status_code != 200:
-                raise Exception("Error getting weather")
-        except:
+                raise Exception("Error getting weather: Status code 200: {}".format(data.body))
+            try:
+                d = json.loads(data.body)
+            except Exception as e:
+                raise Exception("Error parsing json: {}".format(e))
+        except Exception as e:
+            logger.warning("Error geting weather data: {}".format(e))
             for thing in weather_labels.values():
                 thing.set_text("Error")
-                thing.classes("text-xl text-red-500")
+                thing.classes(labelSize + " text-red-500")
             return
-        d = json.loads(data.body)
         temperature = d["env_temperature"]
         colstr = ""
         if temperature < -20:
@@ -248,7 +429,7 @@ def main():
         else:
             colstr = "text-red-500"
         weather_labels["env_temperature"].set_text("{:.1f} °C".format(temperature))
-        weather_labels["env_temperature"].classes("text-xl " + colstr)
+        weather_labels["env_temperature"].classes(labelSize + " " + colstr)
 
         humidity = d["env_humidity"]
         if humidity < 10:
@@ -262,11 +443,11 @@ def main():
         else:
             colstr = "text-red-500"
         weather_labels["env_humidity"].set_text("{:.1f} %".format(humidity))
-        weather_labels["env_humidity"].classes("text-xl " + colstr)
+        weather_labels["env_humidity"].classes(labelSize + " " + colstr)
 
         dewpoint = d["env_dewpoint"]
         weather_labels["env_dewpoint"].set_text("{:.1f} °C".format(dewpoint))
-        weather_labels["env_dewpoint"].classes("text-xl")
+        weather_labels["env_dewpoint"].classes(labelSize)
 
         rain = d["rain_percentage"]
         if rain < 5:
@@ -276,12 +457,12 @@ def main():
         else:
             colstr = "text-red-500"
         weather_labels["rain_percentage"].set_text("{:.0f} %".format(rain))
-        weather_labels["rain_percentage"].classes("text-xl " + colstr)
+        weather_labels["rain_percentage"].classes(labelSize + " " + colstr)
 
         elevation = s.q("weather", "elevation")
         pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
         weather_labels["env_pressure"].set_text("{:.0f} hPa".format(pressure))
-        weather_labels["env_pressure"].classes("text-xl")
+        weather_labels["env_pressure"].classes(labelSize)
 
         sqm = d["sqm_mpsas"]
         if sqm < 18:
@@ -292,11 +473,11 @@ def main():
             colstr = "text-green-500"
 
         weather_labels["sqm_mpsas"].set_text("{:.1f}".format(sqm))
-        weather_labels["sqm_mpsas"].classes("text-xl " + colstr)
+        weather_labels["sqm_mpsas"].classes(labelSize + " " + colstr)
 
         ir_sky = d["ir_sky"]
         weather_labels["ir_sky"].set_text("{:.1f} °C".format(ir_sky))
-        weather_labels["ir_sky"].classes("text-xl")
+        weather_labels["ir_sky"].classes(labelSize)
 
         ir_diff = d["ir_diff"]
         if ir_diff < 15:
@@ -306,7 +487,7 @@ def main():
         else:
             colstr = "text-green-500"
         weather_labels["ir_diff"].set_text("{:.1f} °C".format(ir_diff))
-        weather_labels["ir_diff"].classes("text-xl " + colstr)
+        weather_labels["ir_diff"].classes(labelSize + " " + colstr)
 
         wind_speed = d["wind_speed"]
         if wind_speed < 15:
@@ -316,7 +497,7 @@ def main():
         else:
             colstr = "text-red-500"
         weather_labels["wind_speed"].set_text("{:.1f} km/h".format(wind_speed))
-        weather_labels["wind_speed"].classes("text-xl " + colstr)
+        weather_labels["wind_speed"].classes(labelSize + " " + colstr)
 
         wind_gust = d["wind_gust"]
         if wind_gust < 30:
@@ -326,17 +507,18 @@ def main():
         else:
             colstr = "text-red-500"
         weather_labels["wind_gust"].set_text("{:.1f} km/h".format(wind_gust))
-        weather_labels["wind_gust"].classes("text-xl " + colstr)
-
-
-
+        weather_labels["wind_gust"].classes(labelSize + " " + colstr)
 
 
     updateWeather()
+    updatePlots()
+
+    weather_range_select.on_value_change(updatePlots)
 
     ui.timer(s.q("weather", "refresh"), lambda: status_allsky_image.set_source(s.q("weather", "image") +f'?{time.time()}'))
     ui.timer(s.q("weather", "refresh"), lambda: weather_allsky_image.set_source(s.q("weather", "image") +f'?{time.time()}'))
     ui.timer(s.q("weather", "refresh"), updateWeather)
+    ui.timer(s.q("weather", "refresh"), updatePlots)
     ui.timer(s.q("stream", "refresh"), updateStream)
     tabs.set_value("Status")
 
