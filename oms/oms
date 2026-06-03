@@ -426,7 +426,7 @@ def main():
         fig.update_layout(
                 yaxis={"title": "Heating (%)", "range": [0,100]},
                 yaxis2={
-                    "title": "Temperature (%)",
+                    "title": "Temperature (°C)",
                     "overlaying": "y",
                     "side": "right",
                     "gridcolor": '#555'
