@@ -19,7 +19,7 @@ def id():
 @app.get(__base + "weather")
 def weather():
     logger.debug("weather endpoint call")
-    url = s.q("weather", "url")
+    url = s.q("weather_url")
     try:
         logger.debug("Getting weather from {}".format(url))
         r = requests.get(url)

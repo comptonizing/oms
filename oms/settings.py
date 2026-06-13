@@ -1,36 +1,48 @@
 import json
 import logging
 
+from nicegui import app, ui
+
 logger = logging.getLogger(__name__)
 
-__settings = None
+DEFAULTS = dict(
+        stream_rtsp = "",
+        stream_refresh = 10,
+        weather_refresh = 10,
+        weather_elevation = 0,
+        weather_image = "",
+        weather_url = "",
+        weather_db_url = "",
+        weather_db_org = "",
+        weather_db_token = "",
+        weather_db_bucket = "",
+        roof_port = "",
+        roof_pins_west_open = 3,
+        roof_pins_west_close = 17,
+        roof_pins_east_open = 4,
+        roof_pins_east_close = 23,
+        )
 
-def get():
-    global __settings
-    if __settings is None:
-        raise ValueError("Settings not initialized")
-    return __settings
+async def init():
+    for key, value in DEFAULTS.items():
+        app.storage.general.setdefault(key, value)
 
-def load(fname):
-    logger.info("Loading settings from {}".format(fname))
-    global __settings
-    with open(fname) as f:
-        __settings = json.load(f)
-    logger.debug("Settings: {}". format(json.dumps(__settings, indent=4)))
-
-def query(*args):
-    logger.debug("Query: {}".format(args))
-    thing = get()
-    for key in args:
-        thing = thing[key]
-    logger.debug("Result: {}".format(thing))
-    return thing
+def query(thing):
+    logger.debug("Query: {}".format(thing))
+    ret = app.storage.general[thing]
+    logger.debug("Result: {}".format(ret))
+    return ret
 
 def q(*args):
     return query(*args)
 
+def put(thing, value):
+    logger.debug("Set: {}: {}".format(thing, value))
+    app.storage.general[thing] = value
+
+def p(thing, value):
+    return put(thing, value)
+
 def dump(**kwargs):
     logger.debug("Settings dump")
-    settings = get()
-    d = json.dumps(settings, **kwargs)
-    return d
+    return json.dumps(dict(app.storage.general), **kwargs)

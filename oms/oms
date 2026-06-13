@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import sys
 import time
 import logging
@@ -8,9 +9,11 @@ import threading
 import base64
 import json
 import cv2
+from pathlib import Path
 from PIL import Image, ImageDraw
 from io import BytesIO
 from nicegui import ui, app, background_tasks
+from nicegui.storage import Storage
 import plotly.graph_objects as go
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
 
@@ -20,7 +23,8 @@ import apiv1
 
 
 parser = argparse.ArgumentParser(description = "Observatory Management System")
-parser.add_argument("--settings", required=True, help="Settings json file")
+parser.add_argument("--storage", required=True, help="Path to app storage")
+parser.add_argument("--port", required=False, help="Network port", type=int, default=5000)
 parser.add_argument("--loglevel", required=False, help="Log level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
 args = parser.parse_args()
 
@@ -30,7 +34,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-s.load(args.settings)
+os.environ["NICEGUI_STORAGE_PATH"] = args.storage
 
 #async def roof_worker():
 #    while True:
@@ -88,8 +92,11 @@ last_stream_image_lock = threading.Lock()
 def capture_loop():
     global last_stream_image
     while True:
+        if s.q("stream_rtsp") == "":
+            frame = create_error_image("RTSP not configured")
+            continue
         try:
-            frame = grabRTSP(s.q("stream", "rtsp"))
+            frame = grabRTSP(s.q("stream_rtsp"))
         except Exception as e:
             frame = create_error_image(e)
         with last_stream_image_lock:
@@ -104,7 +111,7 @@ async def query_weather(api, thing, start, window):
       |> yield(name: "mean")""".format(start, thing, window)
     logger.debug("Querying weather: " + query)
 
-    result = await api.query(org=s.q("weather", "database", "organization"), query=query)
+    result = await api.query(org=s.q("weather_db_org"), query=query)
     vals = result.to_values()
     times = []
     values = []
@@ -142,6 +149,17 @@ def main():
         update_plot(plot)
         return plot
 
+    def save_settings():
+        for thing in settings.keys():
+            logger.debug("Setting {}: {}".format(thing, settings[thing].value))
+            s.p(thing, settings[thing].value)
+        influx_client = InfluxDBClientAsync(
+                url = s.q("weather_db_url"),
+                token = s.q("weather_db_token"),
+                org = s.q("weather_db_org"),
+                )
+        query_api = influx_client.query_api()
+
     weather_items = {
             "env_temperature": "Temperature",
             "env_humidity": "Humidity",
@@ -165,11 +183,13 @@ def main():
             }
 
     influx_client = InfluxDBClientAsync(
-            url = s.q("weather", "database", "url"),
-            token = s.q("weather", "database", "token"),
-            org = s.q("weather", "database", "organization")
+            url = s.q("weather_db_url"),
+            token = s.q("weather_db_token"),
+            org = s.q("weather_db_org"),
             )
     query_api = influx_client.query_api()
+
+    settings = {}
 
     ui.page_title("OMS")
     with ui.left_drawer(value=False, top_corner=True, bottom_corner=True) as drawer:
@@ -190,7 +210,7 @@ def main():
         with ui.tab_panel(tab_status):
             with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
                 with ui.card().classes("w-full"):
-                    status_allsky_image = ui.image(s.q("weather", "image")).classes("w-full")
+                    status_allsky_image = ui.image(s.q("weather_image")).classes("w-full")
                 with ui.card().classes("w-full"):
                     status_stream_image = ui.image(create_error_image("Initializing ...")).classes("w-full")
                 with ui.grid(columns=2).classes("w-full"):
@@ -206,7 +226,7 @@ def main():
         with ui.tab_panel(tab_weather):
             with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
                 with ui.card().classes("w-full lg:col-span-1"):
-                    weather_allsky_image = ui.image(s.q("weather", "image")).classes("w-full")
+                    weather_allsky_image = ui.image(s.q("weather_image")).classes("w-full")
                 with ui.grid().classes('grid-cols-2 lg:grid-cols-5 w-full gap-4 lg:col-span-2'):
                     for thing in weather_items:
                         with ui.card().classes("w-full"):
@@ -234,69 +254,29 @@ def main():
                 with ui.card().classes('w-full'):
                     weather_plots["Rain Heating"] = make_plot("Rain Heating")
 
+
         with ui.tab_panel(tab_settings):
-            with ui.card().tight():
+            with ui.card().tight().classes("w-full"):
                 ui.label("Stream")
-                with ui.card_section():
-                    with ui.grid(columns=2):
-                        ui.label("RTSP")
-                        ui.label(s.q("stream", "rtsp"))
-                        ui.label("Refresh")
-                        ui.label(s.q("stream", "refresh"))
-            with ui.card().tight():
+                with ui.card_section().classes("w-full"):
+                    settings["stream_rtsp"] = ui.input("RTSP URL", value=s.q("stream_rtsp")).classes("w-full")
+                    settings["stream_refresh"] = ui.number("Refresh (s)", value=s.q("stream_refresh"))
+            with ui.card().tight().classes("w-full"):
                 ui.label("Weather")
-                with ui.card_section():
-                    ui.label("Refresh: {}".format(s.q("weather", "refresh")))
-                    ui.label("Elevation: {}".format(s.q("weather", "elevation")))
-                    ui.label("Image: {}".format(s.q("weather", "image")))
-                    ui.label("URL: {}".format(s.q("weather", "url")))
-                    with ui.card().tight():
-                        ui.label("Database")
-                        with ui.card_section():
-                            with ui.grid(columns=2):
-                                ui.label("URL:")
-                                ui.label(s.q("weather", "database", "url"))
-                                ui.label("Organization")
-                                ui.label(s.q("weather", "database", "organization"))
-                                ui.label("Token")
-                                ui.label(s.q("weather", "database", "token"))
-                                ui.label("Bucket")
-                                ui.label(s.q("weather", "database", "bucket"))
-            with ui.card().tight():
-                ui.label("Roof")
-                with ui.card_section():
-                    ui.label("Port: {}".format(s.q("roof", "port")))
-                    with ui.card().tight():
-                        ui.label("West")
-                        with ui.card_section():
-                            with ui.grid(columns=2):
-                                ui.label("Open:")
-                                ui.label(s.q("roof", "pins", "west", "open"))
-                                ui.label("Close:")
-                                ui.label(s.q("roof", "pins", "west", "close"))
-                    with ui.card().tight():
-                        ui.label("East")
-                        with ui.card_section():
-                            with ui.grid(columns=2):
-                                ui.label("Open:")
-                                ui.label(s.q("roof", "pins", "east", "open"))
-                                ui.label("Close:")
-                                ui.label(s.q("roof", "pins", "east", "close"))
-            with ui.card().tight():
-                ui.label("Switches")
-                with ui.card_section():
-                    with ui.grid(columns=3):
-                        ui.label("Switch")
-                        ui.label("Pin")
-                        ui.label("Default state")
-                        for thing in s.q("switches").keys():
-                            ui.label(thing)
-                            ui.label(s.q("switches", thing, "pin"))
-                            ui.label(s.q("switches", thing, "default"))
-            with ui.card().tight():
-                ui.label("Dump")
-                with ui.card_section():
-                    ui.label(s.dump(indent=4))
+                with ui.card_section().classes("w-full"):
+                    settings["weather_refresh"] = ui.number("Refresh (s)", value=s.q("weather_refresh"))
+                    settings["weather_elevation"] = ui.number("Elevation (m)", value=s.q("weather_elevation"))
+                    settings["weather_image"] = ui.input("URL for latest allsky image", value=s.q("weather_image"))
+                    settings["weather_url"] = ui.input("URL for weather data scraping", value=s.q("weather_url"))
+                    settings["weather_db_url"] = ui.input("Weather database URL", value=s.q("weather_db_url"))
+                    settings["weather_db_org"] = ui.input("Weather database organization", value=s.q("weather_db_org"))
+                    settings["weather_db_token"] = ui.input("Weather database token", value=s.q("weather_db_token"))
+                    settings["weather_db_bucket"] = ui.input("Weather database bucket", value=s.q("weather_db_bucket"))
+
+
+            ui.button("Save & apply", on_click=save_settings)
+
+
 
 
     def updateStream():
@@ -304,7 +284,7 @@ def main():
             with last_stream_image_lock:
                 status_stream_image.set_source(last_stream_image)
 
-    async def updatePlots():
+    async def _updatePlots():
         r = weather_range_select.value
         w = weather_ranges[r]
 
@@ -434,6 +414,29 @@ def main():
                 )
         update_plot(plot)
 
+    async def updatePlots():
+        try:
+            for plot in weather_plots.values():
+                plot.figure.update_layout(annotations=[])
+            await _updatePlots()
+        except Exception as e:
+            for plot in weather_plots.values():
+                plot.figure.data = []
+                plot.figure.update_layout(
+                        annotations=[dict(
+                            text='No data available (check logs)',
+                            xref='paper', yref='paper',
+                            x=0.5, y=0.5,
+                            xanchor='center', yanchor='middle',
+                            showarrow=False,
+                            font=dict(size=16, color='gray'),
+                        )],
+                        xaxis=dict(visible=False),
+                        yaxis=dict(visible=False),
+                    )
+                update_plot(plot)
+
+
 
 
 
@@ -448,7 +451,7 @@ def main():
             except Exception as e:
                 raise Exception("Error parsing json: {}".format(e))
         except Exception as e:
-            logger.warning("Error geting weather data: {}".format(e))
+            logger.warning("Error getting weather data: {}".format(e))
             for thing in weather_labels.values():
                 thing.set_text("Error")
                 thing.classes(labelSize + " text-red-500")
@@ -496,7 +499,7 @@ def main():
         weather_labels["rain_percentage"].set_text("{:.0f} %".format(rain))
         weather_labels["rain_percentage"].classes(labelSize + " " + colstr)
 
-        elevation = s.q("weather", "elevation")
+        elevation = s.q("weather_elevation")
         pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
         weather_labels["env_pressure"].set_text("{:.0f} hPa".format(pressure))
         weather_labels["env_pressure"].classes(labelSize)
@@ -552,20 +555,21 @@ def main():
 
     weather_range_select.on_value_change(updatePlots)
 
-    ui.timer(s.q("weather", "refresh"), lambda: status_allsky_image.set_source(s.q("weather", "image") +f'?{time.time()}'))
-    ui.timer(s.q("weather", "refresh"), lambda: weather_allsky_image.set_source(s.q("weather", "image") +f'?{time.time()}'))
-    ui.timer(s.q("weather", "refresh"), updateWeather)
-    ui.timer(s.q("weather", "refresh"), updatePlots)
-    ui.timer(s.q("stream", "refresh"), updateStream)
+    ui.timer(s.q("weather_refresh"), lambda: status_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
+    ui.timer(s.q("weather_refresh"), lambda: weather_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
+    ui.timer(s.q("weather_refresh"), updateWeather)
+    ui.timer(s.q("weather_refresh"), updatePlots)
+    ui.timer(s.q("stream_refresh"), updateStream)
     tabs.set_value("Status")
-
 
 
 @app.on_startup
 async def startup():
+    await s.init()
     threading.Thread(
         target=capture_loop,
         daemon=True,
     ).start()
 
-ui.run(dark=True, port=s.q("network", "port"))
+
+ui.run(dark=True, port=args.port)
