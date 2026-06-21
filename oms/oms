@@ -12,13 +12,15 @@ import cv2
 from pathlib import Path
 from PIL import Image, ImageDraw
 from io import BytesIO
-from nicegui import ui, app, background_tasks
+from nicegui import ui, app, background_tasks, Client
 from nicegui.storage import Storage
 import plotly.graph_objects as go
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
 
 
+from container import Container
 import settings as s
+from switch import Switch, State
 import apiv1
 
 
@@ -121,6 +123,121 @@ async def query_weather(api, thing, start, window):
     return times, values
 
 
+updateQueue = asyncio.Queue()
+updateCallbacks: dict[str, callable] = {}
+
+async def updateWorker():
+    while True:
+        thing = await updateQueue.get()
+        logger.debug("update workger got event {}".format(thing))
+        for clientId, client in list(Client.instances.items()):
+            if clientId not in updateCallbacks:
+                continue
+            async def run(cid=clientId, c=client):
+                try:
+                    with c:
+                        await updateCallbacks[cid](thing)
+                except Exception as e:
+                    logger.warning("Error running callback on client {}:\n{}".format(cid, e))
+            logger.debug("Dispatching event for client {}: {}".format(clientId, thing))
+            asyncio.create_task(run())
+
+def pinUsedForRoof(pin):
+    l = [
+            s.q("roof_pins_west_open"),
+            s.q("roof_pins_west_close"),
+            s.q("roof_pins_east_open"),
+            s.q("roof_pins_east_close")
+            ]
+    return pin in l
+
+
+switches = {}
+
+def initSwitch(name, pin, init, last):
+    if init == "on":
+        initState = State.ON
+    elif init == "off":
+        initState = State.OFF
+    elif init == "last":
+        if last == "on":
+            initState = State.ON
+        elif last == "off":
+            initState = State.OFF
+    switches[name] = {
+            "switch": Switch(pin, init=initState),
+            "init": init
+            }
+
+def deinitSwitch(name):
+    pass
+
+def initSwitches():
+    stored = s.q("switches")
+    toRemove = []
+    for name in stored:
+        if pinUsedForRoof(stored[name]["pin"]):
+            logger.warn("Switch for {} with pin {} is already in use for roof, removing".format(name, stored[name]["pin"]))
+            del stored[name]
+    s.p("switches", stored)
+    for name in stored:
+        pin = stored[name]["pin"]
+        init = stored[name]["init"]
+        last = stored[name]["last"]
+        initSwitch(name, pin, init, last)
+
+addSwitchLock = threading.Lock()
+def addSwitch(name, pin, init):
+    with addSwitchLock:
+        logger.debug("Adding switch {} pin {} initial {}".format(name, pin, init))
+        if pinUsedForRoof(pin):
+            raise ValueError("Pin {} already used for roof".format(pin))
+        if name in switches.keys():
+            raise ValueError("Switch with name {} already defined".format(name))
+        for thing in switches:
+            if switches[thing]["switch"].pin == pin:
+                raise ValueError("Pin {} already used for switch {}".format(pin, thing))
+        last = init
+        if last == "last":
+            last = "off"
+        initSwitch(name, pin, init, last)
+        stored = s.q("switches")
+        stored[name] = {
+                "pin": pin,
+                "init": init,
+                "last": last,
+                }
+        s.p("switches", stored)
+        updateQueue.put_nowait(["addSwitch", name])
+
+removeSwitchLock = threading.Lock()
+def removeSwitch(name):
+    with removeSwitchLock:
+        logger.debug("Removing switch {}".format(name))
+        stored = s.q("switches")
+        if name in stored:
+            del stored[name]
+            s.p("switches", stored)
+        if name in switches:
+            del switches[name]
+        updateQueue.put_nowait(["removeSwitch", name])
+
+def editSwitch(name, init):
+    switches[name]["init"] = init
+    stored = s.q("switches")
+    stored[name]["init"] = init
+    s.p("switches", stored)
+
+setSwitchStateLock = threading.Lock()
+def setSwitchState(name, state):
+    with setSwitchStateLock:
+        switches[name]["switch"].setState(State.fromString(state))
+        stored = s.q("switches")
+        stored[name]["last"] = state
+        s.p("switches", stored)
+        updateQueue.put_nowait(["setSwitchState", name, state])
+
+
 @ui.page("/")
 def main():
     def on_tab_change(e):
@@ -148,6 +265,7 @@ def main():
         fig.update_yaxes(gridcolor='#555')
         update_plot(plot)
         return plot
+
 
     def save_settings():
         for thing in settings.keys():
@@ -204,7 +322,7 @@ def main():
 
     with ui.header(elevated=True).style('background-color: #3874c8').classes('items-center justify-start'):
         ui.button(icon='menu', on_click=drawer.toggle).props('flat')
-        header_label = ui.label()
+        header_label = ui.label().classes("text-4xl")
 
     with ui.tab_panels(tabs).classes("w-full"):
         with ui.tab_panel(tab_status):
@@ -254,6 +372,68 @@ def main():
                 with ui.card().classes('w-full'):
                     weather_plots["Rain Heating"] = make_plot("Rain Heating")
 
+        with ui.tab_panel(tab_switches):
+            switches_gui = {}
+            switches_grid = ui.grid().classes('grid-cols-1 lg:grid-cols-8 w-full gap-4')
+
+            with ui.dialog() as removeSwitchDialog, ui.card().classes("w-80"):
+                removeSwitchQuestion = ui.label().style('white-space: pre-line')
+                switchPendingRemove = Container()
+                with ui.row().classes("justify-end w-full"):
+                    def yes():
+                        removeSwitch(switchPendingRemove.get())
+                        removeSwitchDialog.close()
+
+                    ui.button('Yes', on_click=yes)
+                    ui.button('No', on_click=removeSwitchDialog.close)
+
+
+            with ui.dialog() as editSwitchDialog, ui.card().classes("w-120"):
+                editSwitchText = ui.label().style("white-space: pre-line")
+                switchPendingEdit = Container()
+                with ui.grid(columns=2).classes("w-full"):
+                    ui.label("On startup: ")
+                    editInitToggle = ui.toggle(["off", "on", "last"])
+                with ui.row().classes("justify-end"):
+                    def cancel():
+                        editSwitchDialog.close()
+                    ui.button("Cancel", on_click=cancel)
+                    def save():
+                        try:
+                            editSwitch(switchPendingEdit.get(), editInitToggle.value)
+                            ui.notify("Saved", type="positive")
+                        except ValueError as e:
+                            ui.notify("Error adding switch: {}".format(e), type="negative")
+                        editSwitchDialog.close()
+                    ui.button("Save", on_click=save)
+
+
+            with ui.dialog() as addSwitchDialog, ui.card():
+                name = ui.input(label="Name", validation={"Name is required": lambda value: bool(value and value.strip())})
+                pin = ui.input(label="Pin", validation={"Pin must be a positive integer": lambda value: value.isdigit() and int(value) >= 0})
+                with ui.grid(columns=2).classes("w-full"):
+                    ui.label("On startup: ")
+                    init = ui.toggle(["off", "on", "last"])
+                    init.set_value("off")
+                with ui.row().classes("justify-end"):
+                    def cancel():
+                        addSwitchDialog.close()
+
+                    ui.button("Cancel", on_click=cancel)
+                    def save():
+                        if not name.validate():
+                            return
+                        if not pin.validate():
+                            return
+                        try:
+                            addSwitch(name.value, int(pin.value), init.value)
+                        except ValueError as e:
+                            ui.notify("Error adding switch: {}".format(e), type="negative")
+                        addSwitchDialog.close()
+                    ui.button("Save", on_click=save)
+
+            ui.button("Add", on_click = addSwitchDialog.open)
+
 
         with ui.tab_panel(tab_settings):
             with ui.card().tight().classes("w-full"):
@@ -273,10 +453,66 @@ def main():
                     settings["weather_db_token"] = ui.input("Weather database token", value=s.q("weather_db_token"))
                     settings["weather_db_bucket"] = ui.input("Weather database bucket", value=s.q("weather_db_bucket"))
 
-
             ui.button("Save & apply", on_click=save_settings)
 
 
+    def addSwitchToGui(name):
+        with switches_grid:
+            with ui.card().classes("w-full") as card:
+                ui.label("{}".format(name)).classes("text-4xl")
+                ui.label("Pin {}".format(switches[name]["switch"].pin))
+                with ui.card_section().classes("w-full"):
+                    with ui.row().classes("w-full justify-center"):
+                        toggle = ui.toggle(["off", "on"]).props("size=xl color=black")
+                        def switchToggle(name):
+                            if toggle.value == "on":
+                                color = "green"
+                            elif toggle.value == "off":
+                                color = "red"
+                            toggle.props(f'toggle-color={color}')
+                            toggle.update()
+                            setSwitchState(name, toggle.value)
+                        toggle.on("update:model-value", lambda _: switchToggle(name))
+                    with ui.grid(columns=2).classes("w-full mt-4"):
+                        def edit(name):
+                            switchPendingEdit.set(name)
+                            editSwitchText.text = "Editing switch {}".format(name)
+                            editInitToggle.set_value(switches[name]["init"])
+                            editSwitchDialog.open()
+                        ui.button("Edit", on_click=lambda: edit(name))
+                        def remove(name):
+                            switchPendingRemove.set(name)
+                            stateStr = State.toString(switches[name]["switch"].state)
+                            removeSwitchQuestion.text = "Do you want to remove switch {}?\nIt is currently {}".format(name, stateStr)
+                            removeSwitchDialog.open()
+                        ui.button("Remove", on_click=lambda: remove(name))
+                    if switches[name]["switch"].state is State.ON:
+                        toggle.value = "on"
+                        toggle.props(f'toggle-color=green')
+                    elif switches[name]["switch"].state is State.OFF:
+                        toggle.value = "off"
+                        toggle.props(f'toggle-color=red')
+                    toggle.update()
+                    switches_gui[name] = {
+                            "card": card,
+                            "toggle": toggle
+                            }
+
+    def removeSwitchFromGui(name):
+        if not name in switches_gui:
+            return
+        switches_gui[name]["card"].delete()
+        ui.notify("Removed switch {}".format(name))
+
+    def setSwitchGuiState(name, state):
+        if not name in switches_gui:
+            return
+        switches_gui[name]["toggle"].set_value(state)
+        ui.notify("{} turned {}".format(name, state))
+
+    def setupGuiSwitches():
+        for name in switches:
+            addSwitchToGui(name)
 
 
     def updateStream():
@@ -550,8 +786,9 @@ def main():
         weather_labels["wind_gust"].classes(labelSize + " " + colstr)
 
 
+
+    setupGuiSwitches()
     updateWeather()
-    # await updatePlots()
 
     weather_range_select.on_value_change(updatePlots)
 
@@ -562,6 +799,24 @@ def main():
     ui.timer(s.q("stream_refresh"), updateStream)
     tabs.set_value("Status")
 
+    async def update(task):
+        logger.debug("Processing event: {}".format(thing))
+        if task[0] == "addSwitch":
+            addSwitchToGui(task[1])
+            return
+        if task[0] == "removeSwitch":
+            removeSwitchFromGui(task[1])
+            return
+        if task[0] == "setSwitchState":
+            setSwitchGuiState(task[1], task[2])
+
+    updateCallbacks[ui.context.client.id] = update
+
+    def onDisconnect():
+        updateCallbacks.pop(ui.context.client.id, None)
+    ui.context.client.on_disconnect(onDisconnect)
+
+
 
 @app.on_startup
 async def startup():
@@ -570,6 +825,8 @@ async def startup():
         target=capture_loop,
         daemon=True,
     ).start()
+    initSwitches()
+    asyncio.create_task(updateWorker())
 
 
 ui.run(dark=True, port=args.port)
