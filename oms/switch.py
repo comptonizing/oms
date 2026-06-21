@@ -14,6 +14,26 @@ class State(Enum):
     ON = 1
     UNKN = 2
 
+    @classmethod
+    def toString(cls, state):
+        if state is cls.ON:
+            return "on"
+        if state is cls.OFF:
+            return "off"
+        if state is cls.UNKN:
+            return "unkn"
+        raise RuntimeError("{} is not a valid state".format(state))
+
+    @classmethod
+    def fromString(cls, name):
+        if name == "on":
+            return cls.ON
+        if name == "off":
+            return cls.OFF
+        if name == "unkn":
+            return cls.UNKN
+        raise RuntimeError("{} is not a valid state name".format(name))
+
 class Switch():
     def __init__(self, pin, init=State.OFF):
         logger.debug("Making a switch, pin {}, initial state {}".format(pin, init))
