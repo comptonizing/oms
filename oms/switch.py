@@ -35,10 +35,11 @@ class State(Enum):
         raise RuntimeError("{} is not a valid state name".format(name))
 
 class Switch():
-    def __init__(self, pin, init=State.OFF):
+    def __init__(self, pin, init=State.OFF, on_destroy=None):
         logger.debug("Making a switch, pin {}, initial state {}".format(pin, init))
         self.__pin = pin
         self.__state = State.UNKN
+        self.__onDestroy = on_destroy
         GPIO.setup(self.__pin, GPIO.OUT)
         self.setState(init)
 
@@ -66,3 +67,8 @@ class Switch():
     def off(self):
         logger.debug("Setting switch at pin {} to off".format(self.pin))
         self.setState(State.OFF)
+
+    def __del__(self):
+        logger.debug("Destroying switch at pin {}".format(self.pin))
+        if self.__onDestroy is not None:
+            self.setState(self.__onDestroy)
