@@ -53,8 +53,8 @@ class Roof():
 
     @classmethod
     def reset(cls):
-        if cls._instance is not None:
-            cls._instance.stopLoop()
+        #if cls._instance is not None:
+        #    cls._instance.stopLoop()
         del cls._instance
         cls._instance = None
 
@@ -64,7 +64,7 @@ class Roof():
             raise ValueError("No roof instance initialized")
         return cls._instance
 
-    def __init__(self, pinWestOpen, pinWestClose, pinEastOpen, pinEastClose, port, startLoop, baud=9600, timeout=1):
+    def __init__(self, pinWestOpen, pinWestClose, pinEastOpen, pinEastClose, port, baud=9600, timeout=1):
         self.__port = port
         self.__baud = baud
         self.__timeout = timeout
@@ -76,11 +76,10 @@ class Roof():
         self.connect()
         self.__thread: threading.Thread | None = None
         self.__stop_event = threading.Event()
-        if startLoop:
-            self.startLoop()
 
     def __del__(self):
-        self.stopLoop()
+        #self.stopLoop()
+        return
 
     def stopMotion(self):
         self.__switchWestOpen.off()
