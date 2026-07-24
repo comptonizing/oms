@@ -5,3 +5,5 @@ class Container():
         self.__value = value
     def get(self):
         return self.__value
+    def clear(self):
+        self.__value = None

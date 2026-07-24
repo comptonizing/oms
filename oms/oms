@@ -20,8 +20,10 @@ from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
 
 from container import Container
 import settings as s
-from switch import Switch, State
+import switch
 import apiv1
+from roof import Roof
+
 
 
 parser = argparse.ArgumentParser(description = "Observatory Management System")
@@ -38,20 +40,10 @@ logger = logging.getLogger(__name__)
 
 os.environ["NICEGUI_STORAGE_PATH"] = args.storage
 
-#async def roof_worker():
-#    while True:
-#        try:
-#            print("running")
-#            await asyncio.sleep(0.1)
-#        except Exception as e:
-#            print(e)
-#
-#@app.on_startup
-#async def startup():
-#    background_tasks.create(roof_worker())
+indicator_colors = dict(on="green", off="red", unkn="gray")
 
 
-def grabRTSP(url, timeout=5):
+def grabRTSP(url: str, timeout=5):
     logger.debug("Grabbing frame from {}".format(url))
     try:
         logger.debug("Opening capture")
@@ -73,7 +65,7 @@ def grabRTSP(url, timeout=5):
             cap.release()
 
 
-def create_error_image(text: str):
+def createErrorImage(text: str):
     img = Image.new('RGB', (640, 360), color=(40, 40, 40))
     draw = ImageDraw.Draw(img)
 
@@ -91,20 +83,20 @@ def create_error_image(text: str):
 last_stream_image = None
 last_stream_image_lock = threading.Lock()
 
-def capture_loop():
+def captureLoop():
     global last_stream_image
     while True:
         if s.q("stream_rtsp") == "":
-            frame = create_error_image("RTSP not configured")
+            frame = createErrorImage("RTSP not configured")
             continue
         try:
             frame = grabRTSP(s.q("stream_rtsp"))
         except Exception as e:
-            frame = create_error_image(e)
+            frame = createErrorImage("{}".format(e))
         with last_stream_image_lock:
             last_stream_image = frame
 
-async def query_weather(api, thing, start, window):
+async def queryWeather(api, thing, start, window):
     query = """from(bucket: "weather")
       |> range(start: -{})
       |> filter(fn: (r) => r["_measurement"] == "weather")
@@ -125,6 +117,9 @@ async def query_weather(api, thing, start, window):
 
 updateQueue = asyncio.Queue()
 updateCallbacks: dict[str, callable] = {}
+def triggerEvent(*args):
+    updateQueue.put_nowait(list(args))
+
 
 async def updateWorker():
     while True:
@@ -142,7 +137,7 @@ async def updateWorker():
             logger.debug("Dispatching event for client {}: {}".format(clientId, thing))
             asyncio.create_task(run())
 
-def pinUsedForRoof(pin):
+def pinUsedForRoof(pin: int):
     l = [
             s.q("roof_pins_west_open"),
             s.q("roof_pins_west_close"),
@@ -152,42 +147,58 @@ def pinUsedForRoof(pin):
     return pin in l
 
 
+switch_names = ["pier", "cctv", "pc", "allsky"]
 switches = {}
 
-def initSwitch(name, pin, init, last):
+def getSwitchState(name: str):
+    if name not in switches:
+        return switch.State.UNKN
+    return switches[name]["switch"].state
+
+def initSwitch(name: str, pin: int, init: str, last: str):
     if init == "on":
-        initState = State.ON
+        initState = switch.State.ON
     elif init == "off":
-        initState = State.OFF
+        initState = switch.State.OFF
     elif init == "last":
         if last == "on":
-            initState = State.ON
-        elif last == "off":
-            initState = State.OFF
+            initState = switch.State.ON
+        else:
+            initState = switch.State.OFF
+    if name in switches:
+        if switches[name]["switch"].pin == pin:
+            switches[name]["init"] = init
+            return
+        del switches[name]
+
     switches[name] = {
-            "switch": Switch(pin, init=initState),
+            "switch": switch.Switch(pin, init=initState),
             "init": init
             }
 
-def deinitSwitch(name):
+def deinitSwitch(name: str):
     pass
 
 def initSwitches():
-    stored = s.q("switches")
-    toRemove = []
-    for name in stored:
-        if pinUsedForRoof(stored[name]["pin"]):
-            logger.warn("Switch for {} with pin {} is already in use for roof, removing".format(name, stored[name]["pin"]))
-            del stored[name]
-    s.p("switches", stored)
-    for name in stored:
-        pin = stored[name]["pin"]
-        init = stored[name]["init"]
-        last = stored[name]["last"]
+    names = switch_names
+    for name in names:
+        pin = s.q(name + "_pin", fallback=None)
+        init = s.q(name + "_init", fallback=None)
+        last = s.q(name + "_last", fallback=None)
+        if pin is None:
+            logger.warn("Pin for {} is not set up in settings, skipping".format(name))
+            continue
+        pin = int(pin)
+        if pinUsedForRoof(pin):
+            logger.warn("Switch for {} with pin {} is already in use for roof, removing".format(name, pin))
+            s.rm(name + "_pin")
+            s.rm(name + "_init")
+            s.rm(name + "_last")
+            continue
         initSwitch(name, pin, init, last)
 
 addSwitchLock = threading.Lock()
-def addSwitch(name, pin, init):
+def addSwitch(name: str, pin: int, init: str):
     with addSwitchLock:
         logger.debug("Adding switch {} pin {} initial {}".format(name, pin, init))
         if pinUsedForRoof(pin):
@@ -208,10 +219,9 @@ def addSwitch(name, pin, init):
                 "last": last,
                 }
         s.p("switches", stored)
-        updateQueue.put_nowait(["addSwitch", name])
 
 removeSwitchLock = threading.Lock()
-def removeSwitch(name):
+def removeSwitch(name: str):
     with removeSwitchLock:
         logger.debug("Removing switch {}".format(name))
         stored = s.q("switches")
@@ -220,36 +230,107 @@ def removeSwitch(name):
             s.p("switches", stored)
         if name in switches:
             del switches[name]
-        updateQueue.put_nowait(["removeSwitch", name])
-
-def editSwitch(name, init):
-    switches[name]["init"] = init
-    stored = s.q("switches")
-    stored[name]["init"] = init
-    s.p("switches", stored)
 
 setSwitchStateLock = threading.Lock()
-def setSwitchState(name, state):
+def setSwitchState(name: str, state: switch.State):
     with setSwitchStateLock:
-        switches[name]["switch"].setState(State.fromString(state))
-        stored = s.q("switches")
-        stored[name]["last"] = state
-        s.p("switches", stored)
-        updateQueue.put_nowait(["setSwitchState", name, state])
+        stateString = switch.State.toString(state)
+        logger.info(f"Setting switch {name} to {stateString}")
+        switches[name]["switch"].setState(state)
+        s.p(name + "_last", stateString)
+        triggerEvent("setSwitchState", name, stateString)
+
+
+def makeRoof():
+    Roof.reset()
+    if not s.has("roof_pins_west_close") or s.q("roof_pins_west_close") == "":
+        return False
+    if not s.has("roof_pins_west_open") or s.q("roof_pins_west_open") == "":
+        return False
+    if not s.has("roof_pins_east_close") or s.q("roof_pins_east_close") == "":
+        return False
+    if not s.has("roof_pins_east_open") or s.q("roof_pins_east_open") == "":
+        return False
+    if not s.has("roof_port") or s.q("roof_port") == "":
+        return False
+    baud = 9600
+    if s.has("roof_baud"):
+        baud = s.q("roof_baud")
+    timeout = 1
+    if s.has("roof_timeout"):
+        timeout = s.q("roof_timeout")
+    try:
+        Roof(
+                s.q("roof_pins_west_open"),
+                s.q("roof_pins_west_close"),
+                s.q("roof_pins_east_open"),
+                s.q("roof_pins_east_close"),
+                s.q("roof_port"),
+                True,
+                baud = baud,
+                timeout = timeout)
+    except Exception as e:
+        logger.error("Could not initialize roof: {}".format(e))
+        roof.clear()
 
 
 @ui.page("/")
 def main():
-    def on_tab_change(e):
+    ui.add_head_html('<link href="https://cdn.jsdelivr.net/npm/@mdi/font@latest/css/materialdesignicons.min.css" rel="stylesheet">')
+    ui.add_head_html('''
+    <style>
+    .status-circle {
+        position: absolute;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        aspect-ratio: 1 / 1;
+        cursor: pointer;
+        transition: filter 0.15s ease, transform 0.15s ease;
+    }
+    .status-circle:hover {
+        filter: brightness(1.2);
+        transform: scale(1.08) translate(-50%, -50%);
+    }
+    </style>
+    ''')
+    ui.add_head_html('''
+    <style>
+    .fan-icon {
+        cursor: pointer;
+        transition: filter 0.15s ease, transform 0.15s ease;
+    }
+    .fan-icon:hover {
+        filter: brightness(1.3);
+        transform: scale(1.15);
+    }
+    </style>
+    ''')
+    _db_url = s.q("weather_db_url", fallback=None)
+    _db_token = s.q("weather_db_token", fallback=None)
+    _db_org = s.q("weather_db_org", fallback=None)
+    if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
+        influx_client = InfluxDBClientAsync(
+                url = s.q("weather_db_url"),
+                token = s.q("weather_db_token"),
+                org = s.q("weather_db_org"),
+                )
+        query_api = influx_client.query_api()
+    settings = {}
+
+    def onTabChange(e):
         header_label.set_text(e.value)
         drawer.hide()
 
-    def update_plot(plot):
+    def updatePlot(plot):
         plot.update()
         plot._props['options']['config'] = {'displayModeBar': False}
         #plot._props['options']['config'] = {"displayModeBar": False, "scrollZoom": False, "doubleClick": False}
 
-    def make_plot(title):
+    def makePlot(title: str):
         plot = ui.plotly(go.Figure()).classes("w-full")
         fig = plot.figure
         fig.update_layout(
@@ -263,20 +344,16 @@ def main():
                 )
         fig.update_xaxes(gridcolor='#555')
         fig.update_yaxes(gridcolor='#555')
-        update_plot(plot)
+        updatePlot(plot)
         return plot
 
 
-    def save_settings():
+    def saveSettings():
         for thing in settings.keys():
             logger.debug("Setting {}: {}".format(thing, settings[thing].value))
             s.p(thing, settings[thing].value)
-        influx_client = InfluxDBClientAsync(
-                url = s.q("weather_db_url"),
-                token = s.q("weather_db_token"),
-                org = s.q("weather_db_org"),
-                )
-        query_api = influx_client.query_api()
+        initStuff()
+        triggerEvent("updateSettings")
 
     weather_items = {
             "env_temperature": "Temperature",
@@ -300,23 +377,46 @@ def main():
             "24h": "300s"
             }
 
-    influx_client = InfluxDBClientAsync(
-            url = s.q("weather_db_url"),
-            token = s.q("weather_db_token"),
-            org = s.q("weather_db_org"),
-            )
-    query_api = influx_client.query_api()
+    def processClickFan():
+        pass
 
-    settings = {}
+    def processClickSwitch(thing: str):
+        if not thing in switch_names:
+            logger.error(f"Somehow got an unknown switch click: {thing}")
+            return
+        if not thing in switches.keys():
+            ui.notify(f"Switch for {thing} not configured!", type="negative")
+
+        stateOld = switches[thing]["switch"].state
+        if stateOld is switch.State.ON:
+            stateNew = switch.State.OFF
+        else:
+            stateNew = switch.State.ON
+
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f"Confirm {thing} switch").classes('text-lg font-bold')
+            ui.label(f"Do you want to turn {thing} {switch.State.toString(stateNew)}?")
+            with ui.row().classes('gap-2'):
+                ui.button("No", on_click=dialog.close).classes("flex-1")
+                def acceptSwitch():
+                    dialog.close()
+                    setSwitchState(thing, stateNew)
+                ui.button("Yes", on_click=acceptSwitch).classes("flex-1")
+        dialog.open()
+
+    def processClick(thing: str):
+        if thing == "fan":
+            processClickFan()
+        else:
+            processClickSwitch(thing)
 
     ui.page_title("OMS")
     with ui.left_drawer(value=False, top_corner=True, bottom_corner=True) as drawer:
         ui.button(icon='close', on_click=drawer.hide).props('flat round')
-        with ui.tabs(on_change=on_tab_change).props("vertical") as tabs:
+        with ui.tabs(on_change=onTabChange).props("vertical") as tabs:
             tab_status = ui.tab("Status")
             tab_weather = ui.tab("Weather")
             tab_roof = ui.tab("Roof")
-            tab_switches = ui.tab("Switches")
             tab_log = ui.tab("Log")
             tab_settings = ui.tab("Settings")
 
@@ -326,20 +426,70 @@ def main():
 
     with ui.tab_panels(tabs).classes("w-full"):
         with ui.tab_panel(tab_status):
-            with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
+            with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4 justify-items-center'):
+                with ui.element('div').classes('relative').style("width: 100%; max-width: 400px; aspect-ratio: 1 / 1; border: 1px dashed #ccc;"):
+                    status_indicators = {}
+                    status_indicators["west_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 0;')
+                    status_indicators["west_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 0;')
+                    status_indicators["west_close_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 40%;')
+                    status_indicators["west_close_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 40%;')
+                    status_indicators["east_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 0;')
+                    status_indicators["east_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 0;')
+                    status_indicators["east_close_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 40%;')
+                    status_indicators["east_close_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 40%;')
+                    status_indicators["west_push_north"] = ui.element("div").classes("absolute").style(
+                            "left: 18%; top: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                            )
+                    status_indicators["west_push_south"] = ui.element("div").classes("absolute").style(
+                            "left: 18%; bottom: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                            )
+                    status_indicators["east_push_north"] = ui.element("div").classes("absolute").style(
+                            "left: 52%; top: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                            )
+                    status_indicators["east_push_south"] = ui.element("div").classes("absolute").style(
+                            "left: 52%; bottom: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                            )
+                    status_indicators["west_open"] = ui.icon("arrow_back", size="5rem").classes("absolute") \
+                            .style("top: 50%; left: 5%; transform: translate(50%, -50%);").classes("animate-pulse")
+                    status_indicators["west_close"] = ui.icon("arrow_forward", size="5rem").classes("absolute") \
+                            .style("top: 50%; left: 5%; transform: translate(50%, -50%);").classes("animate-pulse")
+                    status_indicators["east_open"] = ui.icon("arrow_forward", size="5rem").classes("absolute") \
+                            .style("top: 50%; right: 5%; transform: translate(-50%, -50%);").classes("animate-pulse")
+                    status_indicators["east_close"] = ui.icon("arrow_back", size="5rem").classes("absolute") \
+                            .style("top: 50%; right: 5%; transform: translate(-50%, -50%);").classes("animate-pulse")
+                    status_indicators["west_open"].set_visibility(False)
+                    status_indicators["west_close"].set_visibility(False)
+                    status_indicators["east_open"].set_visibility(False)
+                    status_indicators["east_close"].set_visibility(False)
+
+                    status_indicators["fans"] = [
+                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("top: 17%; left:3%").classes('animate-none').on("click", lambda: processClick("fan")),
+                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("bottom: 17%; left:3%").classes('animate-none').on("click", lambda: processClick("fan")),
+                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("top: 17%; right:3%").classes('animate-none').on("click", lambda: processClick("fan")),
+                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("bottom: 17%; right:3%").classes('animate-none').on("click", lambda: processClick("fan"))
+                            ]
+                    __str = """aspect-ratio: 1 / 1; border-radius: 50%;
+                            display: flex; align-items: center; justify-content: center;
+                            color: white; font-weight: bold; font-size: 1rem;
+                            background-color: gray;"""
+                    __str_left = __str + "transform: translate(-50%, -50%);"
+                    __str_right = __str + "transform: translate(50%, -50%);"
+                    status_indicators["pier"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'left: 50%; top: 50%; width: 15%;').on("click", lambda: processClick("pier"))
+                    with status_indicators["pier"]:
+                        ui.label("Pier")
+                    status_indicators["cctv"] = ui.element('div').classes('absolute status-circle').style(__str_right + 'left: 23%; top: 6%; width: 10%;').on("click", lambda: processClick("cctv"))
+                    with status_indicators["cctv"]:
+                        ui.label("CCTV")
+                    status_indicators["allsky"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'right: 23%; top: 6%; width: 10%;').on("click", lambda: processClick("allsky"))
+                    with status_indicators["allsky"]:
+                        ui.label("AS")
+                    status_indicators["pc"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'left: 6%; top: 35%; width: 8%').on("click", lambda: processClick("pc"))
+                    with status_indicators["pc"]:
+                        ui.label("PC")
+                with ui.card().classes("w-full"):
+                    status_stream_image = ui.image(createErrorImage("Initializing ...")).classes("w-full")
                 with ui.card().classes("w-full"):
                     status_allsky_image = ui.image(s.q("weather_image")).classes("w-full")
-                with ui.card().classes("w-full"):
-                    status_stream_image = ui.image(create_error_image("Initializing ...")).classes("w-full")
-                with ui.grid(columns=2).classes("w-full"):
-                    with ui.card().classes("w-full"):
-                        ui.label("Val 1").classes("w-full")
-                        with ui.card_section().classes("w-full"):
-                            ui.label("Val 1").classes("w-full")
-                    with ui.card().classes("w-full"):
-                        ui.label("Val 2").classes("w-full")
-                        with ui.card_section().classes("w-full"):
-                            ui.label("Val 2").classes("w-full")
 
         with ui.tab_panel(tab_weather):
             with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
@@ -356,164 +506,91 @@ def main():
             weather_plots = {}
             with ui.grid().classes('grid-cols-1 lg:grid-cols-2 w-full gap-4'):
                 with ui.card().classes('w-full'):
-                    weather_plots["Temperature"] = make_plot("Temperature")
+                    weather_plots["Temperature"] = makePlot("Temperature")
                 with ui.card().classes('w-full'):
-                    weather_plots["Sky"] = make_plot("Sky")
+                    weather_plots["Sky"] = makePlot("Sky")
                 with ui.card().classes('w-full'):
-                    weather_plots["Wind"] = make_plot("Wind")
+                    weather_plots["Wind"] = makePlot("Wind")
                 with ui.card().classes('w-full'):
-                    weather_plots["Humidity"] = make_plot("Humidity")
+                    weather_plots["Humidity"] = makePlot("Humidity")
                 with ui.card().classes('w-full'):
-                    weather_plots["SQM"] = make_plot("SQM")
+                    weather_plots["SQM"] = makePlot("SQM")
                 with ui.card().classes('w-full'):
-                    weather_plots["Rain"] = make_plot("Rain")
+                    weather_plots["Rain"] = makePlot("Rain")
                 with ui.card().classes('w-full'):
-                    weather_plots["Pressure"] = make_plot("Pressure")
+                    weather_plots["Pressure"] = makePlot("Pressure")
                 with ui.card().classes('w-full'):
-                    weather_plots["Rain Heating"] = make_plot("Rain Heating")
+                    weather_plots["Rain Heating"] = makePlot("Rain Heating")
 
-        with ui.tab_panel(tab_switches):
-            switches_gui = {}
-            switches_grid = ui.grid().classes('grid-cols-1 lg:grid-cols-8 w-full gap-4')
-
-            with ui.dialog() as removeSwitchDialog, ui.card().classes("w-80"):
-                removeSwitchQuestion = ui.label().style('white-space: pre-line')
-                switchPendingRemove = Container()
-                with ui.row().classes("justify-end w-full"):
-                    def yes():
-                        removeSwitch(switchPendingRemove.get())
-                        removeSwitchDialog.close()
-
-                    ui.button('Yes', on_click=yes)
-                    ui.button('No', on_click=removeSwitchDialog.close)
-
-
-            with ui.dialog() as editSwitchDialog, ui.card().classes("w-120"):
-                editSwitchText = ui.label().style("white-space: pre-line")
-                switchPendingEdit = Container()
-                with ui.grid(columns=2).classes("w-full"):
-                    ui.label("On startup: ")
-                    editInitToggle = ui.toggle(["off", "on", "last"])
-                with ui.row().classes("justify-end"):
-                    def cancel():
-                        editSwitchDialog.close()
-                    ui.button("Cancel", on_click=cancel)
-                    def save():
-                        try:
-                            editSwitch(switchPendingEdit.get(), editInitToggle.value)
-                            ui.notify("Saved", type="positive")
-                        except ValueError as e:
-                            ui.notify("Error adding switch: {}".format(e), type="negative")
-                        editSwitchDialog.close()
-                    ui.button("Save", on_click=save)
-
-
-            with ui.dialog() as addSwitchDialog, ui.card():
-                name = ui.input(label="Name", validation={"Name is required": lambda value: bool(value and value.strip())})
-                pin = ui.input(label="Pin", validation={"Pin must be a positive integer": lambda value: value.isdigit() and int(value) >= 0})
-                with ui.grid(columns=2).classes("w-full"):
-                    ui.label("On startup: ")
-                    init = ui.toggle(["off", "on", "last"])
-                    init.set_value("off")
-                with ui.row().classes("justify-end"):
-                    def cancel():
-                        addSwitchDialog.close()
-
-                    ui.button("Cancel", on_click=cancel)
-                    def save():
-                        if not name.validate():
-                            return
-                        if not pin.validate():
-                            return
-                        try:
-                            addSwitch(name.value, int(pin.value), init.value)
-                        except ValueError as e:
-                            ui.notify("Error adding switch: {}".format(e), type="negative")
-                        addSwitchDialog.close()
-                    ui.button("Save", on_click=save)
-
-            ui.button("Add", on_click = addSwitchDialog.open)
-
+        with ui.tab_panel(tab_roof):
+            pass
 
         with ui.tab_panel(tab_settings):
             with ui.card().tight().classes("w-full"):
                 ui.label("Stream")
                 with ui.card_section().classes("w-full"):
-                    settings["stream_rtsp"] = ui.input("RTSP URL", value=s.q("stream_rtsp")).classes("w-full")
-                    settings["stream_refresh"] = ui.number("Refresh (s)", value=s.q("stream_refresh"))
+                    settings["stream_rtsp"] = ui.input("RTSP URL", value=s.q("stream_rtsp", fallback=None)).classes("w-full")
+                    settings["stream_refresh"] = ui.number("Refresh (s)", value=s.q("stream_refresh", fallback=None))
             with ui.card().tight().classes("w-full"):
                 ui.label("Weather")
                 with ui.card_section().classes("w-full"):
-                    settings["weather_refresh"] = ui.number("Refresh (s)", value=s.q("weather_refresh"))
-                    settings["weather_elevation"] = ui.number("Elevation (m)", value=s.q("weather_elevation"))
-                    settings["weather_image"] = ui.input("URL for latest allsky image", value=s.q("weather_image"))
-                    settings["weather_url"] = ui.input("URL for weather data scraping", value=s.q("weather_url"))
-                    settings["weather_db_url"] = ui.input("Weather database URL", value=s.q("weather_db_url"))
-                    settings["weather_db_org"] = ui.input("Weather database organization", value=s.q("weather_db_org"))
-                    settings["weather_db_token"] = ui.input("Weather database token", value=s.q("weather_db_token"))
-                    settings["weather_db_bucket"] = ui.input("Weather database bucket", value=s.q("weather_db_bucket"))
+                    settings["weather_refresh"] = ui.number("Refresh (s)", value=s.q("weather_refresh", fallback=None))
+                    settings["weather_elevation"] = ui.number("Elevation (m)", value=s.q("weather_elevation", fallback=None))
+                    settings["weather_image"] = ui.input("URL for latest allsky image", value=s.q("weather_image", fallback=None))
+                    settings["weather_url"] = ui.input("URL for weather data scraping", value=s.q("weather_url", fallback=None))
+                    settings["weather_db_url"] = ui.input("Weather database URL", value=s.q("weather_db_url", fallback=None))
+                    settings["weather_db_org"] = ui.input("Weather database organization", value=s.q("weather_db_org", fallback=None))
+                    settings["weather_db_token"] = ui.input("Weather database token", value=s.q("weather_db_token", fallback=None))
+                    settings["weather_db_bucket"] = ui.input("Weather database bucket", value=s.q("weather_db_bucket", fallback=None))
 
-            ui.button("Save & apply", on_click=save_settings)
-
-
-    def addSwitchToGui(name):
-        with switches_grid:
-            with ui.card().classes("w-full") as card:
-                ui.label("{}".format(name)).classes("text-4xl")
-                ui.label("Pin {}".format(switches[name]["switch"].pin))
+            with ui.card().tight().classes("w-full"):
+                ui.label("Roof")
                 with ui.card_section().classes("w-full"):
-                    with ui.row().classes("w-full justify-center"):
-                        toggle = ui.toggle(["off", "on"]).props("size=xl color=black")
-                        def switchToggle(name):
-                            if toggle.value == "on":
-                                color = "green"
-                            elif toggle.value == "off":
-                                color = "red"
-                            toggle.props(f'toggle-color={color}')
-                            toggle.update()
-                            setSwitchState(name, toggle.value)
-                        toggle.on("update:model-value", lambda _: switchToggle(name))
-                    with ui.grid(columns=2).classes("w-full mt-4"):
-                        def edit(name):
-                            switchPendingEdit.set(name)
-                            editSwitchText.text = "Editing switch {}".format(name)
-                            editInitToggle.set_value(switches[name]["init"])
-                            editSwitchDialog.open()
-                        ui.button("Edit", on_click=lambda: edit(name))
-                        def remove(name):
-                            switchPendingRemove.set(name)
-                            stateStr = State.toString(switches[name]["switch"].state)
-                            removeSwitchQuestion.text = "Do you want to remove switch {}?\nIt is currently {}".format(name, stateStr)
-                            removeSwitchDialog.open()
-                        ui.button("Remove", on_click=lambda: remove(name))
-                    if switches[name]["switch"].state is State.ON:
-                        toggle.value = "on"
-                        toggle.props(f'toggle-color=green')
-                    elif switches[name]["switch"].state is State.OFF:
-                        toggle.value = "off"
-                        toggle.props(f'toggle-color=red')
-                    toggle.update()
-                    switches_gui[name] = {
-                            "card": card,
-                            "toggle": toggle
-                            }
+                    settings["roof_pins_west_close"] = ui.number("Pin west close", value=s.q("roof_pins_west_close", fallback=None))
+                    settings["roof_pins_west_open"] = ui.number("Pin west open", value=s.q("roof_pins_west_open", fallback=None))
+                    settings["roof_pins_east_close"] = ui.number("Pin east close", value=s.q("roof_pins_east_close", fallback=None))
+                    settings["roof_pins_east_open"] = ui.number("Pin east open", value=s.q("roof_pins_east_open", fallback=None))
+                    settings["roof_port"] = ui.input("Breakout board port", value=s.q("roof_port", fallback=None))
+                    settings["roof_baud"] = ui.number("Breakout board baud rate", value=s.q("roof_baud", fallback=None))
+                    settings["roof_timeout"] = ui.number("Breakout board timeout (s)", value=s.q("roof_timeout", fallback=None))
 
-    def removeSwitchFromGui(name):
-        if not name in switches_gui:
-            return
-        switches_gui[name]["card"].delete()
-        ui.notify("Removed switch {}".format(name))
+            with ui.card().tight().classes("w-full"):
+                ui.label("Switches")
+                with ui.card_section().classes("w-full"):
+                    with ui.card().tight().classes("w-full"):
+                        ui.label("CCTV")
+                        with ui.card_section().classes("w-full"):
+                            settings["cctv_pin"] = ui.number("Pin", value=s.q("cctv_pin", fallback=None), step=1, format='%d')
+                            settings["cctv_init"] = ui.select(["off", "on", "last"], value=s.q("cctv_init", fallback="off"))
+                    with ui.card().tight().classes("w-full"):
+                        ui.label("Allsky")
+                        with ui.card_section().classes("w-full"):
+                            settings["allky_pin"] = ui.number("Pin", value=s.q("allsky_pin", fallback=None), step=1, format='%d')
+                            settings["allsky_init"] = ui.select(["off", "on", "last"], value=s.q("allsky_init", fallback="off"))
+                    with ui.card().tight().classes("w-full"):
+                        ui.label("Pier")
+                        with ui.card_section().classes("w-full"):
+                            settings["pier_pin"] = ui.number("Pin", value=s.q("pier_pin", fallback=None), step=1, format='%d')
+                            settings["pier_init"] = ui.select(["off", "on", "last"], value=s.q("pier_init", fallback="off"))
+                    with ui.card().tight().classes("w-full"):
+                        ui.label("PC")
+                        with ui.card_section().classes("w-full"):
+                            settings["pc_pin"] = ui.number("Pin", value=s.q("pc_pin", fallback=None), step=1, format='%d')
+                            settings["pc_init"] = ui.select(["off", "on", "last"], value=s.q("pc_init", fallback="off"))
+            ui.button("Save & apply", on_click=saveSettings)
 
-    def setSwitchGuiState(name, state):
-        if not name in switches_gui:
-            return
-        switches_gui[name]["toggle"].set_value(state)
-        ui.notify("{} turned {}".format(name, state))
 
-    def setupGuiSwitches():
-        for name in switches:
-            addSwitchToGui(name)
-
+    def updateButtons():
+        for name in switch_names:
+            state = getSwitchState(name)
+            if state == switch.State.ON:
+                color = indicator_colors["on"]
+            elif state == switch.State.OFF:
+                color = indicator_colors["off"]
+            else:
+                color = indicator_colors["unkn"]
+            logger.info(f"Button {name} is {state} -> {color}")
+            status_indicators[name].style(f'background-color: {color}')
 
     def updateStream():
         if last_stream_image is not None:
@@ -523,86 +600,99 @@ def main():
     async def _updatePlots():
         r = weather_range_select.value
         w = weather_ranges[r]
+        sleepTime = 0.1
 
         plot = weather_plots["Temperature"]
         fig = plot.figure
         fig.update_yaxes(title_text="Temperature (°C)")
         fig.data = []
-        t, v = await query_weather(query_api, "env_temperature", r, w)
+        t, v = await queryWeather(query_api, "env_temperature", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Temperature Air")
         fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
         logger.debug("Done")
-        t, v = await query_weather(query_api, "env_dewpoint", r, w)
+        t, v = await queryWeather(query_api, "env_dewpoint", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Temperature Dewpoint")
         fig.add_scatter(x=t, y=v, mode="lines", name="Dewpoint", line={"color": "orange"})
         logger.debug("Done")
-        t, v = await query_weather(query_api, "inside_temperature", r, w)
+        t, v = await queryWeather(query_api, "inside_temperature", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Temperature Inside")
         fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "blue"})
         logger.debug("Done")
-        update_plot(plot)
+        updatePlot(plot)
 
         plot = weather_plots["Sky"]
         fig = plot.figure
         fig.update_yaxes(title_text="Temperature (°C)")
         fig.data = []
-        t, v = await query_weather(query_api, "ir_sky", r, w)
+        t, v = await queryWeather(query_api, "ir_sky", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Sky Sky")
         fig.add_scatter(x=t, y=v, mode="lines", name="Sky", line={"color": "green"})
         logger.debug("Done")
-        t, v = await query_weather(query_api, "ir_diff", r, w)
+        t, v = await queryWeather(query_api, "ir_diff", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Sky Difference")
         fig.add_scatter(x=t, y=v, mode="lines", name="Difference", line={"color": "orange"})
         logger.debug("Done")
-        update_plot(plot)
+        updatePlot(plot)
 
         plot = weather_plots["Wind"]
         fig = plot.figure
         fig.update_yaxes(title_text="Speed (km/h)")
         fig.data = []
-        t, v = await query_weather(query_api, "wind_speed", r, w)
+        t, v = await queryWeather(query_api, "wind_speed", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Wind Speed")
         fig.add_scatter(x=t, y=v, mode="lines", name="Speed", line={"color": "green"})
         logger.debug("Done")
-        t, v = await query_weather(query_api, "wind_gust", r, w)
+        t, v = await queryWeather(query_api, "wind_gust", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Wind Gust")
         fig.add_scatter(x=t, y=v, mode="lines", name="Gust", line={"color": "orange"})
         logger.debug("Done")
-        update_plot(plot)
+        updatePlot(plot)
 
         plot = weather_plots["Humidity"]
         fig = plot.figure
         fig.update_yaxes(title_text="Humidity (%)")
         fig.data = []
-        t, v = await query_weather(query_api, "env_humidity", r, w)
+        t, v = await queryWeather(query_api, "env_humidity", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Humidity Air")
         fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
         logger.debug("Done")
-        t, v = await query_weather(query_api, "inside_humidity", r, w)
+        t, v = await queryWeather(query_api, "inside_humidity", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Humidity Inside")
         fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "orange"})
         logger.debug("Done")
         fig.update_layout(yaxis={"range": [0,100]})
-        update_plot(plot)
+        updatePlot(plot)
 
         plot = weather_plots["SQM"]
         fig = plot.figure
         fig.update_yaxes(title_text="SQM (mag/arcsec^2)")
         fig.data = []
-        t, v = await query_weather(query_api, "sqm_mpsas", r, w)
+        t, v = await queryWeather(query_api, "sqm_mpsas", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting SQM SQM")
         fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
         logger.debug("Done")
-        update_plot(plot)
+        updatePlot(plot)
 
         plot = weather_plots["Rain"]
         fig = plot.figure
         fig.data = []
-        t, v = await query_weather(query_api, "rain_percentage", r, w)
+        t, v = await queryWeather(query_api, "rain_percentage", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Rain Amount")
         fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Amount", line={"color": "green"})
         logger.debug("Done")
-        t, v = await query_weather(query_api, "rain_capacitance", r, w)
+        t, v = await queryWeather(query_api, "rain_capacitance", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Rain Capacitance")
         fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Capacitance", line={"color": "orange"})
         logger.debug("Done")
@@ -616,26 +706,29 @@ def main():
                     "gridcolor": '#555'
                     }
                 )
-        update_plot(plot)
+        updatePlot(plot)
 
         plot = weather_plots["Pressure"]
         fig = plot.figure
         fig.update_yaxes(title_text="Pressure (hPa)")
         fig.data = []
-        t, v = await query_weather(query_api, "env_pressure", r, w)
+        t, v = await queryWeather(query_api, "env_pressure", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting Pressure Pressue")
         fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
         logger.debug("Done")
-        update_plot(plot)
+        updatePlot(plot)
 
         plot = weather_plots["Rain Heating"]
         fig = plot.figure
         fig.data = []
-        t, v = await query_weather(query_api, "rain_dutycycle", r, w)
+        t, v = await queryWeather(query_api, "rain_dutycycle", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting RainHeating Dutycycle")
         fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Dutycycle", line={"color": "green"})
         logger.debug("Done")
-        t, v = await query_weather(query_api, "rain_temperature", r, w)
+        t, v = await queryWeather(query_api, "rain_temperature", r, w)
+        await asyncio.sleep(sleepTime)
         logger.debug("Plotting RainHeating Temperature")
         fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Temperature", line={"color": "blue"})
         logger.debug("Done")
@@ -648,7 +741,7 @@ def main():
                     "gridcolor": '#555'
                     }
                 )
-        update_plot(plot)
+        updatePlot(plot)
 
     async def updatePlots():
         try:
@@ -656,6 +749,7 @@ def main():
                 plot.figure.update_layout(annotations=[])
             await _updatePlots()
         except Exception as e:
+            logger.error(f"Error updating weather plots: {e}")
             for plot in weather_plots.values():
                 plot.figure.data = []
                 plot.figure.update_layout(
@@ -670,11 +764,7 @@ def main():
                         xaxis=dict(visible=False),
                         yaxis=dict(visible=False),
                     )
-                update_plot(plot)
-
-
-
-
+                updatePlot(plot)
 
     def updateWeather():
         labelSize = "text-3xl"
@@ -787,46 +877,72 @@ def main():
 
 
 
-    setupGuiSwitches()
     updateWeather()
 
     weather_range_select.on_value_change(updatePlots)
 
-    ui.timer(s.q("weather_refresh"), lambda: status_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
-    ui.timer(s.q("weather_refresh"), lambda: weather_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
-    ui.timer(s.q("weather_refresh"), updateWeather)
-    ui.timer(s.q("weather_refresh"), updatePlots)
-    ui.timer(s.q("stream_refresh"), updateStream)
-    tabs.set_value("Status")
+    timers = {}
 
-    async def update(task):
-        logger.debug("Processing event: {}".format(thing))
-        if task[0] == "addSwitch":
-            addSwitchToGui(task[1])
-            return
-        if task[0] == "removeSwitch":
-            removeSwitchFromGui(task[1])
-            return
-        if task[0] == "setSwitchState":
-            setSwitchGuiState(task[1], task[2])
+    def initTimers():
+        for thing in timers:
+            timers[thing].cancel()
+        timers["update_status_allsky_image"] = ui.timer(s.q("weather_refresh"), lambda: status_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
+        timers["update_weather_allsky_image"] = ui.timer(s.q("weather_refresh"), lambda: weather_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
+        timers["update_weather"] = ui.timer(s.q("weather_refresh"), updateWeather)
+        timers["update_plots"] = ui.timer(s.q("weather_refresh"), updatePlots)
+        timers["update_stream"] = ui.timer(s.q("stream_refresh"), updateStream)
 
-    updateCallbacks[ui.context.client.id] = update
+    def processSettingsUpdate():
+        initTimers()
+        status_allsky_image.set_source(s.q("weather_image"))
+        updateButtons()
+        _db_url = s.q("weather_db_url", fallback=None)
+        _db_token = s.q("weather_db_token", fallback=None)
+        _db_org = s.q("weather_db_org", fallback=None)
+        if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
+            influx_client = InfluxDBClientAsync(
+                    url = s.q("weather_db_url"),
+                    token = s.q("weather_db_token"),
+                    org = s.q("weather_db_org"),
+                    )
+            query_api = influx_client.query_api()
+
+    def onConnect():
+        initTimers()
+        updateButtons()
+    ui.context.client.on_connect(onConnect)
 
     def onDisconnect():
         updateCallbacks.pop(ui.context.client.id, None)
     ui.context.client.on_disconnect(onDisconnect)
 
+    async def update(thing: list):
+        logger.debug("Processing event: {}".format(thing))
+        if thing[0] == "setSwitchState":
+            ui.notify(f"Switch {thing[1]} was turned {thing[2]}")
+            updateButtons()
+            return
+        if thing[0] == "updateSettings":
+            processSettingsUpdate()
+            return
+        logger.error(f"Unknown update event, ignoring: {thing}")
 
+    updateCallbacks[ui.context.client.id] = update
+
+    tabs.set_value("Status")
+
+def initStuff():
+    makeRoof()
+    initSwitches()
 
 @app.on_startup
 async def startup():
     await s.init()
     threading.Thread(
-        target=capture_loop,
+        target=captureLoop,
         daemon=True,
     ).start()
-    initSwitches()
     asyncio.create_task(updateWorker())
+    initStuff()
 
-
-ui.run(dark=True, port=args.port)
+ui.run(dark=True, favicon="favicon.svg", port=args.port)

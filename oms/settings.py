@@ -28,14 +28,17 @@ async def init():
     for key, value in DEFAULTS.items():
         app.storage.general.setdefault(key, value)
 
-def query(thing):
+def query(thing, **kwargs):
     logger.debug("Query: {}".format(thing))
+    if not thing in app.storage.general and "fallback" in kwargs:
+        logger.debug("Returning fallback {}".format(kwargs["fallback"]))
+        return kwargs["fallback"]
     ret = app.storage.general[thing]
     logger.debug("Result: {}".format(ret))
     return ret
 
-def q(*args):
-    return query(*args)
+def q(*args, **kwargs):
+    return query(*args, **kwargs)
 
 def put(thing, value):
     logger.debug("Set: {}: {}".format(thing, value))
@@ -47,3 +50,10 @@ def p(thing, value):
 def dump(**kwargs):
     logger.debug("Settings dump")
     return json.dumps(dict(app.storage.general), **kwargs)
+
+def has(thing):
+    return thing in app.storage.general
+
+def rm(thing):
+    if thing in app.storage.general:
+        del app.storage.general[thing]
