@@ -598,7 +598,7 @@ def main():
     async def _updatePlots():
         r = weather_range_select.value
         w = weather_ranges[r]
-        sleepTime = 0.1
+        sleepTime = 0.3
 
         plot = weather_plots["Temperature"]
         fig = plot.figure
