@@ -396,7 +396,7 @@ def main():
         with ui.dialog() as dialog, ui.card():
             ui.label(f"Confirm {thing} switch").classes('text-lg font-bold')
             ui.label(f"Do you want to turn {thing} {switch.State.toString(stateNew)}?")
-            with ui.row().classes('gap-2'):
+            with ui.row().classes('w-full gap-2'):
                 ui.button("No", on_click=dialog.close).classes("flex-1")
                 def acceptSwitch():
                     dialog.close()
@@ -487,14 +487,14 @@ def main():
                     with status_indicators["pc"]:
                         ui.label("PC")
                 with ui.card().classes("w-full"):
-                    status_stream_image = ui.image(createErrorImage("Initializing ...")).classes("w-full")
+                    status_stream_image = ui.image(createErrorImage("Initializing ...")).classes("w-full").props('no-transition no-spinner')
                 with ui.card().classes("w-full"):
-                    status_allsky_image = ui.image(s.q("weather_image")).classes("w-full")
+                    status_allsky_image = ui.image(s.q("weather_image")).classes("w-full").props('no-transition no-spinner')
 
         with ui.tab_panel(tab_weather):
             with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
                 with ui.card().classes("w-full lg:col-span-1"):
-                    weather_allsky_image = ui.image(s.q("weather_image")).classes("w-full")
+                    weather_allsky_image = ui.image(s.q("weather_image")).classes("w-full").props('no-transition no-spinner')
                 with ui.grid().classes('grid-cols-2 lg:grid-cols-5 w-full gap-4 lg:col-span-2'):
                     for thing in weather_items:
                         with ui.card().classes("w-full"):
