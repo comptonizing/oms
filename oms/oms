@@ -588,7 +588,6 @@ def main():
                 color = indicator_colors["off"]
             else:
                 color = indicator_colors["unkn"]
-            logger.info(f"Button {name} is {state} -> {color}")
             status_indicators[name].style(f'background-color: {color}')
 
     def updateStream():
