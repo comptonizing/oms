@@ -86,13 +86,11 @@ def captureLoop():
         url = s.q("stream_rtsp", fallback="")
         if url == "":
             frame = createErrorImage("RTSP not configured")
-            with last_stream_image_lock:
-                last_stream_image = frame
-            continue
-        try:
-            frame = grabRTSP(s.q("stream_rtsp"))
-        except Exception as e:
-            frame = createErrorImage("{}".format(e))
+        else:
+            try:
+                frame = grabRTSP(url)
+            except Exception as e:
+                frame = createErrorImage("{}".format(e))
         with last_stream_image_lock:
             last_stream_image = frame
         time.sleep(s.q("stream_refresh", fallback=5))
@@ -166,6 +164,7 @@ def initSwitch(name: str, pin: int, init: str, last: str):
     else:
         if init != "off":
             logger.warning("Unknown init value {} for switch {}, defaulting to off".format(init, name))
+        initState = switch.State.OFF
     if name in switches:
         if switches[name]["switch"].pin == pin:
             switches[name]["init"] = init
@@ -263,7 +262,7 @@ def getLastRoofState():
     return lastRoofState
 
 def roofLoop():
-    global roofThread, roofStopEvent, lastRoofState, roofLock
+    global roofThread, roofStopEvent, lastRoofState, roofLock, lastRoofIconUpdate
     while not roofStopEvent.is_set():
         time.sleep(0.05)
         try:
@@ -427,7 +426,7 @@ def main():
             }
 
     def processClickFan():
-        if not roof.Roof.get().isInitialized():
+        if not roof.Roof.isInitialized():
             ui.notify("Roof not initialized", type="negative")
             return
         with ui.dialog() as dialog, ui.card():
