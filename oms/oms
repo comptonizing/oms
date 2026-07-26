@@ -98,17 +98,6 @@ def captureLoop():
             last_stream_image = frame
         time.sleep(s.q("stream_refresh", fallback=5))
 
-def startCaptureLoop():
-    global captureStopEvent
-    logger.info("Starting capture loop")
-    captureStopEvent.clear()
-    captureThread = threading.Thread(
-        target=captureLoop,
-        daemon=True,
-        name="OMS rstp worker"
-    ).start()
-    logger.info("Capture loop started")
-
 def stopCaptureLoop():
     global captureThread, captureStopEvent
     logger.info("Stopping capture loop")
@@ -117,6 +106,19 @@ def stopCaptureLoop():
         captureStopEvent.set()
         captureThread.join()
     logger.info("Capture loop stopped")
+
+def startCaptureLoop():
+    global captureThread, captureStopEvent
+    stopCaptureLoop()
+    logger.info("Starting capture loop")
+    captureStopEvent.clear()
+    captureThread = threading.Thread(
+        target=captureLoop,
+        daemon=True,
+        name="OMS rstp worker"
+    )
+    captureThread.start()
+    logger.info("Capture loop started")
 
 async def queryWeather(api, thing, start, window):
     bucket = s.q("weather_db_bucket", fallback="weather") or "weather"
