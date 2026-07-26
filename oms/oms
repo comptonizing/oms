@@ -120,8 +120,8 @@ def stopCaptureLoop():
 def startCaptureLoop():
     global captureThread, captureStopEvent
     stopCaptureLoop()
-    logger.info("Starting capture loop")
     captureStopEvent.clear()
+    logger.info("Starting capture loop")
     captureThread = threading.Thread(
         target=captureLoop,
         daemon=True,
@@ -132,13 +132,32 @@ def startCaptureLoop():
 
 environmentInfluxClient = None
 environmentSerial = None
+environmentThread = None
 environmentLock = threading.Lock()
-def environmentSetup():
-    global environmentInfluxClient, environmentSerial, environmentLock
+environmentStopEvent = threading.Event()
+def environmentWorkerLoop():
+    global environmentStopEvent, environmentInfluxClient, environmentSerial
+    while not environmentStopEvent.is_set():
+        time.sleep(s.q("weather_refresh", fallback=5))
+
+def stopEnvironmentWorker():
+    global environmentLock, environmentThread
+    if environmentThread is not None and environmentThread.is_alive():
+        logger.info("Stopping environment thread")
+        environmentStopEvent.set()
+        environmentThread.join(timeout=5)
+        if environmentThread.is_aliver():
+            logger.warning("Environment thread still alive")
+        else:
+            environmentThread = None
+            logger.info("Environment thread stopped")
+
+def setupEnvironmentWorker():
+    global environmentInfluxClient, environmentSerial, environmentLock, environmentLock
     logger.info("Setting up environment sensor and database")
     if not environmentLock.acquire(timeout=5):
         logger.warning("Error acquiring environment lock")
-        return
+        return False
     try:
         if environmentSerial is not None:
             try:
@@ -164,7 +183,7 @@ def environmentSetup():
                 msg = f"Error setting up influx client: {e}"
                 logger.error(msg)
                 triggerEvent("error", msg)
-                return
+                return False
 
         port = s.q("weather_environment_port", fallback=None)
         baud = s.q("weather_environment_baud", fallback=None)
@@ -172,10 +191,10 @@ def environmentSetup():
         if port is None or baud is None:
             logger.warning("Environment serial port not available")
             triggerEvent("warning", "Environment serial port not available")
-            return
+            return False
         logger.info("Opening serial port {}".format(port))
         try:
-            environmentSerial = Serial(port, baud, timeout=timeout, write_timeout=timeout)
+            environmentSerial = Serial(port, baud, timeout=timeout, write_timeout=timeout, exclusive=True)
             environmentSerial.reset_input_buffer()
             environmentSerial.reset_output_buffer()
             if not environmentSerial.is_open:
@@ -185,12 +204,28 @@ def environmentSetup():
             logger.warning(msg)
             triggerEvent("error", msg)
             environmentSerial = None
-            return
+            return False
     finally:
         environmentLock.release()
+    return True
 
-async def environmentWorker():
-    pass
+def startEnvironmentWorker():
+    global environmentThread, environmentStopEvent
+    stopEnvironmentWorker()
+    environmentStopEvent.clear()
+    logger.info("Starting environment loop")
+    if not setupEnvironmentWorker():
+        msg = "Could not set up environment board"
+        logger.error(msg)
+        triggerEvent("eror", msg)
+        return
+    environmentThread = threading.Thread(
+            target = environmentWorkerLoop,
+            daemon = True,
+            name = "Environment worker"
+            )
+    environmentThread.start()
+    logger.info("Environment loop started")
 
 async def queryWeather(api, thing, start, window):
     bucket = s.q("weather_db_bucket", fallback="weather") or "weather"
@@ -1213,10 +1248,10 @@ def main():
     ''')
 
 def initStuff():
-    environmentSetup()
     makeRoof()
     initSwitches()
     startCaptureLoop()
+    startEnvironmentWorker()
 
 @app.on_shutdown
 async def shutdown():
