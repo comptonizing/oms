@@ -93,6 +93,8 @@ class Roof():
         return self.__thread is not None and self.__thread.is_alive()
 
     def disconnect(self):
+        if self.__serial is None:
+            return
         try:
             self.__serial.close()
         except (SerialException, OSError):
