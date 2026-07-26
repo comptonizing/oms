@@ -194,40 +194,6 @@ def initSwitches():
             continue
         initSwitch(name, pin, init, last)
 
-addSwitchLock = threading.Lock()
-def addSwitch(name: str, pin: int, init: str):
-    with addSwitchLock:
-        logger.debug("Adding switch {} pin {} initial {}".format(name, pin, init))
-        if pinUsedForRoof(pin):
-            raise ValueError("Pin {} already used for roof".format(pin))
-        if name in switches.keys():
-            raise ValueError("Switch with name {} already defined".format(name))
-        for thing in switches:
-            if switches[thing]["switch"].pin == pin:
-                raise ValueError("Pin {} already used for switch {}".format(pin, thing))
-        last = init
-        if last == "last":
-            last = "off"
-        initSwitch(name, pin, init, last)
-        stored = s.q("switches")
-        stored[name] = {
-                "pin": pin,
-                "init": init,
-                "last": last,
-                }
-        s.p("switches", stored)
-
-removeSwitchLock = threading.Lock()
-def removeSwitch(name: str):
-    with removeSwitchLock:
-        logger.debug("Removing switch {}".format(name))
-        stored = s.q("switches")
-        if name in stored:
-            del stored[name]
-            s.p("switches", stored)
-        if name in switches:
-            del switches[name]
-
 setSwitchStateLock = threading.Lock()
 def setSwitchState(name: str, state: switch.State):
     with setSwitchStateLock:
