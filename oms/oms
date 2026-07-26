@@ -284,8 +284,9 @@ def stopRoof():
         roofThread.join(timeout=5)
         if roofThread.is_alive():
             logger.warning("Roof thread still running")
-        roofThread = None
-        logger.info("Roof stopped")
+        else:
+            roofThread = None
+            logger.info("Roof stopped")
     triggerEvent("roofUpdate", None)
 
 
