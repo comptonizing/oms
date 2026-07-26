@@ -1,11 +1,8 @@
 import logging
-import asyncio
 from enum import Enum
 import numpy as np
 from serial import Serial, SerialException
-from nicegui import ui
 import threading
-
 
 import switch
 
@@ -47,9 +44,14 @@ class Roof():
     _instance = None
 
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            return cls._instance
+        if cls._instance is not None:
+            raise RuntimeError("Roof is already initialized")
+        cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @classmethod
+    def isInitialized(cls):
+        return cls._instance != None
 
     @classmethod
     def reset(cls):
@@ -93,7 +95,7 @@ class Roof():
     def disconnect(self):
         try:
             self.__serial.close()
-        except (serial.SerialException, OSError):
+        except (SerialException, OSError):
             pass
         self.__serial = None
 
@@ -117,14 +119,14 @@ class Roof():
     def read(self, size):
         try:
             return self.__serial.read(size)
-        except (serial.SerialException, OSError):
+        except (SerialException, OSError):
             self.reconnect()
             return self.__serial.read(size)
 
     def write(self, data):
         try:
             return self.__serial.write(data)
-        except (serial.SerialException, OSError):
+        except (SerialException, OSError):
             self.reconnect()
             return self.__serial.write(data)
 
@@ -151,8 +153,6 @@ class Roof():
             self.__thread = threading.Thread(target=self.loop, daemon=True)
             self.__thread.start()
 
-
-
     def stopLoop(self):
         logger.info("Stopping roof loop")
         self.__stop_event.set()
@@ -165,3 +165,9 @@ class Roof():
         finally:
             # cleanup
             pass
+
+    def fansOn(self):
+        return self.decodeResponse(self.writeCmd(CMD.FANS_ON))
+
+    def fansOff(self):
+        return self.decodeResponse(self.writeCmd(CMD.FANS_OFF))

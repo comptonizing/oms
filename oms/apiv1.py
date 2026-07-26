@@ -3,7 +3,6 @@ from http import HTTPStatus as status
 from fastapi.responses import JSONResponse, Response
 import requests
 import logging
-import json
 
 import settings as s
 

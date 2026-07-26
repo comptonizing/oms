@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import sys
 import time
 import logging
 import argparse
@@ -9,21 +8,18 @@ import threading
 import base64
 import json
 import cv2
-from pathlib import Path
 from PIL import Image, ImageDraw
 from io import BytesIO
-from nicegui import ui, app, background_tasks, Client
-from nicegui.storage import Storage
 import plotly.graph_objects as go
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
+from nicegui import ui, app, Client
 
 
 from container import Container
 import settings as s
 import switch
+import roof
 import apiv1
-from roof import Roof
-
 
 
 parser = argparse.ArgumentParser(description = "Observatory Management System")
@@ -42,12 +38,14 @@ os.environ["NICEGUI_STORAGE_PATH"] = args.storage
 
 indicator_colors = dict(on="green", off="red", unkn="gray")
 
+mainLoop = None
+
 
 def grabRTSP(url: str, timeout=5):
     logger.debug("Grabbing frame from {}".format(url))
+    logger.debug("Opening capture")
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     try:
-        logger.debug("Opening capture")
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout * 1000)
         cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout * 1000)
 
@@ -61,8 +59,7 @@ def grabRTSP(url: str, timeout=5):
             raise Exception("Received empty frame from {}".format(url))
         return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     finally:
-        if cap is not None:
-            cap.release()
+        cap.release()
 
 
 def createErrorImage(text: str):
@@ -86,8 +83,11 @@ last_stream_image_lock = threading.Lock()
 def captureLoop():
     global last_stream_image
     while True:
-        if s.q("stream_rtsp") == "":
+        url = s.q("stream_rtsp", fallback="")
+        if url == "":
             frame = createErrorImage("RTSP not configured")
+            with last_stream_image_lock:
+                last_stream_image = frame
             continue
         try:
             frame = grabRTSP(s.q("stream_rtsp"))
@@ -95,14 +95,16 @@ def captureLoop():
             frame = createErrorImage("{}".format(e))
         with last_stream_image_lock:
             last_stream_image = frame
+        time.sleep(s.q("stream_refresh", fallback=5))
 
 async def queryWeather(api, thing, start, window):
-    query = """from(bucket: "weather")
+    bucket = s.q("weather_db_bucket", fallback="weather") or "weather"
+    query = """from(bucket: "{}")
       |> range(start: -{})
       |> filter(fn: (r) => r["_measurement"] == "weather")
       |> filter(fn: (r) => r["_field"] == "{}")
       |> aggregateWindow(every: {}, fn: mean, createEmpty: false)
-      |> yield(name: "mean")""".format(start, thing, window)
+      |> yield(name: "mean")""".format(bucket, start, thing, window)
     logger.debug("Querying weather: " + query)
 
     result = await api.query(org=s.q("weather_db_org"), query=query)
@@ -118,13 +120,14 @@ async def queryWeather(api, thing, start, window):
 updateQueue = asyncio.Queue()
 updateCallbacks: dict[str, callable] = {}
 def triggerEvent(*args):
-    updateQueue.put_nowait(list(args))
+    global mainLoop
+    mainLoop.call_soon_threadsafe(updateQueue.put_nowait, list(args))
 
 
 async def updateWorker():
     while True:
         thing = await updateQueue.get()
-        logger.debug("update workger got event {}".format(thing))
+        logger.debug("update worker got event {}".format(thing))
         for clientId, client in list(Client.instances.items()):
             if clientId not in updateCallbacks:
                 continue
@@ -158,13 +161,11 @@ def getSwitchState(name: str):
 def initSwitch(name: str, pin: int, init: str, last: str):
     if init == "on":
         initState = switch.State.ON
-    elif init == "off":
-        initState = switch.State.OFF
     elif init == "last":
-        if last == "on":
-            initState = switch.State.ON
-        else:
-            initState = switch.State.OFF
+        initState = switch.State.ON if last == "on" else switch.State.OFF
+    else:
+        if init != "off":
+            logger.warning("Unknown init value {} for switch {}, defaulting to off".format(init, name))
     if name in switches:
         if switches[name]["switch"].pin == pin:
             switches[name]["init"] = init
@@ -175,9 +176,6 @@ def initSwitch(name: str, pin: int, init: str, last: str):
             "switch": switch.Switch(pin, init=initState),
             "init": init
             }
-
-def deinitSwitch(name: str):
-    pass
 
 def initSwitches():
     names = switch_names
@@ -240,9 +238,7 @@ def setSwitchState(name: str, state: switch.State):
         s.p(name + "_last", stateString)
         triggerEvent("setSwitchState", name, stateString)
 
-
-def makeRoof():
-    Roof.reset()
+def checkRoofPins():
     if not s.has("roof_pins_west_close") or s.q("roof_pins_west_close") == "":
         return False
     if not s.has("roof_pins_west_open") or s.q("roof_pins_west_open") == "":
@@ -253,24 +249,87 @@ def makeRoof():
         return False
     if not s.has("roof_port") or s.q("roof_port") == "":
         return False
-    baud = 9600
-    if s.has("roof_baud"):
-        baud = s.q("roof_baud")
-    timeout = 1
-    if s.has("roof_timeout"):
-        timeout = s.q("roof_timeout")
-    try:
-        Roof(
-                s.q("roof_pins_west_open"),
-                s.q("roof_pins_west_close"),
-                s.q("roof_pins_east_open"),
-                s.q("roof_pins_east_close"),
-                s.q("roof_port"),
-                baud = baud,
-                timeout = timeout)
-    except Exception as e:
-        logger.error("Could not initialize roof: {}".format(e))
-        roof.clear()
+    return True
+
+roofLock = threading.Lock()
+roofThread = None
+roofStopEvent = threading.Event()
+lastRoofState = [False] * (max(c.value for c in roof.ResponseState) + 1)
+lastRoofIconUpdate = time.time()
+roofIconUpdateInterval = 3
+
+def getLastRoofState():
+    global lastRoofState
+    return lastRoofState
+
+def roofLoop():
+    global roofThread, roofStopEvent, lastRoofState, roofLock
+    while not roofStopEvent.is_set():
+        time.sleep(0.05)
+        try:
+            with roofLock:
+                currentRoofState = roof.Roof.get().getStatus()
+            if currentRoofState != lastRoofState or time.time() - lastRoofIconUpdate > roofIconUpdateInterval:
+                triggerEvent("roofUpdate", currentRoofState)
+                lastRoofIconUpdate = time.time()
+                lastRoofState = currentRoofState
+        except Exception as e:
+            logger.error("Error in roof thread: {}".format(e))
+
+
+def makeRoof():
+    global roofThread, roofStopEvent, lastRoofState, roofLock
+    if roofThread is not None and roofThread.is_alive():
+        logger.info("Stopping roof thread")
+        roofStopEvent.set()
+        roofThread.join()
+        roofThread = None
+    with roofLock:
+        roof.Roof.reset()
+        if not checkRoofPins():
+            triggerEvent("roofUpdate", None)
+            return False
+        baud = 9600
+        if s.has("roof_baud"):
+            baud = s.q("roof_baud")
+        timeout = 1
+        if s.has("roof_timeout"):
+            timeout = s.q("roof_timeout")
+        try:
+            roof.Roof(
+                    s.q("roof_pins_west_open"),
+                    s.q("roof_pins_west_close"),
+                    s.q("roof_pins_east_open"),
+                    s.q("roof_pins_east_close"),
+                    s.q("roof_port"),
+                    baud = baud,
+                    timeout = timeout)
+            triggerEvent("roofUpdate", roof.Roof.get().getStatus())
+            roofThread = threading.Thread(target=roofLoop, name="OMS roof worker")
+            roofThread.start()
+            return True
+        except Exception as e:
+            logger.error("Could not initialize roof: {}".format(e))
+            roofThread = None
+            roof.Roof.reset()
+            triggerEvent("roofUpdate", None)
+            return False
+
+def setFans(mode):
+    s.p("fan_mode", mode)
+    if mode == "auto":
+        # TODO implement fan auto mode
+        logger.error("Auto fan mode not implemented yet")
+        return
+    with roofLock:
+        if mode == "on":
+            logger.info("Switching fans on")
+            status = roof.Roof.get().fansOn()
+        elif mode == "off":
+            logger.info("Switching fans off")
+            status = roof.Roof.get().fansOff()
+        triggerEvent("roofUpdate", status)
+
 
 
 @ui.page("/")
@@ -308,16 +367,7 @@ def main():
     }
     </style>
     ''')
-    _db_url = s.q("weather_db_url", fallback=None)
-    _db_token = s.q("weather_db_token", fallback=None)
-    _db_org = s.q("weather_db_org", fallback=None)
-    if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
-        influx_client = InfluxDBClientAsync(
-                url = s.q("weather_db_url"),
-                token = s.q("weather_db_token"),
-                org = s.q("weather_db_org"),
-                )
-        query_api = influx_client.query_api()
+
     settings = {}
 
     def onTabChange(e):
@@ -377,7 +427,18 @@ def main():
             }
 
     def processClickFan():
-        pass
+        if not roof.Roof.get().isInitialized():
+            ui.notify("Roof not initialized", type="negative")
+            return
+        with ui.dialog() as dialog, ui.card():
+            ui.label("Fan settings")
+            fanToggle = ui.toggle(["off", "on", "auto"], value=s.q("fan_mode", fallback="off")).classes("w-full")
+            def applyFans():
+                dialog.close()
+                setFans(fanToggle.value)
+            ui.button("Apply", on_click=applyFans).classes("w-full")
+
+        dialog.open()
 
     def processClickSwitch(thing: str):
         if not thing in switch_names:
@@ -385,6 +446,7 @@ def main():
             return
         if not thing in switches.keys():
             ui.notify(f"Switch for {thing} not configured!", type="negative")
+            return
 
         stateOld = switches[thing]["switch"].state
         if stateOld is switch.State.ON:
@@ -564,7 +626,7 @@ def main():
                     with ui.card().tight().classes("w-full"):
                         ui.label("Allsky")
                         with ui.card_section().classes("w-full"):
-                            settings["allky_pin"] = ui.number("Pin", value=s.q("allsky_pin", fallback=None), step=1, format='%d')
+                            settings["allsky_pin"] = ui.number("Pin", value=s.q("allsky_pin", fallback=None), step=1, format='%d')
                             settings["allsky_init"] = ui.select(["off", "on", "last"], value=s.q("allsky_init", fallback="off"))
                     with ui.card().tight().classes("w-full"):
                         ui.label("Pier")
@@ -590,6 +652,43 @@ def main():
                 color = indicator_colors["unkn"]
             status_indicators[name].style(f'background-color: {color}')
 
+    def updateRoofIcons(status: roof.ResponseState | None):
+        if status is None:
+            for thing in ["west_open_north", "west_open_south", "west_close_north", "west_close_south", "east_open_north", "east_open_south", "east_close_north", "east_close_south"]:
+                status_indicators[thing].props("color=gray")
+            for thing in ["west_push_north", "west_push_south", "east_push_north", "east_push_south"]:
+                status_indicators[thing].style("background-color: transparent")
+            for thing in ["west_open", "west_close", "east_open", "east_close"]:
+                status_indicators[thing].set_visibility(False)
+            for thing in status_indicators["fans"]:
+                thing.classes(add="animate-none", remove="animate-spin")
+            return
+
+        colors = ["red", "green"]
+        status_indicators["west_close_north"].props(f"color={colors[status[roof.ResponseState.SW1.value]]}")
+        status_indicators["west_close_south"].props(f"color={colors[status[roof.ResponseState.SW2.value]]}")
+        status_indicators["west_open_north"].props(f"color={colors[status[roof.ResponseState.SW3.value]]}")
+        status_indicators["west_open_south"].props(f"color={colors[status[roof.ResponseState.SW4.value]]}")
+        status_indicators["east_close_north"].props(f"color={colors[status[roof.ResponseState.SW5.value]]}")
+        status_indicators["east_close_south"].props(f"color={colors[status[roof.ResponseState.SW6.value]]}")
+        status_indicators["east_open_north"].props(f"color={colors[status[roof.ResponseState.SW7.value]]}")
+        status_indicators["east_open_south"].props(f"color={colors[status[roof.ResponseState.SW8.value]]}")
+
+        colors = ["background-color: transparent", "background-color: gray"]
+        status_indicators["west_push_north"].style(colors[status[roof.ResponseState.WEST_STATE.value]])
+        status_indicators["west_push_south"].style(colors[status[roof.ResponseState.WEST_STATE.value]])
+        status_indicators["east_push_north"].style(colors[status[roof.ResponseState.EAST_STATE.value]])
+        status_indicators["east_push_south"].style(colors[status[roof.ResponseState.EAST_STATE.value]])
+
+        animateAdd = ["animate-none", "animate-spin"][status[roof.ResponseState.FANS.value]]
+        animateRemove = ["animate-spin", "animate-none"][status[roof.ResponseState.FANS.value]]
+        for thing in status_indicators["fans"]:
+            thing.classes(add=animateAdd, remove=animateRemove)
+
+        # TODO blinking arrows are missing
+
+
+
     def updateStream():
         if last_stream_image is not None:
             with last_stream_image_lock:
@@ -600,21 +699,29 @@ def main():
         w = weather_ranges[r]
         sleepTime = 0.3
 
+        try:
+            api = query_api.get()
+        except:
+            return
+
+        if api is None:
+            return
+
         plot = weather_plots["Temperature"]
         fig = plot.figure
         fig.update_yaxes(title_text="Temperature (°C)")
         fig.data = []
-        t, v = await queryWeather(query_api, "env_temperature", r, w)
+        t, v = await queryWeather(api, "env_temperature", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Temperature Air")
         fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
         logger.debug("Done")
-        t, v = await queryWeather(query_api, "env_dewpoint", r, w)
+        t, v = await queryWeather(api, "env_dewpoint", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Temperature Dewpoint")
         fig.add_scatter(x=t, y=v, mode="lines", name="Dewpoint", line={"color": "orange"})
         logger.debug("Done")
-        t, v = await queryWeather(query_api, "inside_temperature", r, w)
+        t, v = await queryWeather(api, "inside_temperature", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Temperature Inside")
         fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "blue"})
@@ -625,12 +732,12 @@ def main():
         fig = plot.figure
         fig.update_yaxes(title_text="Temperature (°C)")
         fig.data = []
-        t, v = await queryWeather(query_api, "ir_sky", r, w)
+        t, v = await queryWeather(api, "ir_sky", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Sky Sky")
         fig.add_scatter(x=t, y=v, mode="lines", name="Sky", line={"color": "green"})
         logger.debug("Done")
-        t, v = await queryWeather(query_api, "ir_diff", r, w)
+        t, v = await queryWeather(api, "ir_diff", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Sky Difference")
         fig.add_scatter(x=t, y=v, mode="lines", name="Difference", line={"color": "orange"})
@@ -641,12 +748,12 @@ def main():
         fig = plot.figure
         fig.update_yaxes(title_text="Speed (km/h)")
         fig.data = []
-        t, v = await queryWeather(query_api, "wind_speed", r, w)
+        t, v = await queryWeather(api, "wind_speed", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Wind Speed")
         fig.add_scatter(x=t, y=v, mode="lines", name="Speed", line={"color": "green"})
         logger.debug("Done")
-        t, v = await queryWeather(query_api, "wind_gust", r, w)
+        t, v = await queryWeather(api, "wind_gust", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Wind Gust")
         fig.add_scatter(x=t, y=v, mode="lines", name="Gust", line={"color": "orange"})
@@ -657,12 +764,12 @@ def main():
         fig = plot.figure
         fig.update_yaxes(title_text="Humidity (%)")
         fig.data = []
-        t, v = await queryWeather(query_api, "env_humidity", r, w)
+        t, v = await queryWeather(api, "env_humidity", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Humidity Air")
         fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
         logger.debug("Done")
-        t, v = await queryWeather(query_api, "inside_humidity", r, w)
+        t, v = await queryWeather(api, "inside_humidity", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Humidity Inside")
         fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "orange"})
@@ -674,7 +781,7 @@ def main():
         fig = plot.figure
         fig.update_yaxes(title_text="SQM (mag/arcsec^2)")
         fig.data = []
-        t, v = await queryWeather(query_api, "sqm_mpsas", r, w)
+        t, v = await queryWeather(api, "sqm_mpsas", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting SQM SQM")
         fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
@@ -684,12 +791,12 @@ def main():
         plot = weather_plots["Rain"]
         fig = plot.figure
         fig.data = []
-        t, v = await queryWeather(query_api, "rain_percentage", r, w)
+        t, v = await queryWeather(api, "rain_percentage", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Rain Amount")
         fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Amount", line={"color": "green"})
         logger.debug("Done")
-        t, v = await queryWeather(query_api, "rain_capacitance", r, w)
+        t, v = await queryWeather(api, "rain_capacitance", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Rain Capacitance")
         fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Capacitance", line={"color": "orange"})
@@ -710,7 +817,7 @@ def main():
         fig = plot.figure
         fig.update_yaxes(title_text="Pressure (hPa)")
         fig.data = []
-        t, v = await queryWeather(query_api, "env_pressure", r, w)
+        t, v = await queryWeather(api, "env_pressure", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting Pressure Pressue")
         fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
@@ -720,12 +827,12 @@ def main():
         plot = weather_plots["Rain Heating"]
         fig = plot.figure
         fig.data = []
-        t, v = await queryWeather(query_api, "rain_dutycycle", r, w)
+        t, v = await queryWeather(api, "rain_dutycycle", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting RainHeating Dutycycle")
         fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Dutycycle", line={"color": "green"})
         logger.debug("Done")
-        t, v = await queryWeather(query_api, "rain_temperature", r, w)
+        t, v = await queryWeather(api, "rain_temperature", r, w)
         await asyncio.sleep(sleepTime)
         logger.debug("Plotting RainHeating Temperature")
         fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Temperature", line={"color": "blue"})
@@ -881,6 +988,8 @@ def main():
 
     timers = {}
 
+    query_api = Container()
+
     def initTimers():
         for thing in timers:
             timers[thing].cancel()
@@ -890,24 +999,32 @@ def main():
         timers["update_plots"] = ui.timer(s.q("weather_refresh"), updatePlots)
         timers["update_stream"] = ui.timer(s.q("stream_refresh"), updateStream)
 
-    def processSettingsUpdate():
-        initTimers()
-        status_allsky_image.set_source(s.q("weather_image"))
-        updateButtons()
+    def makeInfluxClient():
         _db_url = s.q("weather_db_url", fallback=None)
         _db_token = s.q("weather_db_token", fallback=None)
         _db_org = s.q("weather_db_org", fallback=None)
         if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
             influx_client = InfluxDBClientAsync(
-                    url = s.q("weather_db_url"),
-                    token = s.q("weather_db_token"),
-                    org = s.q("weather_db_org"),
+                    url = _db_url,
+                    token = _db_token,
+                    org = _db_org
                     )
-            query_api = influx_client.query_api()
+            query_api.set(influx_client.query_api())
+        else:
+            query_api.clear()
+
+    def processSettingsUpdate():
+        makeInfluxClient()
+        initTimers()
+        status_allsky_image.set_source(s.q("weather_image"))
+        updateButtons()
+
 
     def onConnect():
+        makeInfluxClient()
         initTimers()
         updateButtons()
+        updateRoofIcons(getLastRoofState())
     ui.context.client.on_connect(onConnect)
 
     def onDisconnect():
@@ -923,6 +1040,9 @@ def main():
         if thing[0] == "updateSettings":
             processSettingsUpdate()
             return
+        if thing[0] == "roofUpdate":
+            updateRoofIcons(thing[1])
+            return
         logger.error(f"Unknown update event, ignoring: {thing}")
 
     updateCallbacks[ui.context.client.id] = update
@@ -935,10 +1055,13 @@ def initStuff():
 
 @app.on_startup
 async def startup():
+    global mainLoop
     await s.init()
+    mainLoop = asyncio.get_event_loop()
     threading.Thread(
         target=captureLoop,
         daemon=True,
+        name="OMS rstp worker"
     ).start()
     asyncio.create_task(updateWorker())
     initStuff()
