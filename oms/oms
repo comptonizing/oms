@@ -342,7 +342,7 @@ def setFans(mode, auto=False):
     try:
         if not roof.Roof.isInitialized():
             logger.debug("Roof not initialized, ignoring")
-            triggerEvent("fanError", mode, "Roof not initialzied")
+            triggerEvent("fanError", mode, "Roof not initialized")
             return
         logger.info(f"Switching fans {mode}")
         try:
