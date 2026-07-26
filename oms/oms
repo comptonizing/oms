@@ -81,10 +81,11 @@ def createErrorImage(text: str):
 
 last_stream_image = None
 last_stream_image_lock = threading.Lock()
-
+captureThread = None
+captureStopEvent = threading.Event()
 def captureLoop():
-    global last_stream_image
-    while True:
+    global last_stream_image, last_stream_image_lock, captureStopEvent
+    while not captureStopEvent.is_set():
         url = s.q("stream_rtsp", fallback="")
         if url == "":
             frame = createErrorImage("RTSP not configured")
@@ -96,6 +97,26 @@ def captureLoop():
         with last_stream_image_lock:
             last_stream_image = frame
         time.sleep(s.q("stream_refresh", fallback=5))
+
+def startCaptureLoop():
+    global captureStopEvent
+    logger.info("Starting capture loop")
+    captureStopEvent.clear()
+    captureThread = threading.Thread(
+        target=captureLoop,
+        daemon=True,
+        name="OMS rstp worker"
+    ).start()
+    logger.info("Capture loop started")
+
+def stopCaptureLoop():
+    global captureThread, captureStopEvent
+    logger.info("Stopping capture loop")
+    if captureThread is not None and captureThread.is_alive():
+        logger.info("Stopping capture loop")
+        captureStopEvent.set()
+        captureThread.join()
+    logger.info("Capture loop stopped")
 
 async def queryWeather(api, thing, start, window):
     bucket = s.q("weather_db_bucket", fallback="weather") or "weather"
@@ -185,11 +206,11 @@ def initSwitches():
         init = s.q(name + "_init", fallback=None)
         last = s.q(name + "_last", fallback=None)
         if pin is None:
-            logger.warn("Pin for {} is not set up in settings, skipping".format(name))
+            logger.warning("Pin for {} is not set up in settings, skipping".format(name))
             continue
         pin = int(pin)
         if pinUsedForRoof(pin):
-            logger.warn("Switch for {} with pin {} is already in use for roof, removing".format(name, pin))
+            logger.warning("Switch for {} with pin {} is already in use for roof, removing".format(name, pin))
             s.rm(name + "_pin")
             s.rm(name + "_init")
             s.rm(name + "_last")
@@ -253,14 +274,20 @@ def roofLoop():
         except Exception as e:
             logger.error("Error in roof thread: {}".format(e))
 
-
-def makeRoof():
-    global roofThread, roofStopEvent, lastRoofState, roofLock
+def stopRoof():
+    global roofThread, roofStopEvent, roofLock
     if roofThread is not None and roofThread.is_alive():
         logger.info("Stopping roof thread")
         roofStopEvent.set()
         roofThread.join()
         roofThread = None
+        logger.info("Roof stopped")
+    triggerEvent("roofUpdate", None)
+
+
+def makeRoof():
+    global roofThread, roofStopEvent, lastRoofState, roofLock
+    stopRoof()
     with roofLock:
         roof.Roof.reset()
         if not checkRoofPins():
@@ -282,8 +309,11 @@ def makeRoof():
                     baud = baud,
                     timeout = timeout)
             triggerEvent("roofUpdate", roof.Roof.get().getStatus())
-            roofThread = threading.Thread(target=roofLoop, name="OMS roof worker")
+            logger.info("Starting roof thread")
+            roofStopEvent.clear()
+            roofThread = threading.Thread(target=roofLoop, name="OMS roof worker", daemon=True)
             roofThread.start()
+            logger.info("Roof thread started")
         except Exception as e:
             logger.error("Could not initialize roof: {}".format(e))
             roofThread = None
@@ -1078,17 +1108,18 @@ def main():
 def initStuff():
     makeRoof()
     initSwitches()
+    startCaptureLoop()
+
+@app.on_shutdown
+async def shutdown():
+    stopCaptureLoop()
+    stopRoof()
 
 @app.on_startup
 async def startup():
     global mainLoop
     await s.init()
     mainLoop = asyncio.get_event_loop()
-    threading.Thread(
-        target=captureLoop,
-        daemon=True,
-        name="OMS rstp worker"
-    ).start()
     asyncio.create_task(updateWorker())
     initStuff()
 
