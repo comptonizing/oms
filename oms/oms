@@ -852,98 +852,101 @@ def main():
                 thing.set_text("Error")
                 thing.classes(labelSize + " text-red-500")
             return
-        temperature = d["env_temperature"]
-        colstr = ""
-        if temperature < -20:
-            colstr = "text-red-500"
-        elif temperature < -10:
-            colstr = "text-orange-500"
-        elif temperature < 25:
-            colstr = "text-green-500"
-        elif temperature < 35:
-            colstr = "text-orange-500"
-        else:
-            colstr = "text-red-500"
-        weather_labels["env_temperature"].set_text("{:.1f} °C".format(temperature))
-        weather_labels["env_temperature"].classes(labelSize + " " + colstr)
+        try:
+            temperature = d["env_temperature"]
+            colstr = ""
+            if temperature < -20:
+                colstr = "text-red-500"
+            elif temperature < -10:
+                colstr = "text-orange-500"
+            elif temperature < 25:
+                colstr = "text-green-500"
+            elif temperature < 35:
+                colstr = "text-orange-500"
+            else:
+                colstr = "text-red-500"
+            weather_labels["env_temperature"].set_text("{:.1f} °C".format(temperature))
+            weather_labels["env_temperature"].classes(labelSize + " " + colstr)
 
-        humidity = d["env_humidity"]
-        if humidity < 10:
-            colstr = "text-red-500"
-        elif humidity < 20:
-            colstr = "text-orange-500"
-        elif humidity < 80:
-            colstr = "text-green-500"
-        elif humidity < 90:
-            colstr = "text-orange-500"
-        else:
-            colstr = "text-red-500"
-        weather_labels["env_humidity"].set_text("{:.1f} %".format(humidity))
-        weather_labels["env_humidity"].classes(labelSize + " " + colstr)
+            humidity = d["env_humidity"]
+            if humidity < 10:
+                colstr = "text-red-500"
+            elif humidity < 20:
+                colstr = "text-orange-500"
+            elif humidity < 80:
+                colstr = "text-green-500"
+            elif humidity < 90:
+                colstr = "text-orange-500"
+            else:
+                colstr = "text-red-500"
+            weather_labels["env_humidity"].set_text("{:.1f} %".format(humidity))
+            weather_labels["env_humidity"].classes(labelSize + " " + colstr)
 
-        dewpoint = d["env_dewpoint"]
-        weather_labels["env_dewpoint"].set_text("{:.1f} °C".format(dewpoint))
-        weather_labels["env_dewpoint"].classes(labelSize)
+            dewpoint = d["env_dewpoint"]
+            weather_labels["env_dewpoint"].set_text("{:.1f} °C".format(dewpoint))
+            weather_labels["env_dewpoint"].classes(labelSize)
 
-        rain = d["rain_percentage"]
-        if rain < 5:
-            colstr = "text-green-500"
-        elif rain < 10:
-            colstr = "text-orange-500"
-        else:
-            colstr = "text-red-500"
-        weather_labels["rain_percentage"].set_text("{:.0f} %".format(rain))
-        weather_labels["rain_percentage"].classes(labelSize + " " + colstr)
+            rain = d["rain_percentage"]
+            if rain < 5:
+                colstr = "text-green-500"
+            elif rain < 10:
+                colstr = "text-orange-500"
+            else:
+                colstr = "text-red-500"
+            weather_labels["rain_percentage"].set_text("{:.0f} %".format(rain))
+            weather_labels["rain_percentage"].classes(labelSize + " " + colstr)
 
-        elevation = s.q("weather_elevation")
-        pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
-        weather_labels["env_pressure"].set_text("{:.0f} hPa".format(pressure))
-        weather_labels["env_pressure"].classes(labelSize)
+            elevation = s.q("weather_elevation")
+            pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
+            weather_labels["env_pressure"].set_text("{:.0f} hPa".format(pressure))
+            weather_labels["env_pressure"].classes(labelSize)
 
-        sqm = d["sqm_mpsas"]
-        if sqm < 18:
-            colstr = "text-red-500"
-        elif sqm < 20:
-            colstr = "text-orange-500"
-        else:
-            colstr = "text-green-500"
+            sqm = d["sqm_mpsas"]
+            if sqm < 18:
+                colstr = "text-red-500"
+            elif sqm < 20:
+                colstr = "text-orange-500"
+            else:
+                colstr = "text-green-500"
 
-        weather_labels["sqm_mpsas"].set_text("{:.1f}".format(sqm))
-        weather_labels["sqm_mpsas"].classes(labelSize + " " + colstr)
+            weather_labels["sqm_mpsas"].set_text("{:.1f}".format(sqm))
+            weather_labels["sqm_mpsas"].classes(labelSize + " " + colstr)
 
-        ir_sky = d["ir_sky"]
-        weather_labels["ir_sky"].set_text("{:.1f} °C".format(ir_sky))
-        weather_labels["ir_sky"].classes(labelSize)
+            ir_sky = d["ir_sky"]
+            weather_labels["ir_sky"].set_text("{:.1f} °C".format(ir_sky))
+            weather_labels["ir_sky"].classes(labelSize)
 
-        ir_diff = d["ir_diff"]
-        if ir_diff < 15:
-            colstr = "text-red-500"
-        elif ir_diff < 20:
-            colstr = "text-orange-500"
-        else:
-            colstr = "text-green-500"
-        weather_labels["ir_diff"].set_text("{:.1f} °C".format(ir_diff))
-        weather_labels["ir_diff"].classes(labelSize + " " + colstr)
+            ir_diff = d["ir_diff"]
+            if ir_diff < 15:
+                colstr = "text-red-500"
+            elif ir_diff < 20:
+                colstr = "text-orange-500"
+            else:
+                colstr = "text-green-500"
+            weather_labels["ir_diff"].set_text("{:.1f} °C".format(ir_diff))
+            weather_labels["ir_diff"].classes(labelSize + " " + colstr)
 
-        wind_speed = d["wind_speed"]
-        if wind_speed < 15:
-            colstr = "text-green-500"
-        elif wind_speed < 20:
-            colstr = "text-orange-500"
-        else:
-            colstr = "text-red-500"
-        weather_labels["wind_speed"].set_text("{:.1f} km/h".format(wind_speed))
-        weather_labels["wind_speed"].classes(labelSize + " " + colstr)
+            wind_speed = d["wind_speed"]
+            if wind_speed < 15:
+                colstr = "text-green-500"
+            elif wind_speed < 20:
+                colstr = "text-orange-500"
+            else:
+                colstr = "text-red-500"
+            weather_labels["wind_speed"].set_text("{:.1f} km/h".format(wind_speed))
+            weather_labels["wind_speed"].classes(labelSize + " " + colstr)
 
-        wind_gust = d["wind_gust"]
-        if wind_gust < 30:
-            colstr = "text-green-500"
-        elif wind_gust < 40:
-            colstr = "text-orange-500"
-        else:
-            colstr = "text-red-500"
-        weather_labels["wind_gust"].set_text("{:.1f} km/h".format(wind_gust))
-        weather_labels["wind_gust"].classes(labelSize + " " + colstr)
+            wind_gust = d["wind_gust"]
+            if wind_gust < 30:
+                colstr = "text-green-500"
+            elif wind_gust < 40:
+                colstr = "text-orange-500"
+            else:
+                colstr = "text-red-500"
+            weather_labels["wind_gust"].set_text("{:.1f} km/h".format(wind_gust))
+            weather_labels["wind_gust"].classes(labelSize + " " + colstr)
+        except Exception as e:
+            logger.error("Error updating weather plots: {}".format(e))
 
 
 
