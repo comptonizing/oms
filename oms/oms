@@ -272,7 +272,6 @@ def makeRoof():
             triggerEvent("roofUpdate", roof.Roof.get().getStatus())
             roofThread = threading.Thread(target=roofLoop, name="OMS roof worker")
             roofThread.start()
-            return True
         except Exception as e:
             logger.error("Could not initialize roof: {}".format(e))
             roofThread = None
@@ -280,20 +279,35 @@ def makeRoof():
             triggerEvent("roofUpdate", None)
             return False
 
-def setFans(mode):
+    fans = s.q("fan_mode", fallback=None)
+    if fans is not None:
+        setFans(fans)
+    return True
+
+def setFans(mode, auto=False):
+    with roofLock:
+        if not roof.Roof.isInitialized():
+            return
+        logger.info(f"Switching fans {mode}")
+        try:
+            if mode == "on":
+                status = roof.Roof.get().fansOn()
+            elif mode == "off":
+                status = roof.Roof.get().fansOff()
+        except Exception as e:
+            logger.error("Error setting fans to {}: {}".format(mode, e))
+    triggerEvent("fanUpdate", mode, auto)
+    triggerEvent("roofUpdate", status)
+
+
+def setFanMode(mode):
     s.p("fan_mode", mode)
     if mode == "auto":
         # TODO implement fan auto mode
         logger.error("Auto fan mode not implemented yet")
         return
-    with roofLock:
-        if mode == "on":
-            logger.info("Switching fans on")
-            status = roof.Roof.get().fansOn()
-        elif mode == "off":
-            logger.info("Switching fans off")
-            status = roof.Roof.get().fansOff()
-        triggerEvent("roofUpdate", status)
+    logger.info(f"Switching fan mode to {mode}")
+    setFans(mode)
 
 
 
@@ -400,7 +414,7 @@ def main():
             fanToggle = ui.toggle(["off", "on", "auto"], value=s.q("fan_mode", fallback="off")).classes("w-full")
             def applyFans():
                 dialog.close()
-                setFans(fanToggle.value)
+                setFanMode(fanToggle.value)
             ui.button("Apply", on_click=applyFans).classes("w-full")
 
         dialog.open()
@@ -1010,6 +1024,10 @@ def main():
             return
         if thing[0] == "roofUpdate":
             updateRoofIcons(thing[1])
+            return
+        if thing[0] == "fanUpdate":
+            print("FAN UPDATE")
+            ui.notify(f"Fans set to {thing[1]} ({"auto" if thing[2] else "manual"})")
             return
         logger.error(f"Unknown update event, ignoring: {thing}")
 
