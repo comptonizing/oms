@@ -1126,4 +1126,4 @@ async def startup():
 try:
     ui.run(dark=True, favicon="favicon.svg", port=args.port, reload=False)
 except KeyboardInterrupt:
-    print("Shutdown requested ...", file=sys.stderr)
+    logger.info("Shutdown requested ...", file=sys.stderr)
