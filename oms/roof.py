@@ -103,7 +103,7 @@ class Roof():
 
     def connect(self):
         try:
-            self.__serial = Serial(self.__port, self.__baud, timeout=self.__timeout, write_timeout=self.__timeout)
+            self.__serial = Serial(self.__port, self.__baud, timeout=self.__timeout, write_timeout=self.__timeout, exclusive=True)
             self.__serial.reset_input_buffer()
             self.__serial.reset_output_buffer()
             if not self.__serial.is_open:
