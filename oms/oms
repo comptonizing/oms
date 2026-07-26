@@ -296,6 +296,7 @@ def setFans(mode, auto=False):
                 status = roof.Roof.get().fansOff()
         except Exception as e:
             logger.error("Error setting fans to {}: {}".format(mode, e))
+            return
     triggerEvent("fanUpdate", mode, auto)
     triggerEvent("roofUpdate", status)
 
