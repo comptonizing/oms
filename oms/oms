@@ -410,6 +410,14 @@ def main():
     </style>
     ''')
 
+    loading_overlay = ui.element('div').props('id=loading-overlay').style(
+            'position: fixed; inset: 0; z-index: 9999; display: flex; '
+            'align-items: center; justify-content: center; background-color: #121212; '
+            'transition: opacity 0.3s ease;'
+            )
+    with loading_overlay:
+        ui.spinner(size='xl', color='white')
+
     settings = {}
 
     def onTabChange(e):
@@ -1112,6 +1120,19 @@ def main():
     updateCallbacks[ui.context.client.id] = update
 
     tabs.set_value("Status")
+
+    ui.run_javascript('''
+        Promise.race([
+            document.fonts.ready,
+            new Promise(resolve => setTimeout(resolve, 3000))
+        ]).then(() => {
+            const el = document.getElementById('loading-overlay');
+            if (el) {
+                el.style.opacity = '0';
+                setTimeout(() => el.remove(), 300);
+            }
+        });
+    ''')
 
 def initStuff():
     makeRoof()
