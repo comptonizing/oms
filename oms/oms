@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
 import logging
 import argparse
@@ -1091,4 +1092,7 @@ async def startup():
     asyncio.create_task(updateWorker())
     initStuff()
 
-ui.run(dark=True, favicon="favicon.svg", port=args.port)
+try:
+    ui.run(dark=True, favicon="favicon.svg", port=args.port, reload=False)
+except KeyboardInterrupt:
+    print("Shutdown requested ...", file=sys.stderr)
