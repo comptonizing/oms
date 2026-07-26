@@ -118,10 +118,16 @@ class Roof():
 
     def read(self, size):
         try:
-            return self.__serial.read(size)
+            data = self.__serial.read(size)
         except (SerialException, OSError):
-            self.reconnect()
-            return self.__serial.read(size)
+            data = b""
+        if len(data) == size:
+            return data
+        self.reconnect()
+        data = self.__serial.read(size)
+        if len(data) != size:
+            raise SerialException("Incomplete read from serial port {}: expected {} bytes, got {}".format(self.__port, size, len(data)))
+        return data
 
     def write(self, data):
         try:
