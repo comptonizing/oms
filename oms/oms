@@ -146,14 +146,14 @@ def stopEnvironmentWorker():
         logger.info("Stopping environment thread")
         environmentStopEvent.set()
         environmentThread.join(timeout=5)
-        if environmentThread.is_aliver():
+        if environmentThread.is_alive():
             logger.warning("Environment thread still alive")
         else:
             environmentThread = None
             logger.info("Environment thread stopped")
 
 def setupEnvironmentWorker():
-    global environmentInfluxClient, environmentSerial, environmentLock, environmentLock
+    global environmentInfluxClient, environmentSerial, environmentLock
     logger.info("Setting up environment sensor and database")
     if not environmentLock.acquire(timeout=5):
         logger.warning("Error acquiring environment lock")
@@ -217,7 +217,7 @@ def startEnvironmentWorker():
     if not setupEnvironmentWorker():
         msg = "Could not set up environment board"
         logger.error(msg)
-        triggerEvent("eror", msg)
+        triggerEvent("error", msg)
         return
     environmentThread = threading.Thread(
             target = environmentWorkerLoop,
@@ -1256,6 +1256,7 @@ def initStuff():
 @app.on_shutdown
 async def shutdown():
     stopCaptureLoop()
+    stopEnvironmentWorker()
     stopRoof()
 
 @app.on_startup
