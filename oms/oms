@@ -129,10 +129,10 @@ async def updateWorker():
         for clientId, client in list(Client.instances.items()):
             if clientId not in updateCallbacks:
                 continue
-            async def run(cid=clientId, c=client):
+            async def run(cid=clientId, c=client, t=thing):
                 try:
                     with c:
-                        await updateCallbacks[cid](thing)
+                        await updateCallbacks[cid](t)
                 except Exception as e:
                     logger.warning("Error running callback on client {}:\n{}".format(cid, e))
             logger.debug("Dispatching event for client {}: {}".format(clientId, thing))
@@ -1027,7 +1027,6 @@ def main():
             updateRoofIcons(thing[1])
             return
         if thing[0] == "fanUpdate":
-            print("FAN UPDATE")
             ui.notify(f"Fans set to {thing[1]} ({"auto" if thing[2] else "manual"})")
             return
         logger.error(f"Unknown update event, ignoring: {thing}")
