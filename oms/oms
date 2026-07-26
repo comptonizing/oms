@@ -42,6 +42,12 @@ indicator_colors = dict(on="green", off="red", unkn="gray")
 
 mainLoop = None
 
+backgroundTasks: set[asyncio.Task] = set()
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    backgroundTasks.add(task)
+    task.add_done_callback(backgroundTasks.discard)
+    return task
 
 def grabRTSP(url: str, timeout=5):
     logger.debug("Grabbing frame from {}".format(url))
@@ -164,7 +170,7 @@ async def updateWorker():
                 except Exception as e:
                     logger.warning("Error running callback on client {}:\n{}".format(cid, e))
             logger.debug("Dispatching event for client {}: {}".format(clientId, thing))
-            asyncio.create_task(run())
+            spawn(run())
 
 def pinUsedForRoof(pin: int):
     l = [
@@ -1056,7 +1062,7 @@ def main():
     def makeInfluxClient():
         oldClient = influx_client.get()
         if oldClient is not None:
-            asyncio.create_task(oldClient.close())
+            spawn(oldClient.close())
             influx_client.clear()
             query_api.clear()
         _db_url = s.q("weather_db_url", fallback=None)
@@ -1089,7 +1095,7 @@ def main():
         updateCallbacks.pop(ui.context.client.id, None)
         oldClient = influx_client.get()
         if oldClient is not None:
-            asyncio.create_task(oldClient.close())
+            spawn(oldClient.close())
             influx_client.clear()
             query_api.clear()
     ui.context.client.on_disconnect(onDisconnect)
@@ -1149,7 +1155,7 @@ async def startup():
     global mainLoop
     await s.init()
     mainLoop = asyncio.get_event_loop()
-    asyncio.create_task(updateWorker())
+    spawn(updateWorker())
     initStuff()
 
 try:
