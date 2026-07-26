@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 from io import BytesIO
 import plotly.graph_objects as go
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
+from serial import Serial, SerialException
 
 parser = argparse.ArgumentParser(description = "Observatory Management System")
 parser.add_argument("--storage", required=True, help="Path to app storage")
@@ -128,6 +129,64 @@ def startCaptureLoop():
     )
     captureThread.start()
     logger.info("Capture loop started")
+
+environmentInfluxClient = None
+environmentSerial = None
+environmentLock = threading.Lock()
+def environmentSetup():
+    global environmentInfluxClient, environmentSerial, environmentLock
+    logger.info("Setting up environment sensor and database")
+    try:
+        if not environmentLock.acquire(timeout=5):
+            if environmentSerial is not None:
+                try:
+                    environmentSerial.close()
+                except (SerialException, OSError):
+                    pass
+            environmentSerial = None
+
+            _db_url = s.q("weather_db_url", fallback=None)
+            _db_token = s.q("weather_db_token", fallback=None)
+            _db_org = s.q("weather_db_org", fallback=None)
+            if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
+                try:
+                    environmentInfluxClient = InfluxDBClientAsync(
+                            url = _db_url,
+                            token = _db_token,
+                            org = _db_org
+                        )
+                except Exception as e:
+                    msg = f"Error setting up influx client: {e}"
+                    logger.error(msg)
+                    triggerEvent("error", msg)
+                    return
+
+            port = s.q("weather_environment_port", fallback=None)
+            baud = s.q("weather_environment_baud", fallback=None)
+            timeout = s.q("weather_environment_timeout", fallback=2)
+            if port is None and baud is None:
+                logger.warning("Environment serial port not available")
+                triggerEvent("warning", "Environment serial port not available")
+                return
+            logger.info("Opening serial port {}".format(port))
+            try:
+                environmentSerial = Serial(port, baud, timeout=timeout, write_timeout=timeout)
+                environmentSerial.reset_input_buffer()
+                environmentSerial.reset_output_buffer()
+                if not environmentSerial.is_open:
+                    raise RuntimeError("Unknown error")
+            except SerialException as e:
+                msg = "Can not open serial port {}: {}".format(port, e)
+                logger.warning(msg)
+                triggerEvent("error", msg)
+                environmentSerial = None
+                return
+    finally:
+        environmentLock.release()
+
+
+async def environmentWorker():
+    pass
 
 async def queryWeather(api, thing, start, window):
     bucket = s.q("weather_db_bucket", fallback="weather") or "weather"
@@ -659,6 +718,9 @@ def main():
                     settings["weather_db_org"] = ui.input("Weather database organization", value=s.q("weather_db_org", fallback=None))
                     settings["weather_db_token"] = ui.input("Weather database token", value=s.q("weather_db_token", fallback=None))
                     settings["weather_db_bucket"] = ui.input("Weather database bucket", value=s.q("weather_db_bucket", fallback=None))
+                    settings["weather_environment_port"] = ui.input("Serial port for environment sensor breakout board", value=None)
+                    settings["weather_environment_baud"] = ui.input("Baud rate of the environment sensor breakout board", value=None)
+                    settings["weather_environment_timeout"] = ui.input("Timeout for the environment sensor breakout board", value=None)
 
             with ui.card().tight().classes("w-full"):
                 ui.label("Roof")
@@ -1121,6 +1183,12 @@ def main():
         if thing[0] == "switchError":
             ui.notify(f"Error setting switch {thing[1]}: {thing[2]}", type="negative")
             return
+        if thing[0] == "warning":
+            ui.notify(f"Warning: {thing[1]}", type="warning")
+            return
+        if thing[0] == "error":
+            ui.notify(f"Error: {thing[1]}", type="warning")
+            return
         logger.error(f"Unknown update event, ignoring: {thing}")
 
     updateCallbacks[ui.context.client.id] = update
@@ -1141,6 +1209,7 @@ def main():
     ''')
 
 def initStuff():
+    environmentSetup()
     makeRoof()
     initSwitches()
     startCaptureLoop()
