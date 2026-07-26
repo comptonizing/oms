@@ -203,7 +203,7 @@ def setSwitchState(name: str, state: switch.State):
             switches[name]["switch"].setState(state)
         except Exception as e:
             logger.error(f"Error setting switch {name} to {stateString}: {e}")
-            triggerEvent("switchError", name, stateString)
+            triggerEvent("switchError", name, str(e))
             return
         s.p(name + "_last", stateString)
         triggerEvent("setSwitchState", name, stateString)
@@ -243,7 +243,7 @@ def roofLoop():
                 currentRoofState = roof.Roof.get().getStatus()
             pollDuration = time.time() - pollStart
             if pollDuration > roofPollSlowPeriod:
-                logger.warning(f"Roof status poll took {pollDuration:.1s}s, problems with serial port?")
+                logger.warning(f"Roof status poll took {pollDuration:.1f}s, problems with serial port?")
             if currentRoofState != lastRoofState or time.time() - lastRoofIconUpdate > roofIconUpdateInterval:
                 triggerEvent("roofUpdate", currentRoofState)
                 lastRoofIconUpdate = time.time()
