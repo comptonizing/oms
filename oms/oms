@@ -100,12 +100,15 @@ def captureLoop():
 
 def stopCaptureLoop():
     global captureThread, captureStopEvent
-    logger.info("Stopping capture loop")
     if captureThread is not None and captureThread.is_alive():
         logger.info("Stopping capture loop")
         captureStopEvent.set()
-        captureThread.join()
-    logger.info("Capture loop stopped")
+        captureThread.join(timeout=5)
+        if captureThread.is_alive():
+            logger.warning("Capture loop still alive")
+        else:
+            captureThread = None
+            logger.info("Capture loop stopped")
 
 def startCaptureLoop():
     global captureThread, captureStopEvent
