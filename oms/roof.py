@@ -117,6 +117,8 @@ class Roof():
         return self.__serial.is_open
 
     def read(self, size):
+        if self.__serial is None:
+            self.reconnect()
         try:
             data = self.__serial.read(size)
         except (SerialException, OSError):
@@ -130,6 +132,8 @@ class Roof():
         return data
 
     def write(self, data):
+        if self.__serial is None:
+            self.reconnect()
         try:
             return self.__serial.write(data)
         except (SerialException, OSError):

@@ -199,7 +199,12 @@ def setSwitchState(name: str, state: switch.State):
     with setSwitchStateLock:
         stateString = switch.State.toString(state)
         logger.info(f"Setting switch {name} to {stateString}")
-        switches[name]["switch"].setState(state)
+        try:
+            switches[name]["switch"].setState(state)
+        except Exception as e:
+            logger.error(f"Error setting switch {name} to {stateString}: {e}")
+            triggerEvent("switchError", name, stateString)
+            return
         s.p(name + "_last", stateString)
         triggerEvent("setSwitchState", name, stateString)
 
@@ -227,13 +232,18 @@ def getLastRoofState():
     global lastRoofState
     return lastRoofState
 
+roofPollSlowPeriod = 2
 def roofLoop():
     global roofThread, roofStopEvent, lastRoofState, roofLock, lastRoofIconUpdate
     while not roofStopEvent.is_set():
         time.sleep(0.05)
         try:
+            pollStart = time.time()
             with roofLock:
                 currentRoofState = roof.Roof.get().getStatus()
+            pollDuration = time.time() - pollStart
+            if pollDuration > roofPollSlowPeriod:
+                logger.warning(f"Roof status poll took {pollDuration:.1s}s, problems with serial port?")
             if currentRoofState != lastRoofState or time.time() - lastRoofIconUpdate > roofIconUpdateInterval:
                 triggerEvent("roofUpdate", currentRoofState)
                 lastRoofIconUpdate = time.time()
@@ -284,9 +294,18 @@ def makeRoof():
         setFans(fans)
     return True
 
+
+roofLockTimeout = 5
 def setFans(mode, auto=False):
-    with roofLock:
+    logger.debug(f"setFans({mode}) acquiring roof lock")
+    if not roofLock.acquire(timeout=roofLockTimeout):
+        logger.error(f"Timeout acquiring roof lock")
+        triggerEvent("fanError", mode, "Roof not responding")
+        return
+    try:
         if not roof.Roof.isInitialized():
+            logger.debug("Roof not initialized, ignoring")
+            triggerEvent("fanError", mode, "Roof not initialzied")
             return
         logger.info(f"Switching fans {mode}")
         try:
@@ -295,8 +314,11 @@ def setFans(mode, auto=False):
             elif mode == "off":
                 status = roof.Roof.get().fansOff()
         except Exception as e:
+            triggerEvent("fanError", mode, str(e))
             logger.error("Error setting fans to {}: {}".format(mode, e))
             return
+    finally:
+        roofLock.release()
     triggerEvent("fanUpdate", mode, auto)
     triggerEvent("roofUpdate", status)
 
@@ -971,6 +993,7 @@ def main():
 
     timers = {}
 
+    influx_client = Container()
     query_api = Container()
 
     def initTimers():
@@ -983,18 +1006,22 @@ def main():
         timers["update_stream"] = ui.timer(s.q("stream_refresh"), updateStream)
 
     def makeInfluxClient():
+        oldClient = influx_client.get()
+        if oldClient is not None:
+            asyncio.create_task(oldClient.close())
+            influx_client.clear()
+            query_api.clear()
         _db_url = s.q("weather_db_url", fallback=None)
         _db_token = s.q("weather_db_token", fallback=None)
         _db_org = s.q("weather_db_org", fallback=None)
         if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
-            influx_client = InfluxDBClientAsync(
+            client = InfluxDBClientAsync(
                     url = _db_url,
                     token = _db_token,
                     org = _db_org
                     )
-            query_api.set(influx_client.query_api())
-        else:
-            query_api.clear()
+            influx_client.set(client)
+            query_api.set(client.query_api())
 
     def processSettingsUpdate():
         makeInfluxClient()
@@ -1012,6 +1039,11 @@ def main():
 
     def onDisconnect():
         updateCallbacks.pop(ui.context.client.id, None)
+        oldClient = influx_client.get()
+        if oldClient is not None:
+            asyncio.create_task(oldClient.close())
+            influx_client.clear()
+            query_api.clear()
     ui.context.client.on_disconnect(onDisconnect)
 
     async def update(thing: list):
@@ -1028,6 +1060,12 @@ def main():
             return
         if thing[0] == "fanUpdate":
             ui.notify(f"Fans set to {thing[1]} ({"auto" if thing[2] else "manual"})")
+            return
+        if thing[0] == "fanError":
+            ui.notify(f"Error setting fans to {thing[1]}: {thing[2]}", type="negative")
+            return
+        if thing[0] == "switchError":
+            ui.notify(f"Error setting switch {thing[1]}: {thing[2]}", type="negative")
             return
         logger.error(f"Unknown update event, ignoring: {thing}")
 
