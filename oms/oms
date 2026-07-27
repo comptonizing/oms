@@ -105,7 +105,7 @@ def captureLoop():
                 frame = createErrorImage("{}".format(e))
         with last_stream_image_lock:
             last_stream_image = frame
-        time.sleep(s.q("stream_refresh", fallback=5))
+        captureStopEvent.wait(s.q("stream_refresh", fallback=5))
 
 def stopCaptureLoop():
     global captureThread, captureStopEvent
@@ -269,7 +269,7 @@ def environmentWorkerLoop():
         finally:
             if lockAcquired:
                 environmentLock.release()
-            time.sleep(s.q("weather_refresh", fallback=5))
+            environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
 
 def stopEnvironmentWorker():
     global environmentThread, environmentStopEvent
