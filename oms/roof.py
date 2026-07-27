@@ -183,3 +183,10 @@ class Roof():
 
     def fansOff(self):
         return self.decodeResponse(self.writeCmd(CMD.FANS_OFF))
+
+    def fansAreOn(self):
+        status = self.getStatus()
+        if status[ResponseState.FANS.value]:
+            return True
+        else:
+            return False

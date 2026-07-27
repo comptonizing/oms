@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import math
 import logging
 import argparse
 import asyncio
@@ -131,6 +132,18 @@ def startCaptureLoop():
     )
     captureThread.start()
     logger.info("Capture loop started")
+
+
+
+def getWeather():
+    data = apiv1.weather()
+    if data.status_code != 200:
+        raise Exception("Error getting weather: Status code 200: {}".format(data.body))
+    try:
+        d = json.loads(data.body)
+        return d
+    except Exception as e:
+        raise Exception("Error parsing json: {}".format(e))
 
 environmentInfluxClient = None
 environmentWriteApi = None
@@ -414,6 +427,63 @@ def setSwitchState(name: str, state: switch.State):
         s.p(name + "_last", stateString)
         triggerEvent("setSwitchState", name, stateString)
 
+lastFanChange = 0.0
+def updateFans():
+    global lastFanChange, environmentLastData
+    # roof needs to be locked by caller
+    if not roof.Roof.isInitialized():
+        return
+    if s.q("fan_mode", fallback="off") != "auto":
+        return
+    logger.debug("Fans in auto mode")
+    # purposfully ignoring the environment lock here. If caught mid update shouldn't be a problem
+    dt = time.time() - environmentLastData["timestamp"]
+    H = environmentLastData["inside_humidity"]
+    T = environmentLastData["inside_temperature"]
+    if dt > 60:
+        logger.warning("Environment data older than 60s, switching fan off")
+        if roof.Roof.get().fansAreOn():
+            status = roof.Roof.get().fansOff()
+            triggerEvent("fanUpdate", "off", "auto")
+            triggerEvent("roofUpdate", status)
+            lastFanChange = time.time()
+        return
+    if H is None or T is None or math.isnan(H) or math.isnan(T):
+        return
+    logger.debug(f"Environment data available: {environmentLastData}")
+
+    try:
+        weather = getWeather()
+        T_outside = weather["env_temperature"]
+        H_outside = weather["env_temperature"]
+        if math.isnan(T_outside) or math.isnan(H_outside):
+            raise RuntimeError("Temperature or humidity is nan")
+    except Exception as e:
+        logger.warning(f"Error getting weather data, skipping fan update: {e}")
+        return
+    logger.debug(f"Weather data available: {weather}")
+    delay = s.q("roof_fan_change_delay", fallback=60)
+    tmin = s.q("roof_fan_temp_min", fallback=5)
+    if time.time() - lastFanChange < delay:
+        logger.debug("Last change not too far in the past, skipping this one")
+        return
+    fansShouldBeOn = H_outside > H and T_outside > tmin
+    logger.debug("Checking current status")
+    if roof.Roof.get().fansAreOn() == fansShouldBeOn:
+        logger.debug("Fan state already as requested")
+        return
+    logger.debug("Change necessary")
+    if fansShouldBeOn:
+        roof.Roof.get().fansOn()
+        triggerEvent("fanUpdate", "on", True)
+    else:
+        roof.Roof.get().fansOff()
+        triggerEvent("fanUpdate", "off", True)
+    triggerEvent("roofUpdate", roof.Roof.get().getStatus())
+    lastFanChange = time.time()
+
+
+
 def checkRoofPins():
     if not s.has("roof_pins_west_close") or s.q("roof_pins_west_close") == "":
         return False
@@ -454,6 +524,7 @@ def roofLoop():
                 triggerEvent("roofUpdate", currentRoofState)
                 lastRoofIconUpdate = time.time()
                 lastRoofState = currentRoofState
+                updateFans()
         except Exception as e:
             logger.error("Error in roof thread: {}".format(e))
 
@@ -468,6 +539,9 @@ def stopRoof():
         else:
             roofThread = None
             logger.info("Roof stopped")
+    with roofLock:
+        if roof.Roof.isInitialized():
+            roof.Roof.get().fansOff()
     triggerEvent("roofUpdate", None)
 
 
@@ -514,7 +588,7 @@ def makeRoof():
 
 
 roofLockTimeout = 5
-def setFans(mode, auto=False):
+def setFans(mode):
     logger.debug(f"setFans({mode}) acquiring roof lock")
     if not roofLock.acquire(timeout=roofLockTimeout):
         logger.error(f"Timeout acquiring roof lock")
@@ -527,18 +601,23 @@ def setFans(mode, auto=False):
             return
         logger.info(f"Switching fans {mode}")
         try:
-            if mode == "on":
+            fansAreOn = roof.Roof.get().fansAreOn()
+            changed = False
+            if mode == "on" and not fansAreOn:
+                changed = True
                 status = roof.Roof.get().fansOn()
-            elif mode == "off":
+            elif mode == "off" and fansAreOn:
+                changed = False
                 status = roof.Roof.get().fansOff()
+            if changed:
+                triggerEvent("fanUpdate", mode, False)
+                triggerEvent("roofUpdate", status)
         except Exception as e:
             triggerEvent("fanError", mode, str(e))
             logger.error("Error setting fans to {}: {}".format(mode, e))
             return
     finally:
         roofLock.release()
-    triggerEvent("fanUpdate", mode, auto)
-    triggerEvent("roofUpdate", status)
 
 
 def setFanMode(mode):
@@ -565,8 +644,8 @@ def main():
         justify-content: center;
         color: white;
         font-weight: bold;
-        aspect-ratio: 1 / 1;
-        cursor: pointer;
+        aspect- ratio: 1 / 1;
+        cursor:  pointer;
         transition: filter 0.15s ease, transform 0.15s ease;
     }
     .status-circle:hover {
@@ -845,6 +924,8 @@ def main():
                     settings["roof_port"] = ui.input("Breakout board port", value=s.q("roof_port", fallback=None))
                     settings["roof_baud"] = ui.number("Breakout board baud rate", value=s.q("roof_baud", fallback=None))
                     settings["roof_timeout"] = ui.number("Breakout board timeout (s)", value=s.q("roof_timeout", fallback=None))
+                    settings["roof_fan_change_delay"] = ui.number("Minimal time between fan state changes (s)", value=s.q("roof_fan_change_delay", fallback=60))
+                    settings["roof_fan_temp_min"] = ui.number("Minimum outside temperature for fan", value=s.q("roof_fan_temp_min", fallback=5))
 
             with ui.card().tight().classes("w-full"):
                 ui.label("Switches")
@@ -1105,13 +1186,7 @@ def main():
     def updateWeather():
         labelSize = "text-3xl"
         try:
-            data = apiv1.weather()
-            if data.status_code != 200:
-                raise Exception("Error getting weather: Status code 200: {}".format(data.body))
-            try:
-                d = json.loads(data.body)
-            except Exception as e:
-                raise Exception("Error parsing json: {}".format(e))
+            d = getWeather()
         except Exception as e:
             logger.warning("Error getting weather data: {}".format(e))
             for thing in weather_labels.values():
