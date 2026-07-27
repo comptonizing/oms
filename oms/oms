@@ -622,11 +622,10 @@ def setFans(mode):
 
 def setFanMode(mode):
     s.p("fan_mode", mode)
-    if mode == "auto":
-        # TODO implement fan auto mode
-        logger.error("Auto fan mode not implemented yet")
-        return
     logger.info(f"Switching fan mode to {mode}")
+    if mode == "auto":
+        updateFans()
+        return
     setFans(mode)
 
 
