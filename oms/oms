@@ -491,11 +491,11 @@ def updateFans():
             return
         logger.debug("Change necessary")
         if fansShouldBeOn:
-            logger.info("Switching fans on in auto mode")
+            logger.info(f"Switching fans on in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside}")
             roof.Roof.get().fansOn()
             triggerEvent("fanUpdate", "on", True)
         else:
-            logger.info("Switching fans off in auto mode")
+            logger.info(f"Switching fans off in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside}")
             roof.Roof.get().fansOff()
             triggerEvent("fanUpdate", "off", True)
         triggerEvent("roofUpdate", roof.Roof.get().getStatus())
