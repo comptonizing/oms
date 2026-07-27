@@ -443,16 +443,19 @@ def updateFans():
     H = environmentLastData["inside_humidity"]
     T = environmentLastData["inside_temperature"]
     if dt > 60:
-        logger.warning("Environment data older than 60s, switching fan off")
         if not roofLock.acquire(timeout=roofLockTimeout):
             logger.warning("Timeout acquiring roof lock for fan auto mode")
             return
         try:
             if roof.Roof.get().fansAreOn():
+                logger.warning("Environment data older than 60s, switching fan off")
                 status = roof.Roof.get().fansOff()
                 triggerEvent("fanUpdate", "off", "auto")
                 triggerEvent("roofUpdate", status)
                 lastFanChange = time.time()
+        except Exception as e:
+            logger.error(f"Error switching fans off for stale environment data: {e}")
+            triggerEvent("fanError", "auto", str(e))
         finally:
             roofLock.release()
         return
@@ -495,6 +498,9 @@ def updateFans():
             triggerEvent("fanUpdate", "off", True)
         triggerEvent("roofUpdate", roof.Roof.get().getStatus())
         lastFanChange = time.time()
+    except Exception as e:
+        logger.error(f"Error updating fans automatically: {e}")
+        triggerEvent("fanError", "auto", str(e))
     finally:
         roofLock.release()
 
