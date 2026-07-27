@@ -9,10 +9,13 @@ import threading
 import base64
 import json
 import cv2
+from parse import parse
+import numpy as np
 from PIL import Image, ImageDraw
 from io import BytesIO
 import plotly.graph_objects as go
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
+from influxdb_client import InfluxDBClient, WriteOptions, Point
 from serial import Serial, SerialException
 
 parser = argparse.ArgumentParser(description = "Observatory Management System")
@@ -135,22 +138,22 @@ environmentSerial = None
 environmentThread = None
 environmentLock = threading.Lock()
 environmentStopEvent = threading.Event()
-def environmentWorkerLoop():
-    global environmentStopEvent, environmentInfluxClient, environmentSerial
-    while not environmentStopEvent.is_set():
-        time.sleep(s.q("weather_refresh", fallback=5))
-
-def stopEnvironmentWorker():
-    global environmentLock, environmentThread
-    if environmentThread is not None and environmentThread.is_alive():
-        logger.info("Stopping environment thread")
-        environmentStopEvent.set()
-        environmentThread.join(timeout=5)
-        if environmentThread.is_alive():
-            logger.warning("Environment thread still alive")
-        else:
-            environmentThread = None
-            logger.info("Environment thread stopped")
+environmentParameterMap = { "T": "inside_temperature", "H": "inside_humidity" }
+environmentLastData = {}
+environmentWriteOptions = WriteOptions(
+            batch_size = 20,
+            flush_interval = 10000,
+            jitter_interval = 0,
+            retry_interval = 5000,
+            max_retry_time = 600000,
+            max_retries = 100,
+            max_retry_delay = 60000,
+            max_close_wait = 60000,
+            exponential_base = 2
+    )
+for thing in environmentParameterMap.values():
+    environmentLastData[thing] = None
+environmentLastData["timestamp"] = 0.0
 
 def setupEnvironmentWorker():
     global environmentInfluxClient, environmentSerial, environmentLock
@@ -174,7 +177,7 @@ def setupEnvironmentWorker():
         _db_org = s.q("weather_db_org", fallback=None)
         if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
             try:
-                environmentInfluxClient = InfluxDBClientAsync(
+                environmentInfluxClient = InfluxDBClient(
                         url = _db_url,
                         token = _db_token,
                         org = _db_org
@@ -208,6 +211,68 @@ def setupEnvironmentWorker():
     finally:
         environmentLock.release()
     return True
+
+def environmentWorkerLoop():
+    global environmentStopEvent, environmentInfluxClient, environmentSerial, environmentLock, environmentLastData
+    while not environmentStopEvent.is_set():
+        try:
+            if environmentSerial is None or environmentInfluxClient is None:
+                setupEnvironmentWorker()
+            if environmentSerial is None or environmentInfluxClient is None:
+                continue
+            if not environmentLock.acquire(timeout=10):
+                logger.warning("Error acquiring environment lock")
+                continue
+            try:
+                line = environmentSerial.readline().decode("ascii").rstrip()
+            except (SerialException, OSError) as e:
+                logger.warning(f"Error reading from serial port: {e}. Resetting port")
+                setupEnvironmentWorker()
+                try:
+                    # Read serial again
+                    line = environmentSerial.readline().decode("ascii").rstrip()
+                except (SerialException, OSError):
+                    logger.warning(f"Again error reading from serial port: {e}, skipping")
+                    continue
+            if len(line) == 0:
+                logger.warning("Got empty data from environment board")
+                continue
+                if line.startswith("LOG:"):
+                    continue
+            found = False
+            for thing in environmentParameterMap:
+                if line.startswith(thing):
+                    found = True
+                    break
+            if not found:
+                logger.warning(f"Uknown message from environment sensor: {line}")
+                continue
+            result =  parse(thing + ": {}", line)
+            if result is None:
+                logger.warning(f"Could not parse message {line}")
+                continue
+            key = environmentParameterMap[thing]
+            value = float(result[0])
+            environmentLastData[key] = value
+            p = Point("weather").field(key, value)
+            environmentInfluxClient.write_api(write_options=environmentWriteOptions).write(bucket=s.q("weather_db_bucket", fallback=None), org=s.q("weather_db_org", fallback=None), record=p)
+        except Exception as e:
+            logger.warning(f"Error in environment loop: {e}")
+        finally:
+            environmentLock.release()
+            time.sleep(s.q("weather_refresh", fallback=5))
+
+def stopEnvironmentWorker():
+    global environmentThread, environmentStopEvent
+    if environmentThread is not None and environmentThread.is_alive():
+        logger.info("Stopping environment thread")
+        environmentStopEvent.set()
+        environmentThread.join(timeout=5)
+        if environmentThread.is_alive():
+            logger.warning("Environment thread still alive")
+        else:
+            environmentThread = None
+            logger.info("Environment thread stopped")
 
 def startEnvironmentWorker():
     global environmentThread, environmentStopEvent
