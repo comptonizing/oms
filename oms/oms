@@ -476,7 +476,7 @@ def updateFans():
         return
     logger.debug(f"Weather data available: {weather}")
     tmin = s.q("roof_fan_temp_min", fallback=5)
-    fansShouldBeOn = H_outside > H and T_outside > tmin
+    fansShouldBeOn = H_outside < H and T_outside > tmin
 
     if not roofLock.acquire(timeout=roofLockTimeout):
         logger.warning("Timeout acquiring roof lock for fan auto mode")
@@ -488,9 +488,11 @@ def updateFans():
             return
         logger.debug("Change necessary")
         if fansShouldBeOn:
+            logger.info("Switching fans on in auto mode")
             roof.Roof.get().fansOn()
             triggerEvent("fanUpdate", "on", True)
         else:
+            logger.info("Switching fans off in auto mode")
             roof.Roof.get().fansOff()
             triggerEvent("fanUpdate", "off", True)
         triggerEvent("roofUpdate", roof.Roof.get().getStatus())
