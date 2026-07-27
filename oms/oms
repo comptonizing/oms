@@ -10,7 +10,6 @@ import base64
 import json
 import cv2
 from parse import parse
-import numpy as np
 from PIL import Image, ImageDraw
 from io import BytesIO
 import plotly.graph_objects as go
@@ -240,30 +239,19 @@ def environmentWorkerLoop():
                 line = environmentSerial.readline().decode("ascii").rstrip()
             except (SerialException, OSError) as e:
                 logger.warning(f"Error reading from serial port: {e}. Resetting port")
-                environmentLock.release()
-                lockAcquired = False
-                setupEnvironmentWorker()
-                if not environmentLock.acquire(timeout=10):
-                    logger.warning("Error acquiring environment lock")
-                    continue
-                lockAcquired = True
                 try:
-                    # Read serial again
-                    line = environmentSerial.readline().decode("ascii").rstrip()
+                    environmentSerial.close()
                 except (SerialException, OSError):
-                    logger.warning(f"Again error reading from serial port: {e}, skipping")
-                    continue
+                    pass
+                environmentSerial = None
+                continue
             if len(line) == 0:
                 logger.warning("Got empty data from environment board")
                 continue
             if line.startswith("LOG:"):
                 continue
-            found = False
-            for thing in environmentParameterMap:
-                if line.startswith(thing):
-                    found = True
-                    break
-            if not found:
+            thing = next((t for t in environmentParameterMap if line.startswith(t)), None)
+            if thing is None:
                 logger.warning(f"Uknown message from environment sensor: {line}")
                 continue
             result =  parse(thing + ": {}", line)
