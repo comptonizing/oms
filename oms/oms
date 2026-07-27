@@ -439,6 +439,23 @@ def updateFans():
         return
     logger.debug("Fans in auto mode")
     # purposfully ignoring the environment lock here. If caught mid update shouldn't be a problem
+    if not roofLock.acquire(timeout=roofLockTimeout):
+        logger.warning("Timeout acquiring roof lock for fan auto mode")
+        return
+    try:
+        status = roof.Roof.get().getStatus()
+        if not roof.Roof.get().isFullyClosed(status=status):
+            if roof.Roof.get().fansAreOn():
+                logger.info("Roof not closed but fans are on, switching off")
+                status = roof.Roof.get().fansOff()
+                triggerEvent("fanUpdate", "off", "auto")
+                triggerEvent("roofUpdate", status)
+                lastFanChange = time.time()
+            return
+    finally:
+        roofLock.release()
+
+
     dt = time.time() - environmentLastData["timestamp"]
     H = environmentLastData["inside_humidity"]
     T = environmentLastData["inside_temperature"]
@@ -491,11 +508,11 @@ def updateFans():
             return
         logger.debug("Change necessary")
         if fansShouldBeOn:
-            logger.info(f"Switching fans on in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside}")
+            logger.info(f"Switching fans on in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside})")
             roof.Roof.get().fansOn()
             triggerEvent("fanUpdate", "on", True)
         else:
-            logger.info(f"Switching fans off in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside}")
+            logger.info(f"Switching fans off in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside})")
             roof.Roof.get().fansOff()
             triggerEvent("fanUpdate", "off", True)
         triggerEvent("roofUpdate", roof.Roof.get().getStatus())
