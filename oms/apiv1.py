@@ -21,7 +21,7 @@ def weather():
     url = s.q("weather_url")
     try:
         logger.debug("Getting weather from {}".format(url))
-        r = requests.get(url)
+        r = requests.get(url, timeout=10)
     except Exception as e:
         logger.error("Error getting weather: {}".format(e))
         return JSONResponse(

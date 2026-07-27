@@ -430,7 +430,9 @@ def setSwitchState(name: str, state: switch.State):
 lastFanChange = 0.0
 def updateFans():
     global lastFanChange, environmentLastData
-    # roof needs to be locked by caller
+    # Acquires roofLock itself around the roof/serial-touching sections only,
+    # so the (potentially slow) weather fetch below never happens while the
+    # roof is locked out from other callers (e.g. manual fan/roof control).
     if not roof.Roof.isInitialized():
         return
     if s.q("fan_mode", fallback="off") != "auto":
@@ -442,45 +444,59 @@ def updateFans():
     T = environmentLastData["inside_temperature"]
     if dt > 60:
         logger.warning("Environment data older than 60s, switching fan off")
-        if roof.Roof.get().fansAreOn():
-            status = roof.Roof.get().fansOff()
-            triggerEvent("fanUpdate", "off", "auto")
-            triggerEvent("roofUpdate", status)
-            lastFanChange = time.time()
+        if not roofLock.acquire(timeout=roofLockTimeout):
+            logger.warning("Timeout acquiring roof lock for fan auto mode")
+            return
+        try:
+            if roof.Roof.get().fansAreOn():
+                status = roof.Roof.get().fansOff()
+                triggerEvent("fanUpdate", "off", "auto")
+                triggerEvent("roofUpdate", status)
+                lastFanChange = time.time()
+        finally:
+            roofLock.release()
         return
     if H is None or T is None or math.isnan(H) or math.isnan(T):
         return
     logger.debug(f"Environment data available: {environmentLastData}")
 
+    delay = s.q("roof_fan_change_delay", fallback=60)
+    if time.time() - lastFanChange < delay:
+        logger.debug("Last change not too far in the past, skipping this one")
+        return
+
     try:
         weather = getWeather()
         T_outside = weather["env_temperature"]
-        H_outside = weather["env_temperature"]
+        H_outside = weather["env_humidity"]
         if math.isnan(T_outside) or math.isnan(H_outside):
             raise RuntimeError("Temperature or humidity is nan")
     except Exception as e:
         logger.warning(f"Error getting weather data, skipping fan update: {e}")
         return
     logger.debug(f"Weather data available: {weather}")
-    delay = s.q("roof_fan_change_delay", fallback=60)
     tmin = s.q("roof_fan_temp_min", fallback=5)
-    if time.time() - lastFanChange < delay:
-        logger.debug("Last change not too far in the past, skipping this one")
-        return
     fansShouldBeOn = H_outside > H and T_outside > tmin
-    logger.debug("Checking current status")
-    if roof.Roof.get().fansAreOn() == fansShouldBeOn:
-        logger.debug("Fan state already as requested")
+
+    if not roofLock.acquire(timeout=roofLockTimeout):
+        logger.warning("Timeout acquiring roof lock for fan auto mode")
         return
-    logger.debug("Change necessary")
-    if fansShouldBeOn:
-        roof.Roof.get().fansOn()
-        triggerEvent("fanUpdate", "on", True)
-    else:
-        roof.Roof.get().fansOff()
-        triggerEvent("fanUpdate", "off", True)
-    triggerEvent("roofUpdate", roof.Roof.get().getStatus())
-    lastFanChange = time.time()
+    try:
+        logger.debug("Checking current status")
+        if roof.Roof.get().fansAreOn() == fansShouldBeOn:
+            logger.debug("Fan state already as requested")
+            return
+        logger.debug("Change necessary")
+        if fansShouldBeOn:
+            roof.Roof.get().fansOn()
+            triggerEvent("fanUpdate", "on", True)
+        else:
+            roof.Roof.get().fansOff()
+            triggerEvent("fanUpdate", "off", True)
+        triggerEvent("roofUpdate", roof.Roof.get().getStatus())
+        lastFanChange = time.time()
+    finally:
+        roofLock.release()
 
 
 
@@ -607,7 +623,7 @@ def setFans(mode):
                 changed = True
                 status = roof.Roof.get().fansOn()
             elif mode == "off" and fansAreOn:
-                changed = False
+                changed = True
                 status = roof.Roof.get().fansOff()
             if changed:
                 triggerEvent("fanUpdate", mode, False)
@@ -643,8 +659,8 @@ def main():
         justify-content: center;
         color: white;
         font-weight: bold;
-        aspect- ratio: 1 / 1;
-        cursor:  pointer;
+        aspect-ratio: 1 / 1;
+        cursor: pointer;
         transition: filter 0.15s ease, transform 0.15s ease;
     }
     .status-circle:hover {
