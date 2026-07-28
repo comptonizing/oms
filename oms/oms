@@ -244,6 +244,7 @@ def environmentWorkerLoop():
             if environmentSerial is None or environmentInfluxClient is None:
                 setupEnvironmentWorker()
             if environmentSerial is None or environmentInfluxClient is None:
+                environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
                 continue
             if not environmentLock.acquire(timeout=10):
                 logger.warning("Error acquiring environment lock")
@@ -280,10 +281,10 @@ def environmentWorkerLoop():
             environmentWriteApi.write(bucket=s.q("weather_db_bucket", fallback=None), org=s.q("weather_db_org", fallback=None), record=p)
         except Exception as e:
             logger.warning(f"Error in environment loop: {e}")
+            environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
         finally:
             if lockAcquired:
                 environmentLock.release()
-            environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
 
 def stopEnvironmentWorker():
     global environmentThread, environmentStopEvent
