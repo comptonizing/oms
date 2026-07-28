@@ -453,6 +453,10 @@ def updateFans():
                 triggerEvent("roofUpdate", status)
                 lastFanChange = time.time()
             return
+    except Exception as e:
+        logger.error(f"Error checking roof/fan: {e}")
+        triggerEvent("fanError", "auto", str(e))
+        return
     finally:
         roofLock.release()
 
