@@ -78,14 +78,14 @@ class Roof():
         self.connect()
         self.__thread: threading.Thread | None = None
         self.__stop_event = threading.Event()
-        self.__switch_west_open_north = ResponseState.SW3.value
-        self.__switch_west_open_south = ResponseState.SW4.value
-        self.__switch_west_closed_north = ResponseState.SW1.value
-        self.__switch_west_closed_south = ResponseState.SW2.value
-        self.__switch_east_open_north = ResponseState.SW7.value
-        self.__switch_east_open_south = ResponseState.SW8.value
-        self.__switch_east_closed_north = ResponseState.SW5.value
-        self.__switch_east_closed_south = ResponseState.SW6.value
+        self.switch_west_open_north = ResponseState.SW3.value
+        self.switch_west_open_south = ResponseState.SW4.value
+        self.switch_west_closed_north = ResponseState.SW1.value
+        self.switch_west_closed_south = ResponseState.SW2.value
+        self.switch_east_open_north = ResponseState.SW7.value
+        self.switch_east_open_south = ResponseState.SW8.value
+        self.switch_east_closed_north = ResponseState.SW5.value
+        self.switch_east_closed_south = ResponseState.SW6.value
 
     def __del__(self):
         #self.stopLoop()
@@ -202,22 +202,22 @@ class Roof():
     def westFullyOpen(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.__switch_west_open_north] and status[self.__switch_west_open_south]
+        return status[self.switch_west_open_north] and status[self.switch_west_open_south]
 
     def westFullyClosed(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.__switch_west_closed_north] and status[self.__switch_west_closed_south]
+        return status[self.switch_west_closed_north] and status[self.switch_west_closed_south]
 
     def eastFullyOpen(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.__switch_east_open_north] and status[self.__switch_east_open_south]
+        return status[self.switch_east_open_north] and status[self.switch_east_open_south]
 
     def eastFullyClosed(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.__switch_east_closed_north] and status[self.__switch_east_closed_south]
+        return status[self.switch_east_closed_north] and status[self.switch_east_closed_south]
 
     def isFullyOpen(self, status=None):
         return self.westFullyOpen(status=status) and self.eastFullyOpen(status=status)
