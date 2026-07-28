@@ -25,7 +25,8 @@ parser.add_argument("--loglevel", required=False, help="Log level", default="INF
 args = parser.parse_args()
 
 logging.basicConfig(
-        level = getattr(logging, args.loglevel)
+        level = getattr(logging, args.loglevel),
+        format = "%(asctime)s %(levelname)s:%(name)s:%(message)s"
         )
 
 logger = logging.getLogger(__name__)
