@@ -1380,6 +1380,7 @@ def main():
         initTimers()
         updateButtons()
         updateRoofIcons(getLastRoofState())
+        updateCallbacks[ui.context.client.id] = update
     ui.context.client.on_connect(onConnect)
 
     def onDisconnect():
