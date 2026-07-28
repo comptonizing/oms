@@ -728,8 +728,12 @@ def main():
 
     def updatePlot(plot):
         plot.update()
-        plot._props['options']['config'] = {'displayModeBar': False}
-        #plot._props['options']['config'] = {"displayModeBar": False, "scrollZoom": False, "doubleClick": False}
+        # Plotly.update() regenerates 'options' from the figure (data/layout only) and setting
+        # 'config' directly would re-trigger that same overwrite, wiping config out again. Suspend
+        # updates while setting it, then push the prop change via the base Element.update() path.
+        with plot._props.suspend_updates():
+            plot._props['options']['config'] = {'displayModeBar': False, 'staticPlot': True}
+        plot.client.outbox.enqueue_update(plot)
 
     def makePlot(title: str):
         plot = ui.plotly(go.Figure()).classes("w-full")
