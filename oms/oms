@@ -1212,7 +1212,9 @@ def main():
     async def updatePlots():
         try:
             for plot in weather_plots.values():
-                plot.figure.update_layout(annotations=[])
+                plot.figure.layout.annotations = []
+                plot.figure.update_xaxes(visible=True)
+                plot.figure.update_yaxes(visible=True)
             await _updatePlots()
         except Exception as e:
             logger.error(f"Error updating weather plots: {e}")
