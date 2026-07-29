@@ -97,12 +97,17 @@ captureStopEvent = threading.Event()
 def captureLoop():
     global last_stream_image, last_stream_image_lock, captureStopEvent
     while not captureStopEvent.is_set():
-        url = s.q("stream_rtsp", fallback="")
-        if url == "":
-            frame = createErrorImage("RTSP not configured")
+        reason = cctvUnavailableReason()
+        if reason is not None:
+            # Nothing to connect to: an unconfigured stream has no address and an
+            # unpowered camera would only swallow the full open timeout before failing.
+            # Publish no frame at all -- the UI shows the reason instead, and a frame
+            # from before the camera was switched off would be a lie.
+            logger.debug("Not grabbing a CCTV frame: {}".format(reason))
+            frame = None
         else:
             try:
-                frame = grabRTSP(url)
+                frame = grabRTSP(s.q("stream_rtsp"))
             except Exception as e:
                 frame = createErrorImage("{}".format(e))
         with last_stream_image_lock:
@@ -377,6 +382,54 @@ def getSwitchState(name: str):
         return switch.State.UNKN
     return switches[name]["switch"].state
 
+def deviceUnavailableReason(name: str, label: str):
+    """Why the device powered by the switch `name` cannot be used, or None if it can.
+
+    A device whose switch is not configured counts as unavailable: OMS can neither power
+    it nor find out whether anything else did, so talking to it can only end in a
+    timeout.
+    """
+    if name not in switches:
+        return "{} is not configured".format(label)
+    state = getSwitchState(name)
+    if state is switch.State.ON:
+        return None
+    if state is switch.State.OFF:
+        return "{} is switched off".format(label)
+    return "{} is in an unknown state".format(label)
+
+def cctvUnavailableReason():
+    """Why no CCTV frame can be grabbed, or None if one can."""
+    if s.q("stream_rtsp", fallback="") in (None, ""):
+        return "No RTSP stream is configured"
+    return deviceUnavailableReason("cctv", "CCTV camera")
+
+def allskyUnavailableReason():
+    """Why the allsky camera cannot be reached, or None if it can."""
+    return deviceUnavailableReason("allsky", "Allsky camera")
+
+def allskyImageUnavailableReason():
+    """Why no allsky image can be shown, or None if one can."""
+    reason = allskyUnavailableReason()
+    if reason is not None:
+        return reason
+    if s.q("weather_image", fallback="") in (None, ""):
+        return "No allsky image URL is configured"
+    return None
+
+def weatherUnavailableReason():
+    """Why no weather data can be fetched, or None if it can.
+
+    The weather station hangs off the allsky camera and is only reachable while that
+    camera is powered, so switching the allsky off takes the weather data with it.
+    """
+    reason = allskyUnavailableReason()
+    if reason is not None:
+        return reason
+    if s.q("weather_url", fallback="") in (None, ""):
+        return "No weather URL is configured"
+    return None
+
 def initSwitch(name: str, pin: int, init: str, last: str):
     if init == "on":
         initState = switch.State.ON
@@ -439,13 +492,23 @@ def weatherWorkerLoop():
     global weatherStopEvent, weatherCache, weatherCacheTimestamp
     while not weatherStopEvent.is_set():
         try:
-            try:
-                data = getWeather()
+            reason = weatherUnavailableReason()
+            if reason is None:
+                try:
+                    data = getWeather()
+                    with weatherCacheLock:
+                        weatherCache = data
+                        weatherCacheTimestamp = time.time()
+                except Exception as e:
+                    logger.warning(f"Error fetching weather data: {e}")
+            else:
+                # Asking anyway would spend the full HTTP timeout finding out what we
+                # already know. Drop the cache so every reader -- the UI and the fan
+                # decision below -- sees the data as gone rather than merely stale.
+                logger.debug(f"Not fetching weather data: {reason}")
                 with weatherCacheLock:
-                    weatherCache = data
-                    weatherCacheTimestamp = time.time()
-            except Exception as e:
-                logger.warning(f"Error fetching weather data: {e}")
+                    weatherCache = None
+                    weatherCacheTimestamp = 0.0
             # Fan decisions are driven from here (rather than from roofLoop) so that the
             # network call above never delays the roof status poll loop.
             updateFans()
@@ -1040,6 +1103,29 @@ def main():
         updatePlot(plot)
         return plot
 
+    def makeUnavailableMessage(icon: str):
+        """Placeholder shown in a camera card while that camera has nothing to show.
+
+        Created hidden; showUnavailable() swaps it in for the image. Returns the panel
+        and the label inside it, which is the pair that function expects.
+        """
+        with ui.column().classes("w-full items-center justify-center gap-2 py-16") as panel:
+            ui.icon(icon, size="4rem").classes("text-gray-500")
+            label = ui.label("").classes("text-center text-gray-400")
+        panel.set_visibility(False)
+        return panel, label
+
+    def showUnavailable(image, message, reason):
+        """Shows either the camera image or the message saying why there is none."""
+        panel, label = message
+        if reason is None:
+            panel.set_visibility(False)
+            image.set_visibility(True)
+            return
+        label.set_text(reason)
+        image.set_visibility(False)
+        panel.set_visibility(True)
+
 
     async def saveSettings():
         for thing in settings.keys():
@@ -1197,13 +1283,18 @@ def main():
                         ui.label("PC")
                 with ui.card().classes("w-full"):
                     status_stream_image = ui.image(createErrorImage("Initializing ...")).classes("w-full").props('no-transition no-spinner')
+                    status_stream_message = makeUnavailableMessage("videocam_off")
                 with ui.card().classes("w-full"):
-                    status_allsky_image = ui.image(s.q("weather_image")).classes("w-full").props('no-transition no-spinner')
+                    # No source yet: updateAllskyImages() fills it in below, so a browser
+                    # never requests an image URL that is known to be unreachable.
+                    status_allsky_image = ui.image().classes("w-full").props('no-transition no-spinner')
+                    status_allsky_message = makeUnavailableMessage("cloud_off")
 
         with ui.tab_panel(tab_weather):
             with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4'):
                 with ui.card().classes("w-full lg:col-span-1"):
-                    weather_allsky_image = ui.image(s.q("weather_image")).classes("w-full").props('no-transition no-spinner')
+                    weather_allsky_image = ui.image().classes("w-full").props('no-transition no-spinner')
+                    weather_allsky_message = makeUnavailableMessage("cloud_off")
                 with ui.grid().classes('grid-cols-2 lg:grid-cols-5 w-full gap-4 lg:col-span-2'):
                     for thing in weather_items:
                         with ui.card().classes("w-full"):
@@ -1342,9 +1433,27 @@ def main():
 
 
     def updateStream():
-        if last_stream_image is not None:
+        reason = cctvUnavailableReason()
+        if reason is None:
             with last_stream_image_lock:
-                status_stream_image.set_source(last_stream_image)
+                frame = last_stream_image
+            if frame is None:
+                # The worker has not come back with anything yet -- either it has just
+                # started, or the camera was only just switched on and is still booting.
+                reason = "Waiting for the stream ..."
+            else:
+                status_stream_image.set_source(frame)
+        showUnavailable(status_stream_image, status_stream_message, reason)
+
+    def updateAllskyImages():
+        reason = allskyImageUnavailableReason()
+        if reason is None:
+            # One timestamp for both, so the two tabs cannot end up a refresh apart.
+            source = s.q("weather_image") + f'?{time.time()}'
+            status_allsky_image.set_source(source)
+            weather_allsky_image.set_source(source)
+        showUnavailable(status_allsky_image, status_allsky_message, reason)
+        showUnavailable(weather_allsky_image, weather_allsky_message, reason)
 
     async def _updatePlots():
         r = weather_range_select.value
@@ -1521,8 +1630,22 @@ def main():
                     )
                 updatePlot(plot)
 
+    # Tailwind's text colours are mutually exclusive, so a new one has to take the old
+    # one off the element: which of two present classes wins is decided by stylesheet
+    # order, not by the order they were added in.
+    weather_label_colors = "text-red-500 text-orange-500 text-green-500 text-gray-500"
+
     def updateWeather():
         labelSize = "text-3xl"
+        reason = weatherUnavailableReason()
+        if reason is not None:
+            # Not an error: the station is unreachable because the allsky camera it hangs
+            # off is not running, which the allsky card next to this already spells out.
+            logger.debug("No weather data expected: {}".format(reason))
+            for thing in weather_labels.values():
+                thing.set_text("N/A")
+                thing.classes(labelSize + " text-gray-500", remove=weather_label_colors)
+            return
         with weatherCacheLock:
             d = weatherCache
             weatherAge = time.time() - weatherCacheTimestamp
@@ -1531,7 +1654,7 @@ def main():
             logger.warning("No recent weather data available")
             for thing in weather_labels.values():
                 thing.set_text("Error")
-                thing.classes(labelSize + " text-red-500")
+                thing.classes(labelSize + " text-red-500", remove=weather_label_colors)
             return
         try:
             temperature = d["env_temperature"]
@@ -1631,7 +1754,11 @@ def main():
 
 
 
+    # Run once against the freshly built page, so what the client first renders is
+    # already right: the timers below only fire a refresh period later.
     updateWeather()
+    updateStream()
+    updateAllskyImages()
 
     weather_range_select.on_value_change(updatePlots)
 
@@ -1643,8 +1770,7 @@ def main():
     def initTimers():
         for thing in timers:
             timers[thing].cancel()
-        timers["update_status_allsky_image"] = ui.timer(s.q("weather_refresh"), lambda: status_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
-        timers["update_weather_allsky_image"] = ui.timer(s.q("weather_refresh"), lambda: weather_allsky_image.set_source(s.q("weather_image") +f'?{time.time()}'))
+        timers["update_allsky_images"] = ui.timer(s.q("weather_refresh"), updateAllskyImages)
         timers["update_weather"] = ui.timer(s.q("weather_refresh"), updateWeather)
         timers["update_plots"] = ui.timer(s.q("weather_refresh"), updatePlots)
         timers["update_stream"] = ui.timer(s.q("stream_refresh"), updateStream)
@@ -1670,14 +1796,20 @@ def main():
     def processSettingsUpdate():
         makeInfluxClient()
         initTimers()
-        status_allsky_image.set_source(s.q("weather_image"))
         updateButtons()
+        # A saved URL or switch pin can have made either camera available or taken it
+        # away; the timers would not notice until their next tick.
+        updateStream()
+        updateAllskyImages()
+        updateWeather()
 
 
     def onConnect():
         makeInfluxClient()
         initTimers()
         updateButtons()
+        updateStream()
+        updateAllskyImages()
         updateRoofIcons(getLastRoofState())
         updateCallbacks[ui.context.client.id] = update
     ui.context.client.on_connect(onConnect)
@@ -1696,6 +1828,12 @@ def main():
         if thing[0] == "setSwitchState":
             ui.notify(f"Switch {thing[1]} was turned {thing[2]}")
             updateButtons()
+            if thing[1] == "cctv":
+                updateStream()
+            elif thing[1] == "allsky":
+                # Powering the allsky decides both its image and the weather data.
+                updateAllskyImages()
+                updateWeather()
             return
         if thing[0] == "updateSettings":
             processSettingsUpdate()
