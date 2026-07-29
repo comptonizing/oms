@@ -350,14 +350,14 @@ async def updateWorker():
         for clientId, client in list(Client.instances.items()):
             if clientId not in updateCallbacks:
                 continue
-            async def run(cid=clientId, c=client, t=thing):
+            async def dispatch(cid=clientId, c=client, t=thing):
                 try:
                     with c:
                         await updateCallbacks[cid](t)
                 except Exception as e:
                     logger.warning("Error running callback on client {}:\n{}".format(cid, e))
             logger.debug("Dispatching event for client {}: {}".format(clientId, thing))
-            spawn(run())
+            spawn(dispatch())
 
 def pinUsedForRoof(pin: int):
     l = [
@@ -497,75 +497,73 @@ class DeferredLog:
             logger.log(level, msg)
         self._records.clear()
 
+class DeferredEvents:
+    """Collects UI events so they can be raised after a lock has been released.
+
+    Same reasoning as DeferredLog: triggerEvent() is cheap but not free, and none of
+    it needs to happen while roofLock is held.
+    """
+    def __init__(self):
+        self._events = []
+
+    def __call__(self, *args):
+        self._events.append(args)
+
+    def flush(self):
+        for args in self._events:
+            triggerEvent(*args)
+        self._events.clear()
+
+# Written by the roof worker after it actually switches the fans, read by the auto
+# mode to rate-limit itself. One writer, one reader, and a float rebind is atomic
+# under the GIL, so there is nothing here for a lock to protect.
 lastFanChange = 0.0
-lastFanChangeLock = threading.Lock()
 def updateFans():
-    global lastFanChange, environmentLastData
-    # Acquires roofLock itself around each roof/serial-touching section only, for as
-    # short a time as possible, rather than holding it for the whole function. Weather
-    # data is read from a cache (populated by the dedicated weather thread) rather than
-    # fetched here, so no slow network call ever happens while the lock is held.
+    """Decides whether the fans should be running and asks the worker to change them.
+
+    Touches neither the serial port nor roofLock: the roof state comes from what the
+    worker published on its last poll, and every change goes into the command mailbox
+    for the worker to carry out. Runs on the weather thread, so it must never block on
+    the roof. Both facts it needs -- whether the roof is shut and whether the fans are
+    running -- come from the same snapshot, so they cannot disagree.
+    """
     if not roof.Roof.isInitialized():
         return
     if s.q("fan_mode", fallback="off") != "auto":
         return
     logger.debug("Fans in auto mode")
-    # purposfully ignoring the environment lock here. If caught mid update shouldn't be a problem
-    log = DeferredLog()
-    if not roofLock.acquire(timeout=roofLockTimeout):
-        logger.warning("Timeout acquiring roof lock for fan auto mode")
+    status, stateAge = getRoofState()
+    if status is None or stateAge > roofStateMaxAge:
+        logger.debug("No recent roof state available, skipping fan update")
         return
     try:
-        status = roof.Roof.get().getStatus()
-        if not roof.Roof.get().isFullyClosed(status=status):
-            if roof.Roof.get().fansAreOn():
-                log(logging.INFO, "Roof not closed but fans are on, switching off")
-                status = roof.Roof.get().fansOff()
-                triggerEvent("fanUpdate", "off", "auto")
-                triggerEvent("roofUpdate", status)
-                with lastFanChangeLock:
-                    lastFanChange = time.time()
-            return
+        fansAreOn = roof.Roof.get().fansAreOn(status=status)
+        fullyClosed = roof.Roof.get().isFullyClosed(status=status)
     except Exception as e:
-        log(logging.ERROR, f"Error checking roof/fan: {e}")
-        triggerEvent("fanError", "auto", str(e))
+        logger.warning(f"Error reading roof state, skipping fan update: {e}")
         return
-    finally:
-        roofLock.release()
-        log.flush()
 
+    if not fullyClosed:
+        if fansAreOn:
+            logger.info("Roof not closed but fans are on, switching off")
+            setFans("off", auto=True)
+        return
 
+    # purposfully ignoring the environment lock here. If caught mid update shouldn't be a problem
     dt = time.time() - environmentLastData["timestamp"]
     H = environmentLastData["inside_humidity"]
     T = environmentLastData["inside_temperature"]
     if dt > 60:
-        log = DeferredLog()
-        if not roofLock.acquire(timeout=roofLockTimeout):
-            logger.warning("Timeout acquiring roof lock for fan auto mode")
-            return
-        try:
-            if roof.Roof.get().fansAreOn():
-                log(logging.WARNING, "Environment data older than 60s, switching fan off")
-                status = roof.Roof.get().fansOff()
-                triggerEvent("fanUpdate", "off", "auto")
-                triggerEvent("roofUpdate", status)
-                with lastFanChangeLock:
-                    lastFanChange = time.time()
-        except Exception as e:
-            log(logging.ERROR, f"Error switching fans off for stale environment data: {e}")
-            triggerEvent("fanError", "auto", str(e))
-        finally:
-            roofLock.release()
-            log.flush()
+        if fansAreOn:
+            logger.warning("Environment data older than 60s, switching fan off")
+            setFans("off", auto=True)
         return
     if H is None or T is None or math.isnan(H) or math.isnan(T):
         return
     logger.debug(f"Environment data available: {environmentLastData}")
 
     delay = s.q("roof_fan_change_delay", fallback=60)
-    with lastFanChangeLock:
-        tooSoon = time.time() - lastFanChange < delay
-    if tooSoon:
+    if time.time() - lastFanChange < delay:
         logger.debug("Last change not too far in the past, skipping this one")
         return
 
@@ -587,34 +585,12 @@ def updateFans():
     logger.debug(f"Weather data available: {weather}")
     tmin = s.q("roof_fan_temp_min", fallback=5)
     fansShouldBeOn = H_outside < H and T_outside > tmin
-
-    log = DeferredLog()
-    if not roofLock.acquire(timeout=roofLockTimeout):
-        logger.warning("Timeout acquiring roof lock for fan auto mode")
+    if fansShouldBeOn == fansAreOn:
+        logger.debug("Fan state already as requested")
         return
-    try:
-        log(logging.DEBUG, "Checking current status")
-        if roof.Roof.get().fansAreOn() == fansShouldBeOn:
-            log(logging.DEBUG, "Fan state already as requested")
-            return
-        log(logging.DEBUG, "Change necessary")
-        if fansShouldBeOn:
-            log(logging.INFO, f"Switching fans on in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside})")
-            roof.Roof.get().fansOn()
-            triggerEvent("fanUpdate", "on", True)
-        else:
-            log(logging.INFO, f"Switching fans off in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside})")
-            roof.Roof.get().fansOff()
-            triggerEvent("fanUpdate", "off", True)
-        triggerEvent("roofUpdate", roof.Roof.get().getStatus())
-        with lastFanChangeLock:
-            lastFanChange = time.time()
-    except Exception as e:
-        log(logging.ERROR, f"Error updating fans automatically: {e}")
-        triggerEvent("fanError", "auto", str(e))
-    finally:
-        roofLock.release()
-        log.flush()
+    mode = "on" if fansShouldBeOn else "off"
+    logger.info(f"Switching fans {mode} in auto mode (Humidity {H} vs {H_outside}, temperature {T} vs {T_outside})")
+    setFans(mode, auto=True)
 
 
 
@@ -630,6 +606,30 @@ def checkRoofPins():
     if not s.has("roof_port") or s.q("roof_port") == "":
         return False
     return True
+
+def readRoofConfig():
+    """Reads and validates the roof settings. Touches no hardware, needs no lock.
+
+    Returns Roof's constructor arguments, or None if the roof is not configured or the
+    configuration cannot be used. The parsing is guarded because checkRoofPins() only
+    establishes that the settings are present and non-empty, not that the pins are
+    numeric -- a hand-edited value has to fail here rather than escaping makeRoof().
+    """
+    if not checkRoofPins():
+        return None
+    try:
+        return {
+                "pinWestOpen": int(s.q("roof_pins_west_open")),
+                "pinWestClose": int(s.q("roof_pins_west_close")),
+                "pinEastOpen": int(s.q("roof_pins_east_open")),
+                "pinEastClose": int(s.q("roof_pins_east_close")),
+                "port": s.q("roof_port"),
+                "baud": s.q("roof_baud") if s.has("roof_baud") else 9600,
+                "timeout": s.q("roof_timeout") if s.has("roof_timeout") else 0.2,
+                }
+    except Exception as e:
+        logger.error("Roof configuration is not usable: {}".format(e))
+        return None
 
 class OwnerTrackingLock:
     def __init__(self):
@@ -656,6 +656,10 @@ class OwnerTrackingLock:
         self.release()
 
 roofLock = OwnerTrackingLock()
+# Only the roof worker and the makeRoof()/stopRoof() lifecycle take this lock now, and
+# the lifecycle paths join the worker first, so it is contended only in the window
+# where that join timed out.
+roofLockTimeout = 5
 roofThread = None
 roofStopEvent = threading.Event()
 lastRoofState = [False] * (max(c.value for c in roof.ResponseState) + 1)
@@ -663,47 +667,153 @@ lastRoofState = [False] * (max(c.value for c in roof.ResponseState) + 1)
 # otherwise make the loop either sleep for hours or fire a burst of catch-up polls.
 lastRoofIconUpdate = time.monotonic()
 roofIconUpdateInterval = 3
+# When the worker last published lastRoofState; 0.0 until the first poll lands, and
+# reset back to that whenever the roof goes away, so a state from a previous roof
+# instance can never be mistaken for a current one.
+lastRoofStateTime = 0.0
+# How stale the published state may be before a fan decision refuses to use it.
+roofStateMaxAge = 5
 
 def getLastRoofState():
     global lastRoofState
     return lastRoofState
+
+def getRoofState():
+    """Returns (state, age in seconds) as last published by the roof worker.
+
+    state is None if no poll has succeeded yet. The two values are read separately, so
+    the age can be off by up to one poll period -- immaterial against roofStateMaxAge,
+    and it keeps readers off the worker's hot path entirely.
+    """
+    global lastRoofState, lastRoofStateTime
+    if lastRoofStateTime == 0.0:
+        return None, 0.0
+    return lastRoofState, time.monotonic() - lastRoofStateTime
+
+# Work for the roof worker to carry out between status polls. The worker owns the
+# serial port on its own thread, so nothing else ever has to wait on roofLock to
+# change the roof: callers post here and return immediately.
+#
+# Latest-wins per key, because the roof has exactly one correct state per key -- an
+# unexecuted command that a newer one supersedes would only be undone again. Commands
+# stay in the mailbox until a poll succeeds, so one posted while the board is
+# unreachable is carried out when it comes back instead of being dropped.
+roofCommandLock = threading.Lock()
+roofCommands = {}
+
+def postRoofCommand(key, value):
+    with roofCommandLock:
+        roofCommands[key] = value
+
+def takeRoofCommands():
+    global roofCommands
+    with roofCommandLock:
+        commands = roofCommands
+        roofCommands = {}
+    return commands
+
+def clearRoofCommands():
+    global roofCommands
+    with roofCommandLock:
+        roofCommands = {}
 
 roofPollSlowPeriod = 2
 roofPollPeriod = 0.05
 roofPollBackoffMax = 50
 roofPollLogEvery = 50
 
-def pollRoofOnce():
-    global lastRoofState, lastRoofIconUpdate
+def executeFanCommand(status, mode, auto, log, event):
+    """Switches the fans unless the just-polled status says they are already there.
+
+    Runs on the roof worker thread with roofLock held, hence the deferred log/event
+    collectors. Returns the status the board reported after the command, or None if
+    nothing was sent.
+    """
+    global lastFanChange
+    fansAreOn = roof.Roof.get().fansAreOn(status=status)
+    wantOn = mode == "on"
+    if wantOn == fansAreOn:
+        log(logging.DEBUG, "Fan state already as requested")
+        return None
+    if wantOn and auto and not roof.Roof.get().isFullyClosed(status=status):
+        # Auto mode decided from a snapshot up to roofStateMaxAge old; this status is
+        # current. Re-checking is free here and closes the window in which the roof
+        # started opening between the decision and the command. Manual commands are
+        # not second-guessed -- switching the fans on with the roof open has always
+        # been the operator's call to make.
+        log(logging.WARNING, "Refusing to switch fans on in auto mode, roof is not fully closed")
+        event("fanError", mode, "Roof is not fully closed")
+        return None
+    log(logging.INFO, f"Switching fans {mode}")
+    newStatus = roof.Roof.get().fansOn() if wantOn else roof.Roof.get().fansOff()
+    lastFanChange = time.time()
+    event("fanUpdate", mode, auto)
+    return newStatus
+
+def serviceRoofOnce():
+    """One status poll plus whatever commands are pending, in a single lock hold.
+
+    The status the poll just returned is what the commands are judged against, so a
+    command costs at most one extra serial exchange and never needs a status read of
+    its own. Only this thread talks to the board, so the lock is all but uncontended;
+    it is still taken because a makeRoof()/stopRoof() whose thread join timed out can
+    reach the port while this thread is still running.
+    """
+    global lastRoofState, lastRoofStateTime, lastRoofIconUpdate
+    log = DeferredLog()
+    event = DeferredEvents()
     if not roofLock.acquire(timeout=roofLockTimeout):
         logger.warning("Timeout acquiring roof lock for status poll")
         return
     try:
         pollStart = time.monotonic()
-        currentRoofState = roof.Roof.get().getStatus()
+        status = roof.Roof.get().getStatus()
         pollDuration = time.monotonic() - pollStart
+        # Taken after the poll, so that a command posted while it was in flight is
+        # picked up now, and so a failed poll leaves the mailbox untouched for the
+        # next attempt. A command that fails once it has been taken is reported and
+        # dropped rather than retried, matching what the old blocking setFans() did.
+        commands = takeRoofCommands()
+        if "fans" in commands:
+            mode, auto = commands["fans"]
+            try:
+                newStatus = executeFanCommand(status, mode, auto, log, event)
+                if newStatus is not None:
+                    status = newStatus
+            except Exception as e:
+                log(logging.ERROR, f"Error switching fans {mode}: {e}")
+                event("fanError", mode, str(e))
     finally:
         roofLock.release()
+        log.flush()
+        event.flush()
+    changed = status != lastRoofState
+    lastRoofState = status
+    lastRoofStateTime = time.monotonic()
     if pollDuration > roofPollSlowPeriod:
         logger.warning(f"Roof status poll took {pollDuration:.1f}s, problems with serial port?")
     now = time.monotonic()
-    if currentRoofState != lastRoofState or now - lastRoofIconUpdate > roofIconUpdateInterval:
-        triggerEvent("roofUpdate", currentRoofState)
+    if changed or now - lastRoofIconUpdate > roofIconUpdateInterval:
+        triggerEvent("roofUpdate", status)
         lastRoofIconUpdate = now
-        lastRoofState = currentRoofState
 
 def roofLoop():
     # Paced on a deadline rather than by sleeping a fixed gap after each poll: the
     # period then stays constant regardless of how long a poll takes, instead of
     # being (gap + poll). Waiting on the stop event rather than time.sleep() also
     # makes shutdown immediate instead of up to one period late.
+    #
+    # Commands are picked up by the next iteration, so a posted command waits one poll
+    # period -- or, while the board is failing and the backoff has grown, up to
+    # roofPollPeriod * roofPollBackoffMax. Waiting out the backoff is the right
+    # behaviour anyway: the board is not answering, and hammering it would not help.
     nextPoll = time.monotonic() + roofPollPeriod
     failures = 0
     while True:
         if roofStopEvent.wait(max(0.0, nextPoll - time.monotonic())):
             break
         try:
-            pollRoofOnce()
+            serviceRoofOnce()
             failures = 0
         except Exception as e:
             failures += 1
@@ -722,7 +832,11 @@ def roofLoop():
             nextPoll = now + roofPollPeriod
 
 def stopRoof():
-    global roofThread, roofStopEvent, roofLock
+    global roofThread, roofStopEvent, roofLock, lastRoofStateTime
+    # Anything still pending was meant for the roof that is going away, and the fans
+    # are about to be switched off regardless.
+    clearRoofCommands()
+    lastRoofStateTime = 0.0
     if roofThread is not None and roofThread.is_alive():
         logger.info("Stopping roof thread")
         roofStopEvent.set()
@@ -732,46 +846,61 @@ def stopRoof():
         else:
             roofThread = None
             logger.info("Roof stopped")
+    log = DeferredLog()
     if roofLock.acquire(timeout=roofLockTimeout):
         try:
             if roof.Roof.isInitialized():
-                roof.Roof.get().fansOff()
+                # Motion first: it is a local GPIO write that cannot hang, while
+                # fansOff() talks to a board that may be wedged. Guarded separately so
+                # that neither failure can stop the other from being attempted -- and
+                # so that a dead board cannot make stopRoof() raise, which used to
+                # propagate out of makeRoof() and block re-initialization entirely.
+                try:
+                    roof.Roof.get().stopMotion()
+                except Exception as e:
+                    log(logging.ERROR, f"Error stopping roof motion: {e}")
+                try:
+                    roof.Roof.get().fansOff()
+                except Exception as e:
+                    log(logging.WARNING, f"Error switching fans off while stopping roof: {e}")
         finally:
             roofLock.release()
+            log.flush()
     else:
-        logger.warning("Timeout acquiring roof lock while stopping roof, fans may still be on")
+        logger.warning("Timeout acquiring roof lock while stopping roof, fans and motion may still be on")
     triggerEvent("roofUpdate", None)
 
 
 def makeRoof():
-    global roofThread, roofStopEvent, lastRoofState, roofLock
+    global roofThread, lastRoofState, lastRoofStateTime
     stopRoof()
+    # Read and validate the settings before taking the lock: roofLock is there to
+    # serialize access to the board and the relays, and none of this touches either.
+    config = readRoofConfig()
     log = DeferredLog()
+    event = DeferredEvents()
     if not roofLock.acquire(timeout=roofLockTimeout):
         logger.error("Timeout acquiring roof lock while (re-)initializing roof")
         triggerEvent("roofUpdate", None)
         return False
     try:
+        # The old roof goes away even when the new configuration turns out to be
+        # unusable: stopRoof() has already joined the worker, so keeping the instance
+        # would leave a roof that reports itself initialized with nothing polling it.
         roof.Roof.reset()
-        if not checkRoofPins():
-            triggerEvent("roofUpdate", None)
+        if config is None:
+            event("roofUpdate", None)
             return False
-        baud = 9600
-        if s.has("roof_baud"):
-            baud = s.q("roof_baud")
-        timeout = 0.2
-        if s.has("roof_timeout"):
-            timeout = s.q("roof_timeout")
         try:
-            roof.Roof(
-                    int(s.q("roof_pins_west_open")),
-                    int(s.q("roof_pins_west_close")),
-                    int(s.q("roof_pins_east_open")),
-                    int(s.q("roof_pins_east_close")),
-                    s.q("roof_port"),
-                    baud = baud,
-                    timeout = timeout)
-            triggerEvent("roofUpdate", roof.Roof.get().getStatus())
+            roof.Roof(**config)
+            # Publish the first status here rather than leaving the state unknown
+            # until the worker's first poll: the auto mode can then act right away.
+            lastRoofState = roof.Roof.get().getStatus()
+            lastRoofStateTime = time.monotonic()
+            event("roofUpdate", lastRoofState)
+            # Started while the lock is held, deliberately: roofLoop() waits a poll
+            # period before its first acquire and the lock is released a few
+            # instructions from here, so the new worker cannot actually contend for it.
             log(logging.INFO, "Starting roof thread")
             roofStopEvent.clear()
             roofThread = threading.Thread(target=roofLoop, name="OMS roof worker", daemon=True)
@@ -781,55 +910,55 @@ def makeRoof():
             log(logging.ERROR, "Could not initialize roof: {}".format(e))
             roofThread = None
             roof.Roof.reset()
-            triggerEvent("roofUpdate", None)
+            event("roofUpdate", None)
             return False
     finally:
         roofLock.release()
         log.flush()
+        event.flush()
 
     fans = s.q("fan_mode", fallback=None)
     if fans is not None:
-        setFans(fans)
+        applyFanMode(fans)
     return True
 
 
-roofLockTimeout = 5
-def setFans(mode):
-    logger.debug(f"setFans({mode}) acquiring roof lock")
-    log = DeferredLog()
-    if not roofLock.acquire(timeout=roofLockTimeout):
-        logger.error(f"Timeout acquiring roof lock")
-        triggerEvent("fanError", mode, "Roof not responding")
+def setFans(mode, auto=False):
+    """Asks the roof worker to switch the fans. Returns without touching the roof.
+
+    Fire and forget: the worker reports the outcome through the fanUpdate/fanError and
+    roofUpdate events, the same ones a status poll already raises, so there is nothing
+    for callers to wait on.
+    """
+    if mode not in ("on", "off"):
+        # fan_mode comes out of persisted settings, so a hand-edited or stale value can
+        # get here. The worker reads anything that is not "on" as off, which is not a
+        # decision to make on a typo.
+        logger.error(f"Ignoring unknown fan mode {mode}")
+        triggerEvent("fanError", mode, "Unknown fan mode")
         return
-    try:
-        if not roof.Roof.isInitialized():
-            log(logging.DEBUG, "Roof not initialized, ignoring")
-            triggerEvent("fanError", mode, "Roof not initialized")
-            return
-        log(logging.INFO, f"Switching fans {mode}")
-        try:
-            fansAreOn = roof.Roof.get().fansAreOn()
-            changed = False
-            if mode == "on" and not fansAreOn:
-                changed = True
-                status = roof.Roof.get().fansOn()
-            elif mode == "off" and fansAreOn:
-                changed = True
-                status = roof.Roof.get().fansOff()
-            if changed:
-                triggerEvent("fanUpdate", mode, False)
-                triggerEvent("roofUpdate", status)
-        except Exception as e:
-            triggerEvent("fanError", mode, str(e))
-            log(logging.ERROR, "Error setting fans to {}: {}".format(mode, e))
-            return
-    finally:
-        roofLock.release()
-        log.flush()
+    if not roof.Roof.isInitialized():
+        logger.debug("Roof not initialized, ignoring")
+        triggerEvent("fanError", mode, "Roof not initialized")
+        return
+    logger.info(f"Requesting fans {mode}")
+    postRoofCommand("fans", (mode, auto))
 
 
-def setFanMode(mode):
-    s.p("fan_mode", mode)
+def applyFanMode(mode):
+    """Applies a fan mode. Returns immediately and never touches the roof itself: the
+    auto path decides from the worker's published state, the manual path posts a
+    command, so this is safe to call from the event loop and from a worker thread.
+
+    Deliberately does not persist the mode: a settings write triggers NiceGUI's
+    persistent-storage backup, which schedules the file write with
+    core.loop.create_task(). Off the event loop that is not thread safe -- it raises
+    nothing, it just queues the write on the loop without waking it, so the file lands
+    whenever the loop next happens to wake for unrelated reasons (checked against
+    nicegui 3.15.0: a write from a worker thread was still missing from disk half a
+    second later). makeRoof() calls this from a worker thread, so callers persist the
+    mode themselves, on the event loop, beforehand.
+    """
     logger.info(f"Switching fan mode to {mode}")
     if mode == "auto":
         updateFans()
@@ -912,11 +1041,11 @@ def main():
         return plot
 
 
-    def saveSettings():
+    async def saveSettings():
         for thing in settings.keys():
             logger.debug("Setting {}: {}".format(thing, settings[thing].value))
             s.p(thing, settings[thing].value)
-        initStuff()
+        await initStuff()
         triggerEvent("updateSettings")
 
     weather_items = {
@@ -949,8 +1078,12 @@ def main():
             ui.label("Fan settings")
             fanToggle = ui.toggle(["off", "on", "auto"], value=s.q("fan_mode", fallback="off")).classes("w-full")
             def applyFans():
+                # Both steps return immediately -- the roof work happens on the roof
+                # worker thread -- so this can stay on the event loop.
                 dialog.close()
-                setFanMode(fanToggle.value)
+                mode = fanToggle.value
+                s.p("fan_mode", mode)
+                applyFanMode(mode)
             ui.button("Apply", on_click=applyFans).classes("w-full")
 
         dialog.open()
@@ -1007,12 +1140,12 @@ def main():
                     status_indicators = {}
                     status_indicators["west_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 0;')
                     status_indicators["west_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 0;')
-                    status_indicators["west_close_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 40%;')
-                    status_indicators["west_close_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 40%;')
+                    status_indicators["west_closed_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 40%;')
+                    status_indicators["west_closed_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 40%;')
                     status_indicators["east_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 0;')
                     status_indicators["east_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 0;')
-                    status_indicators["east_close_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 40%;')
-                    status_indicators["east_close_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 40%;')
+                    status_indicators["east_closed_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 40%;')
+                    status_indicators["east_closed_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 40%;')
                     status_indicators["west_push_north"] = ui.element("div").classes("absolute").style(
                             "left: 18%; top: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
                             )
@@ -1174,8 +1307,10 @@ def main():
 
     def updateRoofIcons(status: roof.ResponseState | None):
         if status is None:
-            for thing in ["west_open_north", "west_open_south", "west_close_north", "west_close_south", "east_open_north", "east_open_south", "east_close_north", "east_close_south"]:
-                status_indicators[thing].props("color=gray")
+            # The limit switch indicators are keyed by the lower-cased RoofSwitch name,
+            # so the set stays in step with roof.py by construction.
+            for sw in roof.RoofSwitch:
+                status_indicators[sw.name.lower()].props("color=gray")
             for thing in ["west_push_north", "west_push_south", "east_push_north", "east_push_south"]:
                 status_indicators[thing].style("background-color: transparent")
             for thing in ["west_open", "west_close", "east_open", "east_close"]:
@@ -1185,14 +1320,11 @@ def main():
             return
 
         colors = ["red", "green"]
-        status_indicators["west_close_north"].props(f"color={colors[status[roof.ResponseState.SW1.value]]}")
-        status_indicators["west_close_south"].props(f"color={colors[status[roof.ResponseState.SW2.value]]}")
-        status_indicators["west_open_north"].props(f"color={colors[status[roof.ResponseState.SW3.value]]}")
-        status_indicators["west_open_south"].props(f"color={colors[status[roof.ResponseState.SW4.value]]}")
-        status_indicators["east_close_north"].props(f"color={colors[status[roof.ResponseState.SW5.value]]}")
-        status_indicators["east_close_south"].props(f"color={colors[status[roof.ResponseState.SW6.value]]}")
-        status_indicators["east_open_north"].props(f"color={colors[status[roof.ResponseState.SW7.value]]}")
-        status_indicators["east_open_south"].props(f"color={colors[status[roof.ResponseState.SW8.value]]}")
+        # Iterating the enum rather than asking Roof for switchStates(): this runs on
+        # every roof update, including ones that arrive with no roof configured, and it
+        # must not depend on the singleton being there.
+        for sw in roof.RoofSwitch:
+            status_indicators[sw.name.lower()].props(f"color={colors[status[sw.bit]]}")
 
         colors = ["background-color: transparent", "background-color: gray"]
         status_indicators["west_push_north"].style(colors[status[roof.ResponseState.WEST_STATE.value]])
@@ -1605,19 +1737,36 @@ def main():
         });
     ''')
 
-def initStuff():
-    makeRoof()
-    initSwitches()
+def startWorkers():
     startCaptureLoop()
     startEnvironmentWorker()
     startWeatherWorker()
+
+async def initStuff():
+    """(Re-)initializes the roof, the switches and the background workers.
+
+    Called at startup and again whenever settings are saved. Both callers run on the
+    event loop, so everything that blocks -- joining worker threads, opening the roof
+    and environment serial ports, each of which can take seconds on a wedged USB
+    bridge -- is pushed to a worker thread. initSwitches() stays on the event loop:
+    it can rewrite settings storage, which has to happen there (see applyFanMode), and
+    is only GPIO work otherwise. It keeps its position between the two, because the
+    roof has to claim its pins before the switch pins are checked against them.
+    """
+    await asyncio.to_thread(makeRoof)
+    initSwitches()
+    await asyncio.to_thread(startWorkers)
 
 @app.on_shutdown
 async def shutdown():
     stopCaptureLoop()
     stopEnvironmentWorker()
     stopWeatherWorker()
-    stopRoof()
+    # Joins the roof thread and then waits for roofLock to switch the fans off:
+    # ~10s worst case, which would otherwise be spent with the event loop blocked
+    # while uvicorn is trying to close the client websockets. asyncio.to_thread
+    # rather than run.io_bound -- NiceGUI tears down its own executor on shutdown.
+    await asyncio.to_thread(stopRoof)
 
 @app.on_startup
 async def startup():
@@ -1625,7 +1774,7 @@ async def startup():
     await s.init()
     mainLoop = asyncio.get_event_loop()
     spawn(updateWorker())
-    initStuff()
+    await initStuff()
 
 try:
     ui.run(dark=True, favicon="favicon.svg", port=args.port, reload=False)

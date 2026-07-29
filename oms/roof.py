@@ -23,6 +23,26 @@ class ResponseState(Enum):
     EAST_STATE = 12
     CMDUNKN = 13
 
+class RoofSwitch(Enum):
+    """The eight limit switches, and which status bit each one reports in.
+
+    Listed in hardware order (SW1..SW8), which is the wiring this has to match. This
+    is the only place that mapping is written down.
+    """
+    WEST_CLOSED_NORTH = ResponseState.SW1
+    WEST_CLOSED_SOUTH = ResponseState.SW2
+    WEST_OPEN_NORTH = ResponseState.SW3
+    WEST_OPEN_SOUTH = ResponseState.SW4
+    EAST_CLOSED_NORTH = ResponseState.SW5
+    EAST_CLOSED_SOUTH = ResponseState.SW6
+    EAST_OPEN_NORTH = ResponseState.SW7
+    EAST_OPEN_SOUTH = ResponseState.SW8
+
+    @property
+    def bit(self):
+        """Index of this switch in a decoded status."""
+        return self.value.value
+
 class CMD(Enum):
     STATUS = 0
     FANS_ON = 1
@@ -54,8 +74,36 @@ class Roof():
 
     @classmethod
     def reset(cls):
-        del cls._instance
+        """Drops the singleton, de-energizing the motion relays and closing the port.
+
+        Neither may be left to garbage collection. The port is opened exclusive=True,
+        so it has to be closed before another Roof can open it, and makeRoof() calls
+        this from an except block where the traceback of the failing exchange still
+        references the old instance and keeps it alive -- exactly when the port is most
+        needed back. The relays are worse: RPi.GPIO leaves pin state untouched at
+        process exit, so a relay nobody switched off stays energized with no software
+        left to switch it.
+
+        _instance is cleared before anything is torn down, because writeCmd()
+        reconnects by itself when __serial is None: a caller still holding the instance
+        would otherwise reopen the port being closed here. Afterwards it fails fast
+        with "No roof instance initialized", which every call site already handles.
+        """
+        instance = cls._instance
         cls._instance = None
+        if instance is None:
+            return
+        # Teardown must not raise. makeRoof() calls this while handling another
+        # failure, and __init__ can leave a half-built instance behind whose attributes
+        # are missing; an exception here would replace the error being handled.
+        try:
+            instance.stopMotion()
+        except Exception as e:
+            logger.error("Error stopping roof motion while resetting: {}".format(e))
+        try:
+            instance.disconnect()
+        except Exception as e:
+            logger.warning("Error closing roof serial port while resetting: {}".format(e))
 
     @classmethod
     def get(cls):
@@ -68,25 +116,46 @@ class Roof():
         self.__baud = baud
         self.__timeout = timeout
         self.__serial = None
-        self.__switchWestOpen = switch.Switch(pinWestOpen, init=switch.State.OFF, on_destroy=switch.State.OFF)
-        self.__switchWestClose = switch.Switch(pinWestClose, init=switch.State.OFF, on_destroy=switch.State.OFF)
-        self.__switchEastOpen = switch.Switch(pinEastOpen, init=switch.State.OFF, on_destroy=switch.State.OFF)
-        self.__switchEastClose = switch.Switch(pinEastClose, init=switch.State.OFF, on_destroy=switch.State.OFF)
+        # Registered as they are created, so that a construction that fails partway
+        # through still leaves stopMotion() able to de-energize the relays that exist.
+        self.__motionRelays = []
+        self.__switchWestOpen = self.__makeMotionRelay(pinWestOpen)
+        self.__switchWestClose = self.__makeMotionRelay(pinWestClose)
+        self.__switchEastOpen = self.__makeMotionRelay(pinEastOpen)
+        self.__switchEastClose = self.__makeMotionRelay(pinEastClose)
         self.connect()
-        self.switch_west_open_north = ResponseState.SW3.value
-        self.switch_west_open_south = ResponseState.SW4.value
-        self.switch_west_closed_north = ResponseState.SW1.value
-        self.switch_west_closed_south = ResponseState.SW2.value
-        self.switch_east_open_north = ResponseState.SW7.value
-        self.switch_east_open_south = ResponseState.SW8.value
-        self.switch_east_closed_north = ResponseState.SW5.value
-        self.switch_east_closed_south = ResponseState.SW6.value
+        # Superseded by RoofSwitch and the per-switch accessors below; derived from the
+        # enum rather than restating the mapping. Nothing outside this class reads them
+        # any more, so they can go once you are sure of that.
+        self.switch_west_open_north = RoofSwitch.WEST_OPEN_NORTH.bit
+        self.switch_west_open_south = RoofSwitch.WEST_OPEN_SOUTH.bit
+        self.switch_west_closed_north = RoofSwitch.WEST_CLOSED_NORTH.bit
+        self.switch_west_closed_south = RoofSwitch.WEST_CLOSED_SOUTH.bit
+        self.switch_east_open_north = RoofSwitch.EAST_OPEN_NORTH.bit
+        self.switch_east_open_south = RoofSwitch.EAST_OPEN_SOUTH.bit
+        self.switch_east_closed_north = RoofSwitch.EAST_CLOSED_NORTH.bit
+        self.switch_east_closed_south = RoofSwitch.EAST_CLOSED_SOUTH.bit
+
+    def __makeMotionRelay(self, pin):
+        sw = switch.Switch(pin, init=switch.State.OFF, on_destroy=switch.State.OFF)
+        self.__motionRelays.append(sw)
+        return sw
 
     def stopMotion(self):
-        self.__switchWestOpen.off()
-        self.__switchWestClose.off()
-        self.__switchEastOpen.off()
-        self.__switchEastClose.off()
+        """De-energizes every motion relay.
+
+        All of them are attempted even if one fails: leaving a contactor energized
+        because some other pin write raised is not an acceptable outcome. Failures are
+        collected and reported together, once everything has been tried.
+        """
+        errors = []
+        for sw in self.__motionRelays:
+            try:
+                sw.off()
+            except Exception as e:
+                errors.append("pin {}: {}".format(sw.pin, e))
+        if errors:
+            raise RuntimeError("Could not stop roof motion: " + "; ".join(errors))
 
     def disconnect(self):
         if self.__serial is None:
@@ -172,35 +241,79 @@ class Roof():
     def fansOff(self):
         return self.decodeResponse(self.writeCmd(CMD.FANS_OFF))
 
-    def fansAreOn(self):
-        status = self.getStatus()
-        if status[ResponseState.FANS.value]:
-            return True
-        else:
-            return False
+    def fansAreOn(self, status=None):
+        if status is None:
+            status = self.getStatus()
+        return status[ResponseState.FANS.value]
 
+    def switchState(self, sw, status=None):
+        """Whether one limit switch reports engaged.
+
+        As everywhere else here, pass a status to read it out of a snapshot the caller
+        already holds instead of asking the board again.
+        """
+        if status is None:
+            status = self.getStatus()
+        return status[sw.bit]
+
+    def switchStates(self, status=None):
+        """All eight limit switches from a single status, as {RoofSwitch: bool}."""
+        if status is None:
+            status = self.getStatus()
+        return {sw: status[sw.bit] for sw in RoofSwitch}
+
+    def westClosedNorth(self, status=None):
+        return self.switchState(RoofSwitch.WEST_CLOSED_NORTH, status=status)
+
+    def westClosedSouth(self, status=None):
+        return self.switchState(RoofSwitch.WEST_CLOSED_SOUTH, status=status)
+
+    def westOpenNorth(self, status=None):
+        return self.switchState(RoofSwitch.WEST_OPEN_NORTH, status=status)
+
+    def westOpenSouth(self, status=None):
+        return self.switchState(RoofSwitch.WEST_OPEN_SOUTH, status=status)
+
+    def eastClosedNorth(self, status=None):
+        return self.switchState(RoofSwitch.EAST_CLOSED_NORTH, status=status)
+
+    def eastClosedSouth(self, status=None):
+        return self.switchState(RoofSwitch.EAST_CLOSED_SOUTH, status=status)
+
+    def eastOpenNorth(self, status=None):
+        return self.switchState(RoofSwitch.EAST_OPEN_NORTH, status=status)
+
+    def eastOpenSouth(self, status=None):
+        return self.switchState(RoofSwitch.EAST_OPEN_SOUTH, status=status)
+
+    # The composites below resolve the status once and then hand it down, so that a
+    # call without one costs a single exchange rather than one per switch pair.
     def westFullyOpen(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.switch_west_open_north] and status[self.switch_west_open_south]
+        return self.westOpenNorth(status=status) and self.westOpenSouth(status=status)
 
     def westFullyClosed(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.switch_west_closed_north] and status[self.switch_west_closed_south]
+        return self.westClosedNorth(status=status) and self.westClosedSouth(status=status)
 
     def eastFullyOpen(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.switch_east_open_north] and status[self.switch_east_open_south]
+        return self.eastOpenNorth(status=status) and self.eastOpenSouth(status=status)
 
     def eastFullyClosed(self, status=None):
         if status is None:
             status = self.getStatus()
-        return status[self.switch_east_closed_north] and status[self.switch_east_closed_south]
+        return self.eastClosedNorth(status=status) and self.eastClosedSouth(status=status)
 
     def isFullyOpen(self, status=None):
+        if status is None:
+            status = self.getStatus()
         return self.westFullyOpen(status=status) and self.eastFullyOpen(status=status)
 
     def isFullyClosed(self, status=None):
+        if status is None:
+            status = self.getStatus()
         return self.westFullyClosed(status=status) and self.eastFullyClosed(status=status)
