@@ -21,7 +21,6 @@ DEFAULTS = dict(
         roof_pins_west_close = 17,
         roof_pins_east_open = 4,
         roof_pins_east_close = 23,
-        switches = {},
         )
 
 async def init():

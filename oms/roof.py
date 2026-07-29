@@ -2,7 +2,6 @@ import logging
 from enum import Enum
 import numpy as np
 from serial import Serial, SerialException
-import threading
 
 import switch
 
@@ -55,8 +54,6 @@ class Roof():
 
     @classmethod
     def reset(cls):
-        #if cls._instance is not None:
-        #    cls._instance.stopLoop()
         del cls._instance
         cls._instance = None
 
@@ -76,8 +73,6 @@ class Roof():
         self.__switchEastOpen = switch.Switch(pinEastOpen, init=switch.State.OFF, on_destroy=switch.State.OFF)
         self.__switchEastClose = switch.Switch(pinEastClose, init=switch.State.OFF, on_destroy=switch.State.OFF)
         self.connect()
-        self.__thread: threading.Thread | None = None
-        self.__stop_event = threading.Event()
         self.switch_west_open_north = ResponseState.SW3.value
         self.switch_west_open_south = ResponseState.SW4.value
         self.switch_west_closed_north = ResponseState.SW1.value
@@ -87,18 +82,11 @@ class Roof():
         self.switch_east_closed_north = ResponseState.SW5.value
         self.switch_east_closed_south = ResponseState.SW6.value
 
-    def __del__(self):
-        #self.stopLoop()
-        return
-
     def stopMotion(self):
         self.__switchWestOpen.off()
         self.__switchWestClose.off()
         self.__switchEastOpen.off()
         self.__switchEastClose.off()
-
-    def isRunning(self):
-        return self.__thread is not None and self.__thread.is_alive()
 
     def disconnect(self):
         if self.__serial is None:
@@ -123,36 +111,48 @@ class Roof():
         self.disconnect()
         self.connect()
 
-    def isConnected(self):
-        return self.__serial.is_open
+    RESPONSE_SIZE = 2
 
-    def read(self, size):
-        if self.__serial is None:
-            self.reconnect()
-        try:
-            data = self.__serial.read(size)
-        except (SerialException, OSError):
-            data = b""
-        if len(data) == size:
-            return data
-        self.reconnect()
-        data = self.__serial.read(size)
-        if len(data) != size:
-            raise SerialException("Incomplete read from serial port {}: expected {} bytes, got {}".format(self.__port, size, len(data)))
-        return data
+    def __transact(self, payload, size):
+        # Flush before writing rather than after a bad read: a stale byte left over
+        # from an earlier timed-out exchange shifts every later response by one, and
+        # since any two bytes decode without error that desync would be silent.
+        self.__serial.reset_input_buffer()
+        self.__serial.write(payload)
+        return self.__serial.read(size)
 
-    def write(self, data):
-        if self.__serial is None:
-            self.reconnect()
-        try:
-            return self.__serial.write(data)
-        except (SerialException, OSError):
-            self.reconnect()
-            return self.__serial.write(data)
-
-    def writeCmd(self, cmd):
-        self.write((1 << cmd.value).to_bytes(1, "big"))
-        return self.read(2)
+    def writeCmd(self, cmd, retries=1):
+        payload = (1 << cmd.value).to_bytes(1, "big")
+        lastError = None
+        for attempt in range(1, retries + 2):
+            try:
+                if self.__serial is None:
+                    self.connect()
+                data = self.__transact(payload, self.RESPONSE_SIZE)
+                if len(data) == self.RESPONSE_SIZE:
+                    return data
+                # The board only answers when spoken to, so a short read means this
+                # exchange is over. Recovering requires re-sending the command;
+                # reading again without one can only ever time out.
+                lastError = "incomplete response ({} of {} bytes)".format(len(data), self.RESPONSE_SIZE)
+            except (SerialException, OSError, RuntimeError) as e:
+                lastError = str(e)
+                # Drop the connection so the next attempt reopens it. Never raises.
+                self.disconnect()
+            # Debug, not warning: this runs at poll rate, and logging is a blocking
+            # write. A board that is down would otherwise emit warnings faster than
+            # the handler can drain them and stall the caller. The detail survives in
+            # the exception below, which the caller logs once.
+            logger.debug("Roof board exchange failed (attempt {}/{}): {}".format(
+                attempt, retries + 1, lastError))
+        # Every attempt failed. A port that times out without ever raising (a wedged
+        # USB bridge) would otherwise never recover, since a timeout alone doesn't
+        # drop the connection. Reopening is cheap and harmless here -- DTR reset is
+        # blocked in hardware, so it does not disturb the board -- so give the next
+        # call a fresh port.
+        self.disconnect()
+        raise SerialException("No valid response from roof board on {} after {} attempts: {}".format(
+            self.__port, retries + 1, lastError))
 
     def decodeResponse(self, response):
         buff = np.frombuffer(response, dtype=np.uint16)[0]
@@ -165,26 +165,6 @@ class Roof():
 
     def getStatus(self):
         return self.decodeResponse(self.writeCmd(CMD.STATUS))
-
-    def startLoop(self):
-        logger.info("Starting roof loop")
-        if self.__thread is None or not self.__thread.is_alive():
-            self.__stop_event.clear()
-            self.__thread = threading.Thread(target=self.loop, daemon=True)
-            self.__thread.start()
-
-    def stopLoop(self):
-        logger.info("Stopping roof loop")
-        self.__stop_event.set()
-
-    def loop(self):
-        try:
-            while not self.__stop_event.is_set():
-                # Do stuff
-                self.__stop_event.wait(timeout=0.1)
-        finally:
-            # cleanup
-            pass
 
     def fansOn(self):
         return self.decodeResponse(self.writeCmd(CMD.FANS_ON))
