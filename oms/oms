@@ -174,11 +174,27 @@ for thing in environmentParameterMap.values():
     environmentLastData[thing] = None
 environmentLastData["timestamp"] = 0.0
 
-def setupEnvironmentWorker():
+def setupEnvironmentWorker(quiet=False):
+    """Opens the environment serial port, and an InfluxDB client if one is configured.
+
+    `quiet` is for the retry from inside environmentWorkerLoop. The first attempt tells
+    the operator what went wrong; the retries a few seconds apart after it must not, or
+    a board that is unconfigured or unplugged would fill the log and raise a UI
+    notification on every single pass.
+    """
     global environmentInfluxClient, environmentSerial, environmentLock, environmentWriteApi
-    logger.info("Setting up environment sensor and database")
+
+    def report(level, msg, event=None):
+        if quiet:
+            logger.debug(msg)
+            return
+        getattr(logger, level)(msg)
+        if event is not None:
+            triggerEvent(event, msg)
+
+    report("info", "Setting up environment sensor and database")
     if not environmentLock.acquire(timeout=5):
-        logger.warning("Error acquiring environment lock")
+        report("warning", "Error acquiring environment lock")
         return False
     try:
         if environmentSerial is not None:
@@ -212,19 +228,20 @@ def setupEnvironmentWorker():
                     )
                 environmentWriteApi = environmentInfluxClient.write_api(write_options=environmentWriteOptions)
             except Exception as e:
-                msg = f"Error setting up influx client: {e}"
-                logger.error(msg)
-                triggerEvent("error", msg)
+                report("error", f"Error setting up influx client: {e}", "error")
                 return False
+        else:
+            # Not an error: the sensor is still read and the fan logic still works,
+            # the readings just are not archived and the plots stay empty.
+            logger.debug("No weather database configured, environment readings will not be stored")
 
         port = s.q("weather_environment_port", fallback=None)
         baud = s.q("weather_environment_baud", fallback=None)
         timeout = s.q("weather_environment_timeout", fallback=2)
         if port is None or baud is None:
-            logger.warning("Environment serial port not available")
-            triggerEvent("warning", "Environment serial port not available")
+            report("warning", "Environment serial port not available", "warning")
             return False
-        logger.info("Opening serial port {}".format(port))
+        report("info", "Opening serial port {}".format(port))
         try:
             environmentSerial = Serial(port, baud, timeout=timeout, write_timeout=timeout, exclusive=True)
             environmentSerial.reset_input_buffer()
@@ -232,9 +249,7 @@ def setupEnvironmentWorker():
             if not environmentSerial.is_open:
                 raise RuntimeError("Unknown error")
         except SerialException as e:
-            msg = "Can not open serial port {}: {}".format(port, e)
-            logger.warning(msg)
-            triggerEvent("error", msg)
+            report("warning", "Can not open serial port {}: {}".format(port, e), "error")
             environmentSerial = None
             return False
     finally:
@@ -246,9 +261,16 @@ def environmentWorkerLoop():
     while not environmentStopEvent.is_set():
         lockAcquired = False
         try:
-            if environmentSerial is None or environmentInfluxClient is None:
-                setupEnvironmentWorker()
-            if environmentSerial is None or environmentInfluxClient is None:
+            # The serial port is what this loop needs; InfluxDB is only where the
+            # readings are archived. Requiring the client here meant that with no
+            # database configured the port was reopened and then never read, so
+            # environmentLastData never got a timestamp and updateFans always saw
+            # stale data -- auto fan mode could never switch the fans on.
+            if environmentSerial is None:
+                # Quietly: this runs every few seconds for as long as the board is
+                # missing, and the operator was already told once why.
+                setupEnvironmentWorker(quiet=True)
+            if environmentSerial is None:
                 environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
                 continue
             if not environmentLock.acquire(timeout=10):
@@ -282,8 +304,9 @@ def environmentWorkerLoop():
             value = float(result[0])
             environmentLastData[key] = value
             environmentLastData["timestamp"] = time.time()
-            p = Point("weather").field(key, value)
-            environmentWriteApi.write(bucket=s.q("weather_db_bucket", fallback=None), org=s.q("weather_db_org", fallback=None), record=p)
+            if environmentWriteApi is not None:
+                p = Point("weather").field(key, value)
+                environmentWriteApi.write(bucket=s.q("weather_db_bucket", fallback=None), org=s.q("weather_db_org", fallback=None), record=p)
         except Exception as e:
             logger.warning(f"Error in environment loop: {e}")
             environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
@@ -304,15 +327,21 @@ def stopEnvironmentWorker():
             logger.info("Environment thread stopped")
 
 def startEnvironmentWorker():
+    """Starts the environment worker, whether or not the board is there yet.
+
+    The thread starts even when the first setup fails, because the loop retries setup on
+    every pass: a board that is unconfigured or unplugged at boot then comes back on its
+    own once it appears. Returning early here used to leave no thread at all, and the only
+    other caller is a settings save, so nothing retried until the operator saved
+    something. setupEnvironmentWorker() has already reported the specific reason to the
+    UI, so this only notes the consequence -- and it is no longer fatal, hence a warning.
+    """
     global environmentThread, environmentStopEvent
     stopEnvironmentWorker()
     environmentStopEvent.clear()
     logger.info("Starting environment loop")
     if not setupEnvironmentWorker():
-        msg = "Could not set up environment board"
-        logger.error(msg)
-        triggerEvent("error", msg)
-        return
+        logger.warning("Could not set up environment board, the worker will keep retrying")
     environmentThread = threading.Thread(
             target = environmentWorkerLoop,
             daemon = True,
@@ -365,13 +394,25 @@ async def updateWorker():
             spawn(dispatch())
 
 def pinUsedForRoof(pin: int):
-    l = [
-            int(s.q("roof_pins_west_open")),
-            int(s.q("roof_pins_west_close")),
-            int(s.q("roof_pins_east_open")),
-            int(s.q("roof_pins_east_close"))
+    """Whether `pin` is one of the four roof motion pins.
+
+    Goes through readRoofConfig() rather than parsing the settings a second time, so an
+    unusable roof configuration is reported in one place and fails closed here. Parsing
+    inline used to raise TypeError out of initSwitches() -- and out of initStuff() with
+    it -- for a roof pin that had been cleared in the settings dialog.
+
+    No usable configuration means no Roof instance, so nothing is driving those pins and
+    there is nothing to protect a switch from.
+    """
+    config = readRoofConfig()
+    if config is None:
+        return False
+    return pin in [
+            config["pinWestOpen"],
+            config["pinWestClose"],
+            config["pinEastOpen"],
+            config["pinEastClose"]
             ]
-    return pin in l
 
 
 switch_names = ["pier", "cctv", "pc", "allsky"]
@@ -451,22 +492,33 @@ def initSwitch(name: str, pin: int, init: str, last: str):
             }
 
 def initSwitches():
+    """Registers a Switch for every configured switch pin.
+
+    Each switch is set up independently: an unusable pin -- non-numeric, or one GPIO
+    refuses -- must cost only that one switch. Letting it propagate used to abandon the
+    remaining switches and take initStuff() down with them.
+    """
     names = switch_names
     for name in names:
-        pin = s.q(name + "_pin", fallback=None)
-        init = s.q(name + "_init", fallback=None)
-        last = s.q(name + "_last", fallback=None)
-        if pin is None:
-            logger.warning("Pin for {} is not set up in settings, skipping".format(name))
-            continue
-        pin = int(pin)
-        if pinUsedForRoof(pin):
-            logger.warning("Switch for {} with pin {} is already in use for roof, removing".format(name, pin))
-            s.rm(name + "_pin")
-            s.rm(name + "_init")
-            s.rm(name + "_last")
-            continue
-        initSwitch(name, pin, init, last)
+        try:
+            pin = s.q(name + "_pin", fallback=None)
+            init = s.q(name + "_init", fallback=None)
+            last = s.q(name + "_last", fallback=None)
+            if pin is None:
+                logger.warning("Pin for {} is not set up in settings, skipping".format(name))
+                continue
+            pin = int(pin)
+            if pinUsedForRoof(pin):
+                logger.warning("Switch for {} with pin {} is already in use for roof, removing".format(name, pin))
+                s.rm(name + "_pin")
+                s.rm(name + "_init")
+                s.rm(name + "_last")
+                continue
+            initSwitch(name, pin, init, last)
+        except Exception as e:
+            msg = "Error setting up switch {}: {}".format(name, e)
+            logger.error(msg)
+            triggerEvent("error", msg)
 
 setSwitchStateLock = threading.Lock()
 def setSwitchState(name: str, state: switch.State):
@@ -1700,7 +1752,9 @@ def main():
             weather_labels["rain_percentage"].set_text("{:.0f} %".format(rain))
             weather_labels["rain_percentage"].classes(labelSize + " " + colstr)
 
-            elevation = s.q("weather_elevation")
+            # No elevation entered means no sea-level correction, which is what an
+            # elevation of zero computes anyway -- not a default, an identity.
+            elevation = s.q("weather_elevation", fallback=0) or 0
             pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
             weather_labels["env_pressure"].set_text("{:.0f} hPa".format(pressure))
             weather_labels["env_pressure"].classes(labelSize)
@@ -1768,12 +1822,29 @@ def main():
     query_api = Container()
 
     def initTimers():
+        """(Re-)creates the refresh timers, skipping the ones with no interval set.
+
+        There is no default refresh interval -- an unconfigured one means the operator
+        has not said how often to refresh, so nothing refreshes periodically until they
+        do. ui.timer(None) would raise and take the whole settings-update handler with
+        it. processSettingsUpdate() calls this again on every save, so a timer appears as
+        soon as its interval is entered.
+        """
         for thing in timers:
             timers[thing].cancel()
-        timers["update_allsky_images"] = ui.timer(s.q("weather_refresh"), updateAllskyImages)
-        timers["update_weather"] = ui.timer(s.q("weather_refresh"), updateWeather)
-        timers["update_plots"] = ui.timer(s.q("weather_refresh"), updatePlots)
-        timers["update_stream"] = ui.timer(s.q("stream_refresh"), updateStream)
+        timers.clear()
+        intervals = {
+                "update_allsky_images": ("weather_refresh", updateAllskyImages),
+                "update_weather": ("weather_refresh", updateWeather),
+                "update_plots": ("weather_refresh", updatePlots),
+                "update_stream": ("stream_refresh", updateStream),
+                }
+        for name, (setting, callback) in intervals.items():
+            interval = s.q(setting)
+            if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
+                logger.warning("No usable {} set ({!r}), {} will not refresh".format(setting, interval, name))
+                continue
+            timers[name] = ui.timer(interval, callback)
 
     def makeInfluxClient():
         oldClient = influx_client.get()
@@ -1876,9 +1947,23 @@ def main():
     ''')
 
 def startWorkers():
-    startCaptureLoop()
-    startEnvironmentWorker()
-    startWeatherWorker()
+    """Starts the three background workers, each independently.
+
+    One worker failing to start must not keep the other two down: they share no state,
+    and losing the capture loop is no reason to also lose the environment readings the
+    fan safety logic depends on.
+    """
+    for name, start in (
+            ("capture loop", startCaptureLoop),
+            ("environment worker", startEnvironmentWorker),
+            ("weather worker", startWeatherWorker),
+            ):
+        try:
+            start()
+        except Exception as e:
+            msg = "Error starting {}: {}".format(name, e)
+            logger.error(msg)
+            triggerEvent("error", msg)
 
 async def initStuff():
     """(Re-)initializes the roof, the switches and the background workers.
@@ -1890,10 +1975,31 @@ async def initStuff():
     it can rewrite settings storage, which has to happen there (see applyFanMode), and
     is only GPIO work otherwise. It keeps its position between the two, because the
     roof has to claim its pins before the switch pins are checked against them.
+
+    The three steps are isolated from each other. A failure in one used to abandon the
+    ones after it, so a single bad settings value could leave the process with no
+    switches and no background threads at all until a restart -- and on the saveSettings
+    path the exception died in the click handler, telling the user nothing. Each step now
+    reports its own failure and the rest still run.
     """
-    await asyncio.to_thread(makeRoof)
-    initSwitches()
-    await asyncio.to_thread(startWorkers)
+    try:
+        await asyncio.to_thread(makeRoof)
+    except Exception as e:
+        msg = "Error initializing roof: {}".format(e)
+        logger.error(msg)
+        triggerEvent("error", msg)
+    try:
+        initSwitches()
+    except Exception as e:
+        msg = "Error initializing switches: {}".format(e)
+        logger.error(msg)
+        triggerEvent("error", msg)
+    try:
+        await asyncio.to_thread(startWorkers)
+    except Exception as e:
+        msg = "Error starting workers: {}".format(e)
+        logger.error(msg)
+        triggerEvent("error", msg)
 
 @app.on_shutdown
 async def shutdown():
@@ -1909,7 +2015,6 @@ async def shutdown():
 @app.on_startup
 async def startup():
     global mainLoop
-    await s.init()
     mainLoop = asyncio.get_event_loop()
     spawn(updateWorker())
     await initStuff()

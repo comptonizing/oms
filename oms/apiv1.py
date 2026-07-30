@@ -19,6 +19,12 @@ def id():
 def weather():
     logger.debug("weather endpoint call")
     url = s.q("weather_url")
+    if url in [None, ""]:
+        logger.warning("Weather scraping URL is not configured")
+        return JSONResponse(
+                content = {"Error": "No weather URL is configured"},
+                status_code = status.SERVICE_UNAVAILABLE
+                )
     try:
         logger.debug("Getting weather from {}".format(url))
         r = requests.get(url, timeout=10)
