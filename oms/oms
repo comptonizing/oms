@@ -1973,8 +1973,12 @@ async def initStuff():
     and environment serial ports, each of which can take seconds on a wedged USB
     bridge -- is pushed to a worker thread. initSwitches() stays on the event loop:
     it can rewrite settings storage, which has to happen there (see applyFanMode), and
-    is only GPIO work otherwise. It keeps its position between the two, because the
-    roof has to claim its pins before the switch pins are checked against them.
+    is only GPIO work otherwise. It keeps its position between the two: makeRoof() drops
+    the old Roof, and the motion relays it owned de-energize as they are collected, so a
+    pin just handed from the roof to a switch would be pulled low again underneath the new
+    switch if the switch were made first. startup() therefore does not reorder this -- it
+    calls initSwitches() once itself, ahead of the whole thing, and this call then finds
+    the unchanged pins already claimed and does nothing to them.
 
     The three steps are isolated from each other. A failure in one used to abandon the
     ones after it, so a single bad settings value could leave the process with no
@@ -2016,6 +2020,15 @@ async def shutdown():
 async def startup():
     global mainLoop
     mainLoop = asyncio.get_event_loop()
+    # Switches first, before anything that can block. A switch set to restore its last
+    # state powers equipment that is already running -- the observatory PC above all --
+    # and it has to reach that state as early as possible. initStuff() opens the roof's
+    # serial port first, which costs seconds on a wedged USB bridge, and a save landing
+    # during startup can stretch that further. Only the pins are claimed here; initStuff()
+    # calls initSwitches() again a moment later, which is free for pins that have not
+    # changed. triggerEvent() only needs mainLoop, set above -- updateQueue buffers until
+    # updateWorker is spawned, and no client is connected this early anyway.
+    initSwitches()
     spawn(updateWorker())
     await initStuff()
 
