@@ -155,6 +155,15 @@ environmentInfluxClient = None
 environmentWriteApi = None
 environmentSerial = None
 environmentThread = None
+# Bumped by stopEnvironmentWorker() whenever a worker is retired, exactly as roofGeneration
+# is for the roof. A worker carries the value it was started with and leaves as soon as it
+# no longer matches. Two things need that. A worker whose join expired goes on writing
+# environmentLastData, which is what updateFans reads to decide whether the fans may run:
+# both workers read the same board so the values agree, but the *timestamp* does not, and a
+# zombie refreshing it makes stale data look current. And startEnvironmentWorker() clears
+# the shared stop event, which would otherwise revive a zombie sitting in wait() and let it
+# re-open the port a stop had just closed -- the generation is what stops it instead.
+environmentGeneration = 0
 environmentLock = threading.Lock()
 environmentStopEvent = threading.Event()
 environmentParameterMap = { "T": "inside_temperature", "H": "inside_humidity" }
@@ -282,9 +291,13 @@ def setupEnvironmentWorker(quiet=False):
         environmentLock.release()
     return True
 
-def environmentWorkerLoop():
+def environmentWorkerLoop(generation):
     global environmentStopEvent, environmentInfluxClient, environmentSerial, environmentLock, environmentLastData, environmentWriteApi
     while not environmentStopEvent.is_set():
+        if generation != environmentGeneration:
+            logger.warning("Environment worker {} superseded by {}, exiting".format(
+                generation, environmentGeneration))
+            break
         lockAcquired = False
         try:
             # The serial port is what this loop needs; InfluxDB is only where the
@@ -335,6 +348,13 @@ def environmentWorkerLoop():
                 continue
             key = environmentParameterMap[thing]
             value = float(result[0])
+            if generation != environmentGeneration:
+                # Superseded while this line was being read. The reading itself is fine --
+                # same board, same value -- but the timestamp that goes with it is what
+                # updateFans judges freshness by, and this worker is no longer the one
+                # whose freshness that represents.
+                logger.info("Environment worker superseded mid-read, discarding the reading")
+                break
             environmentLastData[key] = value
             environmentLastData["timestamp"] = time.monotonic()
             if environmentWriteApi is not None:
@@ -356,7 +376,10 @@ def stopEnvironmentWorker():
     rather than written. setupEnvironmentWorker() has always done this on its way to
     rebuilding them; the shutdown path never did.
     """
-    global environmentThread, environmentStopEvent
+    global environmentThread, environmentStopEvent, environmentGeneration
+    # Before the join, not after: from here on any worker still running is superseded,
+    # whether it manages to stop or not, and must not touch environmentLastData again.
+    environmentGeneration += 1
     if environmentThread is not None and environmentThread.is_alive():
         logger.info("Stopping environment thread")
         environmentStopEvent.set()
@@ -398,8 +421,12 @@ def startEnvironmentWorker():
     logger.info("Starting environment loop")
     if not setupEnvironmentWorker():
         logger.warning("Could not set up environment board, the worker will keep retrying")
+    # stopEnvironmentWorker() bumped the generation above, so this worker takes the current
+    # value and every older one is already superseded -- including one still sitting in the
+    # wait() that the clear() just above would otherwise have released.
     environmentThread = threading.Thread(
             target = environmentWorkerLoop,
+            args = (environmentGeneration,),
             daemon = True,
             name = "Environment worker"
             )
