@@ -144,7 +144,7 @@ def startCaptureLoop():
 def getWeather():
     data = apiv1.weather()
     if data.status_code != 200:
-        raise Exception("Error getting weather: Status code 200: {}".format(data.body))
+        raise Exception("Error getting weather: status code {}: {}".format(data.status_code, data.body))
     try:
         d = json.loads(data.body)
         return d
@@ -172,6 +172,9 @@ environmentWriteOptions = WriteOptions(
     )
 for thing in environmentParameterMap.values():
     environmentLastData[thing] = None
+# time.monotonic(), like every other interval clock here: a wall-clock reading would be
+# thrown off by an NTP step or a DST change, and this one decides whether the fans may run.
+# 0.0 still means "never read", since monotonic() is never 0 in practice.
 environmentLastData["timestamp"] = 0.0
 
 def setupEnvironmentWorker(quiet=False):
@@ -303,7 +306,7 @@ def environmentWorkerLoop():
             key = environmentParameterMap[thing]
             value = float(result[0])
             environmentLastData[key] = value
-            environmentLastData["timestamp"] = time.time()
+            environmentLastData["timestamp"] = time.monotonic()
             if environmentWriteApi is not None:
                 p = Point("weather").field(key, value)
                 environmentWriteApi.write(bucket=s.q("weather_db_bucket", fallback=None), org=s.q("weather_db_org", fallback=None), record=p)
@@ -497,9 +500,14 @@ def initSwitches():
     Each switch is set up independently: an unusable pin -- non-numeric, or one GPIO
     refuses -- must cost only that one switch. Letting it propagate used to abandon the
     remaining switches and take initStuff() down with them.
+
+    Every pin is collected before any of them is driven, because two switches sharing one
+    pin means two devices wired to one relay: switching either would switch the other, and
+    the second would report a state it does not control. The first name in switch_names
+    wins a contested pin and the other is refused and reported.
     """
-    names = switch_names
-    for name in names:
+    wanted = {}
+    for name in switch_names:
         try:
             pin = s.q(name + "_pin", fallback=None)
             init = s.q(name + "_init", fallback=None)
@@ -514,6 +522,31 @@ def initSwitches():
                 s.rm(name + "_init")
                 s.rm(name + "_last")
                 continue
+            claimed = next((other for other, wish in wanted.items() if wish[0] == pin), None)
+            if claimed is not None:
+                # Refused rather than resolved: there is no way to guess which device is
+                # really on the pin, and the settings are left alone so the operator can
+                # see what they entered and correct it.
+                msg = "Switch for {} cannot use pin {}, {} is already using it".format(name, pin, claimed)
+                logger.error(msg)
+                triggerEvent("error", msg)
+                continue
+            wanted[name] = (pin, init, last)
+        except Exception as e:
+            msg = "Error setting up switch {}: {}".format(name, e)
+            logger.error(msg)
+            triggerEvent("error", msg)
+    # A pin a switch is taking over can still be held by a registration from an earlier
+    # pass, because the operator moved it from one device to another. Release the previous
+    # holder before anything is driven, otherwise both would end up registered on the one
+    # pin. The GPIO level is deliberately left as it is -- that is what disconnecting a
+    # switch has always done.
+    for name, (pin, _, _) in wanted.items():
+        for other in [o for o in switches if o != name and switches[o]["switch"].pin == pin]:
+            logger.info("Releasing pin {} from {}, {} takes it over".format(pin, other, name))
+            del switches[other]
+    for name, (pin, init, last) in wanted.items():
+        try:
             initSwitch(name, pin, init, last)
         except Exception as e:
             msg = "Error setting up switch {}: {}".format(name, e)
@@ -538,6 +571,7 @@ weatherThread = None
 weatherStopEvent = threading.Event()
 weatherCacheLock = threading.Lock()
 weatherCache = None
+# time.monotonic(); 0.0 means nothing is cached. See environmentLastData["timestamp"].
 weatherCacheTimestamp = 0.0
 
 def weatherWorkerLoop():
@@ -550,7 +584,7 @@ def weatherWorkerLoop():
                     data = getWeather()
                     with weatherCacheLock:
                         weatherCache = data
-                        weatherCacheTimestamp = time.time()
+                        weatherCacheTimestamp = time.monotonic()
                 except Exception as e:
                     logger.warning(f"Error fetching weather data: {e}")
             else:
@@ -632,6 +666,7 @@ class DeferredEvents:
 # Written by the roof worker after it actually switches the fans, read by the auto
 # mode to rate-limit itself. One writer, one reader, and a float rebind is atomic
 # under the GIL, so there is nothing here for a lock to protect.
+# time.monotonic(); 0.0 means the fans have not been switched since startup.
 lastFanChange = 0.0
 def updateFans():
     """Decides whether the fans should be running and asks the worker to change them.
@@ -665,7 +700,7 @@ def updateFans():
         return
 
     # purposfully ignoring the environment lock here. If caught mid update shouldn't be a problem
-    dt = time.time() - environmentLastData["timestamp"]
+    dt = time.monotonic() - environmentLastData["timestamp"]
     H = environmentLastData["inside_humidity"]
     T = environmentLastData["inside_temperature"]
     if dt > 60:
@@ -678,13 +713,13 @@ def updateFans():
     logger.debug(f"Environment data available: {environmentLastData}")
 
     delay = s.q("roof_fan_change_delay", fallback=60)
-    if time.time() - lastFanChange < delay:
+    if time.monotonic() - lastFanChange < delay:
         logger.debug("Last change not too far in the past, skipping this one")
         return
 
     with weatherCacheLock:
         weather = weatherCache
-        weatherAge = time.time() - weatherCacheTimestamp
+        weatherAge = time.monotonic() - weatherCacheTimestamp
     weatherMaxAge = s.q("weather_refresh", fallback=5) * 3
     if weather is None or weatherAge > weatherMaxAge:
         logger.debug("No recent weather data available, skipping fan update")
@@ -764,7 +799,12 @@ class OwnerTrackingLock:
         self._lock.release()
 
     def __enter__(self):
-        self.acquire()
+        # Bounded, and loud when it expires. An unbounded acquire would hang the calling
+        # thread for as long as the holder stays wedged, with nothing in the log to say
+        # why -- every explicit acquire() call site already passes roofLockTimeout and
+        # reports the timeout, so `with roofLock:` must not be the one path that does not.
+        if not self.acquire(timeout=roofLockTimeout):
+            raise TimeoutError("Timeout acquiring roofLock")
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -832,10 +872,20 @@ def clearRoofCommands():
     with roofCommandLock:
         roofCommands = {}
 
-roofPollSlowPeriod = 2
-roofPollPeriod = 0.05
-roofPollBackoffMax = 50
-roofPollLogEvery = 50
+# One poll is a 3-byte exchange at 9600 baud plus up to the 10 ms the board spends in its
+# own delay(), so ~13 ms of work. 0.05 dates from when a command had to wait for the next
+# poll to be carried out; the command mailbox removed that, and nothing needs roof status
+# at 20 Hz -- the icons refresh on roofIconUpdateInterval and the fan decision refuses
+# anything older than roofStateMaxAge. Half a second keeps an order of magnitude of
+# headroom over the exchange and is still ten times fresher than that limit.
+roofPollPeriod = 0.5
+# Ceiling on the backoff while the board is failing, as a multiple of the period. Lowered
+# with the period so it still works out to ~5 s between attempts, and a board that comes
+# back is noticed about as quickly as it was before.
+roofPollBackoffMax = 10
+# One error record per this many consecutive failures. Fewer polls per minute now, so a
+# smaller number keeps a dead board about as visible in the log as it used to be.
+roofPollLogEvery = 10
 
 def executeFanCommand(status, mode, auto, log, event):
     """Switches the fans unless the just-polled status says they are already there.
@@ -861,7 +911,7 @@ def executeFanCommand(status, mode, auto, log, event):
         return None
     log(logging.INFO, f"Switching fans {mode}")
     newStatus = roof.Roof.get().fansOn() if wantOn else roof.Roof.get().fansOff()
-    lastFanChange = time.time()
+    lastFanChange = time.monotonic()
     event("fanUpdate", mode, auto)
     return newStatus
 
@@ -881,9 +931,7 @@ def serviceRoofOnce():
         logger.warning("Timeout acquiring roof lock for status poll")
         return
     try:
-        pollStart = time.monotonic()
         status = roof.Roof.get().getStatus()
-        pollDuration = time.monotonic() - pollStart
         # Taken after the poll, so that a command posted while it was in flight is
         # picked up now, and so a failed poll leaves the mailbox untouched for the
         # next attempt. A command that fails once it has been taken is reported and
@@ -905,8 +953,6 @@ def serviceRoofOnce():
     changed = status != lastRoofState
     lastRoofState = status
     lastRoofStateTime = time.monotonic()
-    if pollDuration > roofPollSlowPeriod:
-        logger.warning(f"Roof status poll took {pollDuration:.1f}s, problems with serial port?")
     now = time.monotonic()
     if changed or now - lastRoofIconUpdate > roofIconUpdateInterval:
         triggerEvent("roofUpdate", status)
@@ -1025,6 +1071,11 @@ def makeRoof():
             log(logging.ERROR, "Could not initialize roof: {}".format(e))
             roofThread = None
             roof.Roof.reset()
+            # The status read above may already have published a state and a fresh
+            # timestamp before this failed. Zero it, exactly as stopRoof does, so
+            # getRoofState() cannot hand out a current-looking reading for a roof that
+            # does not exist.
+            lastRoofStateTime = 0.0
             event("roofUpdate", None)
             return False
     finally:
@@ -1700,7 +1751,7 @@ def main():
             return
         with weatherCacheLock:
             d = weatherCache
-            weatherAge = time.time() - weatherCacheTimestamp
+            weatherAge = time.monotonic() - weatherCacheTimestamp
         weatherMaxAge = s.q("weather_refresh", fallback=5) * 3
         if d is None or weatherAge > weatherMaxAge:
             logger.warning("No recent weather data available")
@@ -1804,7 +1855,7 @@ def main():
             weather_labels["wind_gust"].set_text("{:.1f} km/h".format(wind_gust))
             weather_labels["wind_gust"].classes(labelSize + " " + colstr)
         except Exception as e:
-            logger.error("Error updating weather plots: {}".format(e))
+            logger.error("Error updating weather labels: {}".format(e))
 
 
 
@@ -1965,6 +2016,17 @@ def startWorkers():
             logger.error(msg)
             triggerEvent("error", msg)
 
+# Serializes initStuff(). Two clients pressing "Save & apply", or a save landing during
+# startup, otherwise run the whole (re-)initialization concurrently: makeRoof() interleaves
+# its stopRoof()/reset()/Roof()/thread-start with another copy of itself, roofThread gets
+# overwritten, and each worker start can be run twice -- both callers see the old thread
+# alive, both stop it, both start a new one.
+#
+# asyncio rather than threading, because every caller is on the event loop and a waiter has
+# to yield rather than block it. Bound to the loop on first use, which is fine with the one
+# loop the app has; a test process that runs several loops has to replace it between them.
+initLock = asyncio.Lock()
+
 async def initStuff():
     """(Re-)initializes the roof, the switches and the background workers.
 
@@ -1985,25 +2047,32 @@ async def initStuff():
     switches and no background threads at all until a restart -- and on the saveSettings
     path the exception died in the click handler, telling the user nothing. Each step now
     reports its own failure and the rest still run.
+
+    Runs under initLock, so concurrent calls apply one after another instead of
+    interleaving. Note what that does and does not promise: the settings themselves are
+    already in storage before saveSettings() gets here, so a second save that lands while
+    the first is still applying has its values picked up by whichever pass reads them
+    next. What is guaranteed is that no two passes ever run at the same time.
     """
-    try:
-        await asyncio.to_thread(makeRoof)
-    except Exception as e:
-        msg = "Error initializing roof: {}".format(e)
-        logger.error(msg)
-        triggerEvent("error", msg)
-    try:
-        initSwitches()
-    except Exception as e:
-        msg = "Error initializing switches: {}".format(e)
-        logger.error(msg)
-        triggerEvent("error", msg)
-    try:
-        await asyncio.to_thread(startWorkers)
-    except Exception as e:
-        msg = "Error starting workers: {}".format(e)
-        logger.error(msg)
-        triggerEvent("error", msg)
+    async with initLock:
+        try:
+            await asyncio.to_thread(makeRoof)
+        except Exception as e:
+            msg = "Error initializing roof: {}".format(e)
+            logger.error(msg)
+            triggerEvent("error", msg)
+        try:
+            initSwitches()
+        except Exception as e:
+            msg = "Error initializing switches: {}".format(e)
+            logger.error(msg)
+            triggerEvent("error", msg)
+        try:
+            await asyncio.to_thread(startWorkers)
+        except Exception as e:
+            msg = "Error starting workers: {}".format(e)
+            logger.error(msg)
+            triggerEvent("error", msg)
 
 @app.on_shutdown
 async def shutdown():
@@ -2028,7 +2097,12 @@ async def startup():
     # calls initSwitches() again a moment later, which is free for pins that have not
     # changed. triggerEvent() only needs mainLoop, set above -- updateQueue buffers until
     # updateWorker is spawned, and no client is connected this early anyway.
-    initSwitches()
+    #
+    # Under initLock, and released again before initStuff() takes it -- the lock is not
+    # reentrant. No client exists yet at this point, so nothing can contend it; holding it
+    # anyway costs nothing and makes the ordering guarantee independent of that argument.
+    async with initLock:
+        initSwitches()
     spawn(updateWorker())
     await initStuff()
 
