@@ -926,10 +926,6 @@ lastRoofStateTime = 0.0
 # How stale the published state may be before a fan decision refuses to use it.
 roofStateMaxAge = 5
 
-def getLastRoofState():
-    global lastRoofState
-    return lastRoofState
-
 def getRoofState():
     """Returns (state, age in seconds) as last published by the roof worker.
 
@@ -2116,7 +2112,13 @@ def main():
         updateButtons()
         updateStream()
         updateAllskyImages()
-        updateRoofIcons(getLastRoofState())
+        # getRoofState(), not the raw lastRoofState: stopRoof() zeroes the timestamp but
+        # leaves the last real reading in place, so a client connecting after the roof
+        # failed used to be shown convincing red/green limit-switch icons for a roof that
+        # is not there. Clients already connected grey out on the roofUpdate None event;
+        # this is the path that had no such event to receive. getRoofState() returns None
+        # once the timestamp is zeroed, and updateRoofIcons handles None.
+        updateRoofIcons(getRoofState()[0])
         updateCallbacks[ui.context.client.id] = update
     ui.context.client.on_connect(onConnect)
 
