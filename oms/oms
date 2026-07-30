@@ -2262,14 +2262,41 @@ async def initStuff():
 
 @app.on_shutdown
 async def shutdown():
-    stopCaptureLoop()
-    stopEnvironmentWorker()
-    stopWeatherWorker()
-    # Joins the roof thread and then waits for roofLock to switch the fans off:
-    # ~10s worst case, which would otherwise be spent with the event loop blocked
-    # while uvicorn is trying to close the client websockets. asyncio.to_thread
-    # rather than run.io_bound -- NiceGUI tears down its own executor on shutdown.
-    await asyncio.to_thread(stopRoof)
+    """Tears everything down at once, and off the event loop.
+
+    Every one of these blocks. Each worker stop joins its thread with a five second
+    timeout; stopEnvironmentWorker then spends up to another five seconds acquiring its
+    lock and up to five flushing the write API; stopRoof joins, then waits on roofLock to
+    switch the fans off, which was measured at nearly twelve seconds against a wedged
+    serial port. Run one after another on the event loop -- as three of these were -- that
+    is half a minute of a blocked loop while uvicorn is trying to close the client
+    websockets.
+
+    Run together in threads instead, so the cost is the slowest teardown rather than their
+    sum. They contend for nothing: the roof and the environment worker hold different
+    locks, and the capture and weather loops hold none. The one interleaving that can
+    happen is the weather worker posting a fan command through updateFans while stopRoof
+    is tearing the roof down, which is harmless -- the mailbox is cleared at the start of
+    stopRoof and anything landing after it belongs to a roof that no longer exists, in a
+    process that is exiting.
+
+    asyncio.to_thread rather than run.io_bound: NiceGUI tears down its own executor on
+    shutdown. Failures are collected rather than raised, because one teardown that throws
+    must not leave the other three unreported.
+    """
+    stops = (
+            ("capture loop", stopCaptureLoop),
+            ("environment worker", stopEnvironmentWorker),
+            ("weather worker", stopWeatherWorker),
+            ("roof", stopRoof),
+            )
+    results = await asyncio.gather(
+            *(asyncio.to_thread(stop) for _, stop in stops),
+            return_exceptions=True
+            )
+    for (name, _), result in zip(stops, results):
+        if isinstance(result, BaseException):
+            logger.error("Error stopping {}: {}".format(name, result))
 
 @app.on_startup
 async def startup():
