@@ -816,7 +816,24 @@ roofLock = OwnerTrackingLock()
 # where that join timed out.
 roofLockTimeout = 5
 roofThread = None
+# The current roof worker's stop event, and only that. makeRoof() replaces it for each new
+# worker rather than clearing it, and the worker itself holds its own reference, so
+# signalling one worker can never be undone on behalf of another.
 roofStopEvent = threading.Event()
+# Bumped by stopRoof() whenever a worker is retired. Each worker carries the value it was
+# started with and goes silent as soon as it no longer matches: a worker whose join timed
+# out can still be in the middle of a serial read while its replacement is already running,
+# and two threads writing lastRoofState is precisely what the published-state design cannot
+# survive. Bumped in stopRoof() rather than makeRoof() so that a makeRoof() which then
+# fails -- unusable config, a port that will not open -- still leaves the old worker
+# superseded instead of publishing for a roof that has been reset. Read without a lock: an
+# int read is atomic under the GIL, and the check only has to be eventually right.
+roofGeneration = 0
+# Workers that outlived their join. Being superseded they can no longer publish or act, but
+# they still hold a thread and, for as long as they are stuck in a serial read, roofLock --
+# which is exactly why the count is worth reporting. It is the visible symptom of a wedged
+# USB bridge, and the reason a rebuilt roof may fail to take the lock.
+abandonedRoofThreads = []
 lastRoofState = [False] * (max(c.value for c in roof.ResponseState) + 1)
 # Intervals are all measured with time.monotonic(): an NTP step on the Pi would
 # otherwise make the loop either sleep for hours or fire a burst of catch-up polls.
@@ -887,20 +904,24 @@ roofPollBackoffMax = 10
 # smaller number keeps a dead board about as visible in the log as it used to be.
 roofPollLogEvery = 10
 
-def executeFanCommand(status, mode, auto, log, event):
+def executeFanCommand(roofInstance, status, mode, auto, log, event):
     """Switches the fans unless the just-polled status says they are already there.
 
     Runs on the roof worker thread with roofLock held, hence the deferred log/event
     collectors. Returns the status the board reported after the command, or None if
     nothing was sent.
+
+    Acts on the roofInstance the caller was given, for the same reason serviceRoofOnce
+    does: a worker that outlived its stopRoof() must not switch the fans on a roof that
+    has since replaced the one it was started for.
     """
     global lastFanChange
-    fansAreOn = roof.Roof.get().fansAreOn(status=status)
+    fansAreOn = roofInstance.fansAreOn(status=status)
     wantOn = mode == "on"
     if wantOn == fansAreOn:
         log(logging.DEBUG, "Fan state already as requested")
         return None
-    if wantOn and auto and not roof.Roof.get().isFullyClosed(status=status):
+    if wantOn and auto and not roofInstance.isFullyClosed(status=status):
         # Auto mode decided from a snapshot up to roofStateMaxAge old; this status is
         # current. Re-checking is free here and closes the window in which the roof
         # started opening between the decision and the command. Manual commands are
@@ -910,12 +931,12 @@ def executeFanCommand(status, mode, auto, log, event):
         event("fanError", mode, "Roof is not fully closed")
         return None
     log(logging.INFO, f"Switching fans {mode}")
-    newStatus = roof.Roof.get().fansOn() if wantOn else roof.Roof.get().fansOff()
+    newStatus = roofInstance.fansOn() if wantOn else roofInstance.fansOff()
     lastFanChange = time.monotonic()
     event("fanUpdate", mode, auto)
     return newStatus
 
-def serviceRoofOnce():
+def serviceRoofOnce(roofInstance, generation):
     """One status poll plus whatever commands are pending, in a single lock hold.
 
     The status the poll just returned is what the commands are judged against, so a
@@ -923,6 +944,10 @@ def serviceRoofOnce():
     its own. Only this thread talks to the board, so the lock is all but uncontended;
     it is still taken because a makeRoof()/stopRoof() whose thread join timed out can
     reach the port while this thread is still running.
+
+    Works on the roofInstance its caller was given rather than on roof.Roof.get(): the
+    singleton can be replaced under a worker that outlived its stopRoof(), and such a
+    worker must not end up driving the roof that replaced it.
     """
     global lastRoofState, lastRoofStateTime, lastRoofIconUpdate
     log = DeferredLog()
@@ -931,7 +956,14 @@ def serviceRoofOnce():
         logger.warning("Timeout acquiring roof lock for status poll")
         return
     try:
-        status = roof.Roof.get().getStatus()
+        status = roofInstance.getStatus()
+        if generation != roofGeneration:
+            # Superseded while this read was in flight. The mailbox is deliberately left
+            # untouched: takeRoofCommands() removes what it hands out, so taking commands
+            # here would either drop them or run them against a roof that is being
+            # replaced. The worker that replaced this one carries them out instead.
+            log(logging.INFO, "Roof worker superseded mid-poll, discarding the result")
+            return
         # Taken after the poll, so that a command posted while it was in flight is
         # picked up now, and so a failed poll leaves the mailbox untouched for the
         # next attempt. A command that fails once it has been taken is reported and
@@ -940,7 +972,7 @@ def serviceRoofOnce():
         if "fans" in commands:
             mode, auto = commands["fans"]
             try:
-                newStatus = executeFanCommand(status, mode, auto, log, event)
+                newStatus = executeFanCommand(roofInstance, status, mode, auto, log, event)
                 if newStatus is not None:
                     status = newStatus
             except Exception as e:
@@ -950,6 +982,11 @@ def serviceRoofOnce():
         roofLock.release()
         log.flush()
         event.flush()
+    if generation != roofGeneration:
+        # Checked once more: a command can take a second or two, and being replaced during
+        # one must not let this thread publish over what its replacement has written.
+        logger.info("Roof worker superseded, not publishing its last poll")
+        return
     changed = status != lastRoofState
     lastRoofState = status
     lastRoofStateTime = time.monotonic()
@@ -958,7 +995,19 @@ def serviceRoofOnce():
         triggerEvent("roofUpdate", status)
         lastRoofIconUpdate = now
 
-def roofLoop():
+def roofLoop(stopEvent, roofInstance, generation):
+    """The roof worker. Everything it needs is an argument, nothing is looked up.
+
+    stopEvent is this worker's own, so a worker that stopRoof() signalled stays signalled
+    no matter what the next one does. roofInstance is the Roof it was started for, so
+    makeRoof()'s Roof.reset() cannot leave it operating on a roof other than the one it was
+    given. generation is what makes a worker that could not be joined harmless: it stops
+    polling as soon as it no longer matches roofGeneration.
+
+    A worker whose join timed out normally leaves through the stop event, which stays set.
+    The generation check is what covers the window that event cannot: the poll already in
+    flight when the replacement was built.
+    """
     # Paced on a deadline rather than by sleeping a fixed gap after each poll: the
     # period then stays constant regardless of how long a poll takes, instead of
     # being (gap + poll). Waiting on the stop event rather than time.sleep() also
@@ -971,10 +1020,14 @@ def roofLoop():
     nextPoll = time.monotonic() + roofPollPeriod
     failures = 0
     while True:
-        if roofStopEvent.wait(max(0.0, nextPoll - time.monotonic())):
+        if stopEvent.wait(max(0.0, nextPoll - time.monotonic())):
+            break
+        if generation != roofGeneration:
+            logger.warning(
+                    "Roof worker {} superseded by {}, exiting".format(generation, roofGeneration))
             break
         try:
-            serviceRoofOnce()
+            serviceRoofOnce(roofInstance, generation)
             failures = 0
         except Exception as e:
             failures += 1
@@ -992,21 +1045,57 @@ def roofLoop():
             # run back to back and starve other threads of roofLock.
             nextPoll = now + roofPollPeriod
 
+def reapAbandonedRoofThreads():
+    """Drops abandoned workers that have since exited, and reports that they did.
+
+    An abandoned worker is not necessarily lost: one stuck in a serial read leaves as soon
+    as that read returns, because its stop event is still set and its generation is stale.
+    Saying so matters as much as reporting the abandonment -- otherwise the log only ever
+    shows the roof getting worse.
+    """
+    global abandonedRoofThreads
+    if not abandonedRoofThreads:
+        return
+    alive = [thread for thread in abandonedRoofThreads if thread.is_alive()]
+    gone = len(abandonedRoofThreads) - len(alive)
+    if gone > 0:
+        logger.info("{} abandoned roof worker(s) have exited, {} still running".format(
+            gone, len(alive)))
+    abandonedRoofThreads = alive
+
 def stopRoof():
-    global roofThread, roofStopEvent, roofLock, lastRoofStateTime
+    global roofThread, roofStopEvent, roofGeneration, roofLock, lastRoofStateTime
     # Anything still pending was meant for the roof that is going away, and the fans
     # are about to be switched off regardless.
     clearRoofCommands()
     lastRoofStateTime = 0.0
+    # Before the join, not after: from here on any worker still running is superseded,
+    # whether it manages to stop or not, and must not publish or execute anything more.
+    roofGeneration += 1
+    reapAbandonedRoofThreads()
     if roofThread is not None and roofThread.is_alive():
         logger.info("Stopping roof thread")
+        # This worker's own event, and it stays set: makeRoof() gives the next worker a
+        # fresh one instead of clearing this, so a worker that could not be joined below
+        # cannot be woken up again by the next initialization.
         roofStopEvent.set()
         roofThread.join(timeout=5)
         if roofThread.is_alive():
-            logger.warning("Roof thread still running")
+            # Kept, not forgotten. It is superseded and cannot act, but it is still a
+            # thread and it is probably holding roofLock inside a serial read, which is
+            # why the next makeRoof() may not get the lock. Counting them turns a wedged
+            # bridge from something invisible into something the log states outright.
+            abandonedRoofThreads.append(roofThread)
+            logger.error(
+                    "Roof worker did not stop within 5s and was abandoned "
+                    "({} abandoned in total). The serial port is most likely wedged; "
+                    "the roof may not come back before OMS is restarted".format(
+                        len(abandonedRoofThreads)))
         else:
-            roofThread = None
             logger.info("Roof stopped")
+        # Either way this name no longer refers to a worker anything should join or
+        # signal: a successful stop leaves none, and an abandoned one is tracked above.
+        roofThread = None
     log = DeferredLog()
     if roofLock.acquire(timeout=roofLockTimeout):
         try:
@@ -1033,7 +1122,7 @@ def stopRoof():
 
 
 def makeRoof():
-    global roofThread, lastRoofState, lastRoofStateTime
+    global roofThread, roofStopEvent, lastRoofState, lastRoofStateTime
     stopRoof()
     # Read and validate the settings before taking the lock: roofLock is there to
     # serialize access to the board and the relays, and none of this touches either.
@@ -1054,17 +1143,32 @@ def makeRoof():
             return False
         try:
             roof.Roof(**config)
+            instance = roof.Roof.get()
             # Publish the first status here rather than leaving the state unknown
             # until the worker's first poll: the auto mode can then act right away.
-            lastRoofState = roof.Roof.get().getStatus()
+            lastRoofState = instance.getStatus()
             lastRoofStateTime = time.monotonic()
             event("roofUpdate", lastRoofState)
             # Started while the lock is held, deliberately: roofLoop() waits a poll
             # period before its first acquire and the lock is released a few
             # instructions from here, so the new worker cannot actually contend for it.
             log(logging.INFO, "Starting roof thread")
-            roofStopEvent.clear()
-            roofThread = threading.Thread(target=roofLoop, name="OMS roof worker", daemon=True)
+            # A fresh event per worker, handed to the worker as an argument, rather than
+            # clearing a shared one. A previous worker that stopRoof() signalled but could
+            # not join is still waiting on *its* event: clearing that same object here used
+            # to un-signal it, so the orphan resumed polling and two workers then drove one
+            # board. The module-level name is only ever "the current worker's event", for
+            # stopRoof() to signal.
+            workerStopEvent = threading.Event()
+            roofStopEvent = workerStopEvent
+            # stopRoof() bumped the generation at the top of this call, so this worker
+            # takes the current value and every older one is already superseded.
+            roofThread = threading.Thread(
+                    target=roofLoop,
+                    args=(workerStopEvent, instance, roofGeneration),
+                    name="OMS roof worker",
+                    daemon=True
+                    )
             roofThread.start()
             log(logging.INFO, "Roof thread started")
         except Exception as e:
