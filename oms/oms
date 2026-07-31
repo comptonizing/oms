@@ -465,12 +465,20 @@ async def updateWorker():
         thing = await updateQueue.get()
         logger.debug("update worker got event {}".format(thing))
         for clientId, client in list(Client.instances.items()):
-            if clientId not in updateCallbacks:
+            # Bound here rather than looked up again inside dispatch(): the coroutine runs
+            # later, and a client disconnecting in between takes its entry out of
+            # updateCallbacks. The lookup then raised KeyError -- logged as a bare client
+            # id, since that is all a KeyError carries.
+            callback = updateCallbacks.get(clientId)
+            if callback is None:
                 continue
-            async def dispatch(cid=clientId, c=client, t=thing):
+            async def dispatch(cid=clientId, c=client, t=thing, cb=callback):
+                if cid not in updateCallbacks:
+                    logger.debug("Client {} left before its callback ran".format(cid))
+                    return
                 try:
                     with c:
-                        await updateCallbacks[cid](t)
+                        await cb(t)
                 except Exception as e:
                     logger.warning("Error running callback on client {}:\n{}".format(cid, e))
             logger.debug("Dispatching event for client {}: {}".format(clientId, thing))
@@ -1783,7 +1791,7 @@ def main():
         showUnavailable(status_allsky_image, status_allsky_message, reason)
         showUnavailable(weather_allsky_image, weather_allsky_message, reason)
 
-    async def _updatePlots():
+    async def _updatePlots(api):
         r = weather_range_select.value
         w = weather_ranges[r]
         # Zero, not 0.3. These sit after queries, and awaiting a query already hands the
@@ -1791,10 +1799,6 @@ def main():
         # dominated by five figure pushes. Kept as explicit yield points rather than
         # deleted, because that is what they are for -- see pushPlot for the real pause.
         sleepTime = 0
-
-        api = query_api.get()
-        if api is None:
-            return
 
         plot = weather_plots["Temperature"]
         fig = plot.figure
@@ -1970,14 +1974,38 @@ def main():
             # Superseded by a newer pass, which owns the figures now.
             pass
 
+    def cancelPlots():
+        """Stop an in-flight pass because the client it is querying is about to close.
+
+        A pass holds one query API across all fifteen of its queries, so closing the
+        client underneath it fails the rest of them with "Connector is closed."  Cancelling
+        first means the pass stops at its current await instead of running into that.
+        """
+        running = plotRun.get()
+        if running is not None and not running.done():
+            running.cancel()
+        plotRun.clear()
+
     async def _drawPlots():
+        # One API for the whole pass, so the fifteen queries below are answered by one
+        # client and cannot straddle two. Which client it was matters in the handler.
+        api = query_api.get()
+        if api is None:
+            return
         try:
             for plot in weather_plots.values():
                 plot.figure.layout.annotations = []
                 plot.figure.update_xaxes(visible=True)
                 plot.figure.update_yaxes(visible=True)
-            await _updatePlots()
+            await _updatePlots(api)
         except Exception as e:
+            if query_api.get() is not api:
+                # Not a database fault: the client this pass was querying was closed
+                # underneath it -- a settings save or a disconnect -- so its remaining
+                # queries failed with "Connector is closed." Whoever replaced the client
+                # draws next; painting an error over the figures would only flash.
+                logger.debug("Plot pass dropped: its database client was replaced ({})".format(e))
+                return
             logger.error(f"Error updating weather plots: {e}")
             for plot in weather_plots.values():
                 plot.figure.data = []
@@ -2171,6 +2199,7 @@ def main():
     def makeInfluxClient():
         oldClient = influx_client.get()
         if oldClient is not None:
+            cancelPlots()
             spawn(oldClient.close())
             influx_client.clear()
             query_api.clear()
@@ -2222,6 +2251,7 @@ def main():
         updateCallbacks.pop(ui.context.client.id, None)
         oldClient = influx_client.get()
         if oldClient is not None:
+            cancelPlots()
             spawn(oldClient.close())
             influx_client.clear()
             query_api.clear()
