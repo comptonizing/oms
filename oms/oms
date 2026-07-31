@@ -140,6 +140,12 @@ def captureLoop(stopEvent, generation):
     A worker whose join timed out normally leaves through the stop event, which stays set.
     The generation check covers the window that event cannot -- the grab already in flight
     when the replacement was built, which against an unresponsive camera is seconds long.
+
+    The body is guarded as a whole, like the weather and environment workers. Only the grab
+    used to be, which left everything around it able to kill the thread outright: nothing
+    restarts a capture worker until the next settings save, so the UI would sit on "Waiting
+    for the stream ..." indefinitely and the traceback would go to threading.excepthook on
+    stderr rather than through the logger. One bad pass costs a pass.
     """
     global last_stream_image
     while not stopEvent.is_set():
@@ -147,33 +153,43 @@ def captureLoop(stopEvent, generation):
             logger.warning("Capture worker {} superseded by {}, exiting".format(
                 generation, captureGeneration))
             break
-        reason = cctvUnavailableReason()
-        if reason is not None:
-            # Nothing to connect to: an unconfigured stream has no address and an
-            # unpowered camera would only swallow the full open timeout before failing.
-            # Publish no frame at all -- the UI shows the reason instead, and a frame
-            # from before the camera was switched off would be a lie.
-            logger.debug("Not grabbing a CCTV frame: {}".format(reason))
-            frame = None
-        else:
-            try:
-                # Encoded here, on this thread, rather than left as a PIL image for
-                # updateStream() to hand to ui.image -- that put a PNG encode and a
-                # temp-file write on the event loop for every client watching. Inside the
-                # same try as the grab, so an image that will not encode shows up as an
-                # error frame like any other failure instead of killing this pass.
-                frame = encodeImage(grabRTSP(s.q("stream_rtsp")), "JPEG", quality=80)
-            except Exception as e:
-                frame = createErrorImage("{}".format(e))
-        if generation != captureGeneration:
-            # Superseded while this frame was being grabbed, which takes seconds against a
-            # camera that is not answering. Publishing it now would put a frame from a
-            # retired worker on top of whatever its replacement has already shown.
-            logger.info("Capture worker superseded mid-grab, discarding the frame")
-            break
-        with last_stream_image_lock:
-            last_stream_image = frame
-        stopEvent.wait(s.q("stream_refresh", fallback=5))
+        try:
+            reason = cctvUnavailableReason()
+            if reason is not None:
+                # Nothing to connect to: an unconfigured stream has no address and an
+                # unpowered camera would only swallow the full open timeout before failing.
+                # Publish no frame at all -- the UI shows the reason instead, and a frame
+                # from before the camera was switched off would be a lie.
+                logger.debug("Not grabbing a CCTV frame: {}".format(reason))
+                frame = None
+            else:
+                try:
+                    # Encoded here, on this thread, rather than left as a PIL image for
+                    # updateStream() to hand to ui.image -- that put a PNG encode and a
+                    # temp-file write on the event loop for every client watching. Inside
+                    # the same try as the grab, so an image that will not encode shows up as
+                    # an error frame like any other failure instead of killing this pass.
+                    frame = encodeImage(grabRTSP(s.q("stream_rtsp")), "JPEG", quality=80)
+                except Exception as e:
+                    frame = createErrorImage("{}".format(e))
+            if generation != captureGeneration:
+                # Superseded while this frame was being grabbed, which takes seconds against
+                # a camera that is not answering. Publishing it now would put a frame from a
+                # retired worker on top of whatever its replacement has already shown.
+                logger.info("Capture worker superseded mid-grab, discarding the frame")
+                break
+            with last_stream_image_lock:
+                last_stream_image = frame
+        except Exception as e:
+            # last_stream_image is deliberately left alone: whatever it holds is a real
+            # frame from a pass that worked, and it ages out through the UI's own staleness
+            # rules. Replacing it with an error image here would claim the camera failed
+            # when the fault is on this side.
+            logger.error("Error in capture loop: {}".format(e))
+        finally:
+            # This worker's own event. Already set for a worker on its way out, so neither
+            # break above waits out a refresh period first.
+            stopEvent.wait(s.q("stream_refresh", fallback=5))
 
 def stopCaptureLoop():
     global captureThread, captureGeneration
@@ -661,9 +677,14 @@ switch_names = ["pier", "cctv", "pc", "allsky"]
 switches = {}
 
 def getSwitchState(name: str):
-    if name not in switches:
+    # One lookup, not a membership test followed by a subscript. The worker threads call
+    # this while initSwitches() is rebuilding `switches` on the event loop, and that rebuild
+    # deletes entries (`del switches[other]` when a pin changes hands); a save landing
+    # between the two statements used to raise KeyError on the calling thread.
+    entry = switches.get(name)
+    if entry is None:
         return switch.State.UNKN
-    return switches[name]["switch"].state
+    return entry["switch"].state
 
 def deviceUnavailableReason(name: str, label: str):
     """Why the device powered by the switch `name` cannot be used, or None if it can.
@@ -672,9 +693,12 @@ def deviceUnavailableReason(name: str, label: str):
     it nor find out whether anything else did, so talking to it can only end in a
     timeout.
     """
-    if name not in switches:
+    # Also one lookup rather than two, so that a switch disappearing mid-call cannot make
+    # this report a state it read from an entry the membership test no longer covers.
+    entry = switches.get(name)
+    if entry is None:
         return "{} is not configured".format(label)
-    state = getSwitchState(name)
+    state = entry["switch"].state
     if state is switch.State.ON:
         return None
     if state is switch.State.OFF:
