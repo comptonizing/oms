@@ -2164,8 +2164,8 @@ def main():
     plotRun = Container()
     plotLock = asyncio.Lock()
 
-    async def updatePlots():
-        """Redraws the plots. Latest wins.
+    async def updatePlots(*, supersede=True):
+        """Redraws the plots. Latest wins, unless the caller asks not to.
 
         Both the refresh timer and the time-range selector land here, and a pass takes
         long enough that they overlap: a range change during a timer run left two
@@ -2188,10 +2188,22 @@ def main():
         goes on to supersede whatever it finds, which is still latest-wins and not a
         queue. Cancelling a pass that has already been cancelled is harmless, so the
         worst the wait costs is one replacement that is thrown away unstarted.
+
+        supersede=False is the refresh timer's mode, and the difference is deliberate.
+        A range-selector click or a save is a user gesture: it asks for something other
+        than what is being drawn, so cancelling the pass in flight is the only answer
+        that is not either late or wrong. A timer tick asks for exactly what the pass in
+        flight is already computing, so cancelling it would mean a pass that takes longer
+        than one refresh interval never finishes -- the plots would be permanently
+        half-drawn on any database slow enough to matter. It drops itself instead, and
+        the pass it found finishes and paints.
         """
         async with plotLock:
             running = plotRun.get()
             if running is not None and not running.done():
+                if not supersede:
+                    logger.debug("Plot refresh skipped: the previous pass is still running")
+                    return
                 running.cancel()
                 try:
                     await running
@@ -2206,6 +2218,31 @@ def main():
         except asyncio.CancelledError:
             # Superseded by a newer pass, which owns the figures now.
             pass
+
+    def refreshPlots():
+        """The refresh timer's entry point: start a pass, do not wait it out.
+
+        ui.timer sleeps `interval - dt`, where dt is how long its callback took
+        (nicegui/timer.py:97). updatePlots awaits the pass to completion, so pointing the
+        timer straight at it made dt the length of the whole pass -- and a pass longer
+        than the interval made that sleep negative, which returns at once. The result was
+        plot passes running back to back forever instead of one per interval: fifteen
+        queries, twenty add_scatter calls and five figure pushes, continuously, on the
+        event loop that also serves the rest of the GUI.
+
+        It does not take a sick database to get there. A pass over a 24h range is a few
+        seconds of work on the Pi, so a "Plot refresh (s)" of 5 is enough -- and that
+        field takes any number the operator types (see the interval validation still
+        outstanding). Spawning and returning keeps dt at zero, so the ticks are spaced by
+        the interval that was actually configured, whatever the database is doing.
+
+        Returning without the result also means the tick cannot report a failure, which
+        costs nothing here: _drawPlots answers a database error by painting it onto the
+        figures rather than raising. Anything that does escape it lands in asyncio's
+        handler, the same way it already does for the two spawn(updatePlots()) callers
+        below.
+        """
+        spawn(updatePlots(supersede=False))
 
     def cancelPlots():
         """Stop an in-flight pass because the client it is querying is about to close.
@@ -2467,7 +2504,9 @@ def main():
         intervals = {
                 "update_allsky_images": ("weather_refresh", updateAllskyImages, None),
                 "update_weather": ("weather_refresh", updateWeather, None),
-                "update_plots": ("weather_plot_refresh", updatePlots, 60),
+                # refreshPlots, not updatePlots: the timer must not await the pass it
+                # starts, or a slow pass compresses its own interval away.
+                "update_plots": ("weather_plot_refresh", refreshPlots, 60),
                 "update_stream": ("stream_refresh", updateStream, None),
                 }
         for name, (setting, callback, fallback) in intervals.items():
