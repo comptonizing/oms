@@ -118,10 +118,35 @@ def createErrorImage(text: str):
 last_stream_image = None
 last_stream_image_lock = threading.Lock()
 captureThread = None
+# The current capture worker's stop event, and only that. startCaptureLoop() gives each new
+# worker a fresh one rather than clearing this, so signalling one worker can never be undone
+# on behalf of another -- exactly the reasoning behind roofStopEvent.
 captureStopEvent = threading.Event()
-def captureLoop():
-    global last_stream_image, last_stream_image_lock, captureStopEvent
-    while not captureStopEvent.is_set():
+# Bumped by stopCaptureLoop() whenever a worker is retired. A worker carries the value it was
+# started with and leaves as soon as it no longer matches. A worker whose join expired would
+# otherwise go on publishing last_stream_image alongside its replacement, and the two do not
+# agree: a frame grabbed before the camera was reconfigured, or the error image from whatever
+# made the old worker hang, would land on top of a good current frame at random. Read without
+# a lock -- an int read is atomic under the GIL, and the check only has to be eventually
+# right.
+captureGeneration = 0
+def captureLoop(stopEvent, generation):
+    """The capture worker. Its stop event and its identity are arguments, not globals.
+
+    stopEvent is this worker's own, so a worker that stopCaptureLoop() signalled stays
+    signalled no matter what the next one does. generation is what makes a worker that could
+    not be joined harmless: it stops publishing as soon as it no longer matches.
+
+    A worker whose join timed out normally leaves through the stop event, which stays set.
+    The generation check covers the window that event cannot -- the grab already in flight
+    when the replacement was built, which against an unresponsive camera is seconds long.
+    """
+    global last_stream_image
+    while not stopEvent.is_set():
+        if generation != captureGeneration:
+            logger.warning("Capture worker {} superseded by {}, exiting".format(
+                generation, captureGeneration))
+            break
         reason = cctvUnavailableReason()
         if reason is not None:
             # Nothing to connect to: an unconfigured stream has no address and an
@@ -140,29 +165,59 @@ def captureLoop():
                 frame = encodeImage(grabRTSP(s.q("stream_rtsp")), "JPEG", quality=80)
             except Exception as e:
                 frame = createErrorImage("{}".format(e))
+        if generation != captureGeneration:
+            # Superseded while this frame was being grabbed, which takes seconds against a
+            # camera that is not answering. Publishing it now would put a frame from a
+            # retired worker on top of whatever its replacement has already shown.
+            logger.info("Capture worker superseded mid-grab, discarding the frame")
+            break
         with last_stream_image_lock:
             last_stream_image = frame
-        captureStopEvent.wait(s.q("stream_refresh", fallback=5))
+        stopEvent.wait(s.q("stream_refresh", fallback=5))
 
 def stopCaptureLoop():
-    global captureThread, captureStopEvent
+    global captureThread, captureGeneration
+    # Before the join, not after: from here on any worker still running is superseded,
+    # whether it manages to stop or not, and must not publish another frame.
+    captureGeneration += 1
     if captureThread is not None and captureThread.is_alive():
         logger.info("Stopping capture loop")
+        # This worker's own event, and it stays set: startCaptureLoop() gives the next worker
+        # a fresh one instead of clearing this, so a worker that cannot be joined below can
+        # never be woken again by the next start.
         captureStopEvent.set()
         captureThread.join(timeout=5)
         if captureThread.is_alive():
-            logger.warning("Capture loop still alive")
+            # Not fatal, unlike the roof's equivalent: this worker holds no lock anything
+            # else needs, and grabRTSP releases its capture in a finally, so it leaves of its
+            # own accord once the grab it is stuck in returns. Superseded, it publishes
+            # nothing more in the meantime. Worth saying out loud all the same -- it means
+            # the camera or the RTSP stack is not answering within the join.
+            logger.warning(
+                    "Capture worker did not stop within 5s and was abandoned. It is "
+                    "superseded and will publish no further frames; it exits by itself once "
+                    "the grab it is stuck in returns")
         else:
-            captureThread = None
             logger.info("Capture loop stopped")
+    # Cleared either way: a thread that outlived its join is not something anything should go
+    # on to join or signal again.
+    captureThread = None
 
 def startCaptureLoop():
     global captureThread, captureStopEvent
     stopCaptureLoop()
-    captureStopEvent.clear()
     logger.info("Starting capture loop")
+    # A fresh event per worker, handed over as an argument, rather than clearing a shared
+    # one. A previous worker that stopCaptureLoop() signalled but could not join is still
+    # waiting on *its* event; clearing that same object here used to un-signal it, so the
+    # orphan resumed grabbing and two workers then wrote last_stream_image.
+    workerStopEvent = threading.Event()
+    captureStopEvent = workerStopEvent
+    # stopCaptureLoop() bumped the generation above, so this worker takes the current value
+    # and every older one is already superseded.
     captureThread = threading.Thread(
         target=captureLoop,
+        args=(workerStopEvent, captureGeneration),
         daemon=True,
         name="OMS rstp worker"
     )
@@ -703,7 +758,12 @@ def setSwitchState(name: str, state: switch.State):
         triggerEvent("setSwitchState", name, stateString)
 
 weatherThread = None
+# The current weather worker's stop event, and its identity. Both work exactly as
+# captureStopEvent/captureGeneration do, and for the same reason: a worker whose join expired
+# used to be revived by the next start clearing the shared event, and then two workers wrote
+# weatherCache, its timestamp, and drove updateFans() between them.
 weatherStopEvent = threading.Event()
+weatherGeneration = 0
 weatherCacheLock = threading.Lock()
 weatherCache = None
 # time.monotonic(); 0.0 means nothing is cached. See environmentLastData["timestamp"].
@@ -732,58 +792,97 @@ def weatherWarmingUp():
         return True             # the worker has not looked since the station came back
     return (time.monotonic() - since) <= s.q("weather_refresh", fallback=5) * 3
 
-def weatherWorkerLoop():
-    global weatherStopEvent, weatherCache, weatherCacheTimestamp, weatherAvailableSince
-    while not weatherStopEvent.is_set():
+def weatherWorkerLoop(stopEvent, generation):
+    """The weather worker. Same worker-identity contract as captureLoop.
+
+    The pass is split into "find out" and "act on it", with the generation checked in
+    between, because finding out is the slow half: a scrape can take the whole HTTP timeout,
+    which is ample time for this worker to be retired. Acting on a stale identity is the part
+    that matters -- the reading itself would be fine, but the timestamp that goes with it is
+    what updateFans() and the labels judge freshness by, and a retired worker refreshing it
+    makes stale data look current. The fan decision is worse still: it would drive the roof
+    on behalf of a worker that no longer exists.
+    """
+    global weatherCache, weatherCacheTimestamp, weatherAvailableSince
+    while not stopEvent.is_set():
+        if generation != weatherGeneration:
+            logger.warning("Weather worker {} superseded by {}, exiting".format(
+                generation, weatherGeneration))
+            break
         try:
             reason = weatherUnavailableReason()
+            data = None
             if reason is None:
                 with weatherCacheLock:
                     if weatherAvailableSince == 0.0:
                         weatherAvailableSince = time.monotonic()
                 try:
                     data = getWeather()
-                    with weatherCacheLock:
-                        weatherCache = data
-                        weatherCacheTimestamp = time.monotonic()
                 except Exception as e:
+                    # Left as None: the cache keeps whatever it had and ages out on its own,
+                    # which is how every reader already judges it.
                     logger.warning(f"Error fetching weather data: {e}")
             else:
                 # Asking anyway would spend the full HTTP timeout finding out what we
-                # already know. Drop the cache so every reader -- the UI and the fan
-                # decision below -- sees the data as gone rather than merely stale.
+                # already know.
                 logger.debug(f"Not fetching weather data: {reason}")
+
+            if generation != weatherGeneration:
+                logger.info("Weather worker superseded mid-pass, discarding the result")
+                break
+
+            if reason is not None:
+                # Drop the cache so every reader -- the UI and the fan decision below --
+                # sees the data as gone rather than merely stale.
                 with weatherCacheLock:
                     weatherCache = None
                     weatherCacheTimestamp = 0.0
                     weatherAvailableSince = 0.0
+            elif data is not None:
+                with weatherCacheLock:
+                    weatherCache = data
+                    weatherCacheTimestamp = time.monotonic()
             # Fan decisions are driven from here (rather than from roofLoop) so that the
             # network call above never delays the roof status poll loop.
             updateFans()
         except Exception as e:
             logger.error(f"Error in weather loop: {e}")
         finally:
-            weatherStopEvent.wait(s.q("weather_refresh", fallback=5))
+            # This worker's own event. Already set for a worker that is on its way out, so
+            # the break above is not delayed by a refresh period.
+            stopEvent.wait(s.q("weather_refresh", fallback=5))
 
 def stopWeatherWorker():
-    global weatherThread, weatherStopEvent
+    global weatherThread, weatherGeneration
+    # Before the join, for the reason stopCaptureLoop states.
+    weatherGeneration += 1
     if weatherThread is not None and weatherThread.is_alive():
         logger.info("Stopping weather thread")
         weatherStopEvent.set()
         weatherThread.join(timeout=5)
         if weatherThread.is_alive():
-            logger.warning("Weather thread still alive")
+            logger.warning(
+                    "Weather worker did not stop within 5s and was abandoned. It is "
+                    "superseded and will publish nothing more; it exits by itself once the "
+                    "scrape it is stuck in times out")
         else:
-            weatherThread = None
             logger.info("Weather thread stopped")
+    # Cleared either way, as in stopCaptureLoop. Note what this costs: weatherWarmingUp()
+    # reads weatherThread, so between here and the next start it reports no worker running
+    # and the labels read as an error rather than as warming up. That is the honest answer
+    # for the moment when nothing is fetching, and the window is a few statements long.
+    weatherThread = None
 
 def startWeatherWorker():
     global weatherThread, weatherStopEvent
     stopWeatherWorker()
-    weatherStopEvent.clear()
     logger.info("Starting weather loop")
+    # A fresh event per worker rather than clearing a shared one -- see startCaptureLoop.
+    workerStopEvent = threading.Event()
+    weatherStopEvent = workerStopEvent
     weatherThread = threading.Thread(
             target = weatherWorkerLoop,
+            args = (workerStopEvent, weatherGeneration),
             daemon = True,
             name = "Weather worker"
             )
