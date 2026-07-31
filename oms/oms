@@ -266,6 +266,12 @@ environmentThread = None
 # the shared stop event, which would otherwise revive a zombie sitting in wait() and let it
 # re-open the port a stop had just closed -- the generation is what stops it instead.
 environmentGeneration = 0
+# How long the board may say nothing at all before the worker gives up on the open port and
+# opens it again. The board talks constantly -- it emits LOG: lines between measurements --
+# so silence this long is a dead link, not a slow one. Sixty seconds is the same threshold
+# updateFans judges the readings by, so a reopen never throws away anything still in use,
+# and it is long enough that a board which is merely slow to answer is left alone.
+environmentSilenceTimeout = 60
 environmentLock = threading.Lock()
 environmentStopEvent = threading.Event()
 environmentParameterMap = { "T": "inside_temperature", "H": "inside_humidity" }
@@ -395,6 +401,10 @@ def setupEnvironmentWorker(quiet=False):
 
 def environmentWorkerLoop(generation):
     global environmentStopEvent, environmentInfluxClient, environmentSerial, environmentLock, environmentLastData, environmentWriteApi
+    # When the board fell silent, or None while it is talking. Only ever set from this
+    # thread, and deliberately a local: it describes this worker's port, and a superseded
+    # worker must not leave its silence behind for the next one to act on.
+    quietSince = None
     while not environmentStopEvent.is_set():
         if generation != environmentGeneration:
             logger.warning("Environment worker {} superseded by {}, exiting".format(
@@ -418,6 +428,10 @@ def environmentWorkerLoop(generation):
                 # Quietly: this runs every few seconds for as long as the board is
                 # missing, and the operator was already told once why.
                 setupEnvironmentWorker(quiet=True)
+                # A fresh port starts with a clean slate, whatever closed the old one.
+                # Without this the silence measured against the previous port would carry
+                # over and the first timeout on the new one would reopen it again.
+                quietSince = None
             if environmentSerial is None:
                 environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
                 continue
@@ -436,8 +450,37 @@ def environmentWorkerLoop(generation):
                 environmentSerial = None
                 continue
             if len(line) == 0:
-                logger.warning("Got empty data from environment board")
+                # A timeout, not a disconnect: pyserial raises SerialException when the
+                # port reports readable and then yields nothing, so an empty line here
+                # means the board said nothing for weather_environment_timeout seconds.
+                #
+                # Nothing else in this loop ever reopens a port that stays open, and that
+                # is how one quiet spell used to become a permanent one -- this warning
+                # once per timeout for hours, no readings stored, and updateFans switching
+                # the fans off on data over a minute old. The restart that fixed it fixed
+                # it by reopening the port, which is all this does, only sooner. Note that
+                # the reopen also drops DTR, so a board that has hung is reset by it: a
+                # restart curing the symptom never did prove the Pi side was at fault.
+                if quietSince is None:
+                    quietSince = time.monotonic()
+                    logger.warning("Got empty data from environment board")
+                elif time.monotonic() - quietSince > environmentSilenceTimeout:
+                    logger.warning(
+                            "No data from the environment board for over {}s, "
+                            "reopening the serial port".format(environmentSilenceTimeout))
+                    try:
+                        environmentSerial.close()
+                    except (SerialException, OSError) as e:
+                        logger.warning("Error closing the environment serial port: {}".format(e))
+                    environmentSerial = None
+                else:
+                    # Once is worth a warning, the rest of a quiet spell is not: at one
+                    # line per timeout this used to be the only thing in the log.
+                    logger.debug("Got empty data from environment board")
                 continue
+            # Any line at all means the link is alive, LOG: lines included -- they are what
+            # the board sends between measurements.
+            quietSince = None
             if line.startswith("LOG:"):
                 continue
             thing = next((t for t in environmentParameterMap if line.startswith(t)), None)
