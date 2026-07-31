@@ -151,6 +151,23 @@ def getWeather():
     except Exception as e:
         raise Exception("Error parsing json: {}".format(e))
 
+def asNumber(value):
+    """`value` as a float, or None if the station did not send a usable number.
+
+    Fields go missing from the payload now and then, or arrive as null: a sensor the
+    station could not read this cycle. Readers compare these against thresholds, where a
+    None raises TypeError -- and a raise costs them every *other* field in the same pass,
+    which is how one absent reading used to freeze the whole weather card. NaN is folded
+    in here too, so callers have exactly one absent value to test for.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(number) else number
+
 environmentInfluxClient = None
 environmentWriteApi = None
 environmentSerial = None
@@ -839,13 +856,12 @@ def updateFans():
     if weather is None or weatherAge > weatherMaxAge:
         logger.debug("No recent weather data available, skipping fan update")
         return
-    try:
-        T_outside = weather["env_temperature"]
-        H_outside = weather["env_humidity"]
-        if math.isnan(T_outside) or math.isnan(H_outside):
-            raise RuntimeError("Temperature or humidity is nan")
-    except Exception as e:
-        logger.warning(f"Error getting weather data, skipping fan update: {e}")
+    T_outside = asNumber(weather.get("env_temperature"))
+    H_outside = asNumber(weather.get("env_humidity"))
+    if T_outside is None or H_outside is None:
+        # A sensor the station could not read this cycle. Not an OMS fault, and the next
+        # poll usually has it back, so the fans simply keep their current state.
+        logger.debug("Weather has no usable temperature or humidity, skipping fan update")
         return
     logger.debug(f"Weather data available: {weather}")
     tmin = s.q("roof_fan_temp_min", fallback=5)
@@ -2077,91 +2093,117 @@ def main():
                 thing.set_text("Error")
                 thing.classes(labelSize + " text-red-500", remove=weather_label_colors)
             return
+        # Coerced up front, and every block below tests for None: a field the station
+        # left out or sent as null shows as absent on its own label. Comparing it against
+        # a threshold raises, and one raise used to cost every field after it its update
+        # -- the labels then held old readings while looking current.
+        numbers = {name: asNumber(d.get(name)) for name in weather_labels}
+        absent = sorted(name for name, value in numbers.items() if value is None)
+        if absent:
+            logger.debug("Weather fields not usable: {}".format(", ".join(absent)))
+        for name in absent:
+            setLabel(name, "N/A", "text-gray-500")
+
         try:
-            temperature = d["env_temperature"]
-            colstr = ""
-            if temperature < -20:
-                colstr = "text-red-500"
-            elif temperature < -10:
-                colstr = "text-orange-500"
-            elif temperature < 25:
-                colstr = "text-green-500"
-            elif temperature < 35:
-                colstr = "text-orange-500"
-            else:
-                colstr = "text-red-500"
-            setLabel("env_temperature", "{:.1f} °C".format(temperature), colstr)
+            temperature = numbers["env_temperature"]
+            if temperature is not None:
+                colstr = ""
+                if temperature < -20:
+                    colstr = "text-red-500"
+                elif temperature < -10:
+                    colstr = "text-orange-500"
+                elif temperature < 25:
+                    colstr = "text-green-500"
+                elif temperature < 35:
+                    colstr = "text-orange-500"
+                else:
+                    colstr = "text-red-500"
+                setLabel("env_temperature", "{:.1f} °C".format(temperature), colstr)
 
-            humidity = d["env_humidity"]
-            if humidity < 10:
-                colstr = "text-red-500"
-            elif humidity < 20:
-                colstr = "text-orange-500"
-            elif humidity < 80:
-                colstr = "text-green-500"
-            elif humidity < 90:
-                colstr = "text-orange-500"
-            else:
-                colstr = "text-red-500"
-            setLabel("env_humidity", "{:.1f} %".format(humidity), colstr)
+            humidity = numbers["env_humidity"]
+            if humidity is not None:
+                if humidity < 10:
+                    colstr = "text-red-500"
+                elif humidity < 20:
+                    colstr = "text-orange-500"
+                elif humidity < 80:
+                    colstr = "text-green-500"
+                elif humidity < 90:
+                    colstr = "text-orange-500"
+                else:
+                    colstr = "text-red-500"
+                setLabel("env_humidity", "{:.1f} %".format(humidity), colstr)
 
-            dewpoint = d["env_dewpoint"]
-            setLabel("env_dewpoint", "{:.1f} °C".format(dewpoint))
+            dewpoint = numbers["env_dewpoint"]
+            if dewpoint is not None:
+                setLabel("env_dewpoint", "{:.1f} °C".format(dewpoint))
 
-            rain = d["rain_percentage"]
-            if rain < 5:
-                colstr = "text-green-500"
-            elif rain < 10:
-                colstr = "text-orange-500"
-            else:
-                colstr = "text-red-500"
-            setLabel("rain_percentage", "{:.0f} %".format(rain), colstr)
+            rain = numbers["rain_percentage"]
+            if rain is not None:
+                if rain < 5:
+                    colstr = "text-green-500"
+                elif rain < 10:
+                    colstr = "text-orange-500"
+                else:
+                    colstr = "text-red-500"
+                setLabel("rain_percentage", "{:.0f} %".format(rain), colstr)
 
             # No elevation entered means no sea-level correction, which is what an
             # elevation of zero computes anyway -- not a default, an identity.
             elevation = s.q("weather_elevation", fallback=0) or 0
-            pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
-            setLabel("env_pressure", "{:.0f} hPa".format(pressure))
+            pressure = numbers["env_pressure"]
+            if pressure is not None and elevation and temperature is None:
+                # The correction needs the temperature. Without it the raw reading would
+                # be wrong by more than it is worth showing, so leave the N/A standing.
+                logger.debug("No temperature, so no sea-level correction for the pressure")
+            elif pressure is not None:
+                if elevation:
+                    pressure += (pressure * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400)))
+                setLabel("env_pressure", "{:.0f} hPa".format(pressure))
 
-            sqm = d["sqm_mpsas"]
-            if sqm < 18:
-                colstr = "text-red-500"
-            elif sqm < 20:
-                colstr = "text-orange-500"
-            else:
-                colstr = "text-green-500"
+            sqm = numbers["sqm_mpsas"]
+            if sqm is not None:
+                if sqm < 18:
+                    colstr = "text-red-500"
+                elif sqm < 20:
+                    colstr = "text-orange-500"
+                else:
+                    colstr = "text-green-500"
+                setLabel("sqm_mpsas", "{:.1f}".format(sqm), colstr)
 
-            setLabel("sqm_mpsas", "{:.1f}".format(sqm), colstr)
+            ir_sky = numbers["ir_sky"]
+            if ir_sky is not None:
+                setLabel("ir_sky", "{:.1f} °C".format(ir_sky))
 
-            ir_sky = d["ir_sky"]
-            setLabel("ir_sky", "{:.1f} °C".format(ir_sky))
+            ir_diff = numbers["ir_diff"]
+            if ir_diff is not None:
+                if ir_diff < 15:
+                    colstr = "text-red-500"
+                elif ir_diff < 20:
+                    colstr = "text-orange-500"
+                else:
+                    colstr = "text-green-500"
+                setLabel("ir_diff", "{:.1f} °C".format(ir_diff), colstr)
 
-            ir_diff = d["ir_diff"]
-            if ir_diff < 15:
-                colstr = "text-red-500"
-            elif ir_diff < 20:
-                colstr = "text-orange-500"
-            else:
-                colstr = "text-green-500"
-            setLabel("ir_diff", "{:.1f} °C".format(ir_diff), colstr)
+            wind_speed = numbers["wind_speed"]
+            if wind_speed is not None:
+                if wind_speed < 15:
+                    colstr = "text-green-500"
+                elif wind_speed < 20:
+                    colstr = "text-orange-500"
+                else:
+                    colstr = "text-red-500"
+                setLabel("wind_speed", "{:.1f} km/h".format(wind_speed), colstr)
 
-            wind_speed = d["wind_speed"]
-            if wind_speed < 15:
-                colstr = "text-green-500"
-            elif wind_speed < 20:
-                colstr = "text-orange-500"
-            else:
-                colstr = "text-red-500"
-            setLabel("wind_speed", "{:.1f} km/h".format(wind_speed), colstr)
-
-            wind_gust = d["wind_gust"]
-            if wind_gust < 30:
-                colstr = "text-green-500"
-            elif wind_gust < 40:
-                colstr = "text-orange-500"
-            else:
-                colstr = "text-red-500"
-            setLabel("wind_gust", "{:.1f} km/h".format(wind_gust), colstr)
+            wind_gust = numbers["wind_gust"]
+            if wind_gust is not None:
+                if wind_gust < 30:
+                    colstr = "text-green-500"
+                elif wind_gust < 40:
+                    colstr = "text-orange-500"
+                else:
+                    colstr = "text-red-500"
+                setLabel("wind_gust", "{:.1f} km/h".format(wind_gust), colstr)
         except Exception as e:
             logger.error("Error updating weather labels: {}".format(e))
 
