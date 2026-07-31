@@ -1363,11 +1363,28 @@ def main():
         header_label.set_text(e.value)
         drawer.hide()
 
+    # How long to let the loop breathe after pushing a figure to the browser. Five pushes
+    # per pass, so this is the entire cost of being polite now that the per-query sleeps
+    # are gone: 0.25s against the 4.5s they used to add.
+    plotPushPause = 0.05
+
     def updatePlot(plot):
         plot.update()
         with plot._props.suspend_updates():
             plot._props['options']['config'] = {'displayModeBar': False, 'staticPlot': True}
         plot.client.outbox.enqueue_update(plot)
+
+    async def pushPlot(plot):
+        """Pushes a finished figure to the browser, then lets the loop breathe.
+
+        This is where the work actually is: serializing a figure and enqueuing it for the
+        websocket, once per plot. The pause sits here, after a push, rather than being
+        spread over every query -- awaiting a query already yields the loop by itself, so
+        the sleeps that used to follow each one were buying responsiveness that the await
+        had already bought, at 0.3s a time.
+        """
+        updatePlot(plot)
+        await asyncio.sleep(plotPushPause)
 
     def makePlot(title: str):
         plot = ui.plotly(go.Figure()).classes("w-full")
@@ -1618,6 +1635,7 @@ def main():
                 ui.label("Weather")
                 with ui.card_section().classes("w-full"):
                     settings["weather_refresh"] = ui.number("Refresh (s)", value=s.q("weather_refresh", fallback=None))
+                    settings["weather_plot_refresh"] = ui.number("Plot refresh (s)", value=s.q("weather_plot_refresh", fallback=None))
                     settings["weather_elevation"] = ui.number("Elevation (m)", value=s.q("weather_elevation", fallback=None))
                     settings["weather_image"] = ui.input("URL for latest allsky image", value=s.q("weather_image", fallback=None))
                     settings["weather_url"] = ui.input("URL for weather data scraping", value=s.q("weather_url", fallback=None))
@@ -1741,7 +1759,11 @@ def main():
     async def _updatePlots():
         r = weather_range_select.value
         w = weather_ranges[r]
-        sleepTime = 0.3
+        # Zero, not 0.3. These sit after queries, and awaiting a query already hands the
+        # loop to everything else; fifteen of them cost 4.5s of a pass that is otherwise
+        # dominated by five figure pushes. Kept as explicit yield points rather than
+        # deleted, because that is what they are for -- see pushPlot for the real pause.
+        sleepTime = 0
 
         api = query_api.get()
         if api is None:
@@ -1766,7 +1788,7 @@ def main():
         logger.debug("Plotting Temperature Inside")
         fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "blue"})
         logger.debug("Done")
-        updatePlot(plot)
+        await pushPlot(plot)
 
         plot = weather_plots["Sky"]
         fig = plot.figure
@@ -1782,7 +1804,7 @@ def main():
         logger.debug("Plotting Sky Difference")
         fig.add_scatter(x=t, y=v, mode="lines", name="Difference", line={"color": "orange"})
         logger.debug("Done")
-        updatePlot(plot)
+        await pushPlot(plot)
 
         plot = weather_plots["Wind"]
         fig = plot.figure
@@ -1798,7 +1820,7 @@ def main():
         logger.debug("Plotting Wind Gust")
         fig.add_scatter(x=t, y=v, mode="lines", name="Gust", line={"color": "orange"})
         logger.debug("Done")
-        updatePlot(plot)
+        await pushPlot(plot)
 
         plot = weather_plots["Humidity"]
         fig = plot.figure
@@ -1815,7 +1837,7 @@ def main():
         fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "orange"})
         logger.debug("Done")
         fig.update_layout(yaxis={"range": [0,100]})
-        updatePlot(plot)
+        await pushPlot(plot)
 
         plot = weather_plots["SQM"]
         fig = plot.figure
@@ -1826,7 +1848,7 @@ def main():
         logger.debug("Plotting SQM SQM")
         fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
         logger.debug("Done")
-        updatePlot(plot)
+        await pushPlot(plot)
 
         plot = weather_plots["Rain"]
         fig = plot.figure
@@ -1851,7 +1873,7 @@ def main():
                     "gridcolor": '#555'
                     }
                 )
-        updatePlot(plot)
+        await pushPlot(plot)
 
         plot = weather_plots["Pressure"]
         fig = plot.figure
@@ -1862,7 +1884,7 @@ def main():
         logger.debug("Plotting Pressure Pressue")
         fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
         logger.debug("Done")
-        updatePlot(plot)
+        await pushPlot(plot)
 
         plot = weather_plots["Rain Heating"]
         fig = plot.figure
@@ -1886,9 +1908,42 @@ def main():
                     "gridcolor": '#555'
                     }
                 )
-        updatePlot(plot)
+        await pushPlot(plot)
+
+    # The plot pass currently in flight for this client, if any.
+    plotRun = Container()
 
     async def updatePlots():
+        """Redraws the plots. Latest wins.
+
+        Both the refresh timer and the time-range selector land here, and a pass takes
+        long enough that they overlap: a range change during a timer run left two
+        coroutines mutating the same figures, one doing fig.data = [] part-way through the
+        other's add_scatter.
+
+        The pass in flight is cancelled rather than queued behind, or dropped. Every
+        figure is rebuilt from scratch, so a half-finished pass has nothing worth keeping,
+        and cancelling is what makes the range selector feel immediate -- dropping the new
+        request would ignore the click, and queueing it would answer it seconds late.
+        """
+        running = plotRun.get()
+        if running is not None and not running.done():
+            running.cancel()
+            try:
+                await running
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug("Superseded plot pass ended with {}".format(e))
+        task = spawn(_drawPlots())
+        plotRun.set(task)
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Superseded by a newer pass, which owns the figures now.
+            pass
+
+    async def _drawPlots():
         try:
             for plot in weather_plots.values():
                 plot.figure.layout.annotations = []
@@ -2064,14 +2119,18 @@ def main():
         for thing in timers:
             timers[thing].cancel()
         timers.clear()
+        # (setting, callback, fallback). Only the plots carry a fallback, and it is a
+        # local one at the single place that reads it, not a defaults table coming back:
+        # a plot pass costs fifteen queries, so leaving it unset must not mean "as often
+        # as the labels refresh". Sixty seconds is the operator's choice of a floor.
         intervals = {
-                "update_allsky_images": ("weather_refresh", updateAllskyImages),
-                "update_weather": ("weather_refresh", updateWeather),
-                "update_plots": ("weather_refresh", updatePlots),
-                "update_stream": ("stream_refresh", updateStream),
+                "update_allsky_images": ("weather_refresh", updateAllskyImages, None),
+                "update_weather": ("weather_refresh", updateWeather, None),
+                "update_plots": ("weather_plot_refresh", updatePlots, 60),
+                "update_stream": ("stream_refresh", updateStream, None),
                 }
-        for name, (setting, callback) in intervals.items():
-            interval = s.q(setting)
+        for name, (setting, callback, fallback) in intervals.items():
+            interval = s.q(setting, fallback=fallback)
             if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
                 logger.warning("No usable {} set ({!r}), {} will not refresh".format(setting, interval, name))
                 continue
@@ -2119,6 +2178,11 @@ def main():
         # this is the path that had no such event to receive. getRoofState() returns None
         # once the timestamp is zeroed, and updateRoofIcons handles None.
         updateRoofIcons(getRoofState()[0])
+        # Drawn once here rather than left blank until the first timer tick, which is a
+        # whole plot interval away -- a minute of empty plots on a page that has just
+        # loaded looks like a fault. Cheap to do: a pass this early is the only one
+        # running, and a range change moments later simply cancels it.
+        spawn(updatePlots())
         updateCallbacks[ui.context.client.id] = update
     ui.context.client.on_connect(onConnect)
 
