@@ -1986,11 +1986,38 @@ def main():
             running.cancel()
         plotRun.clear()
 
+    async def blankPlots(message):
+        """Replace every figure with one centred line of text.
+
+        The axes are hidden along with the data: an empty grid with a note floating over
+        it reads as a plot that failed to draw, rather than as one with nothing to draw.
+        Pushed through pushPlot() like any other pass, so blanking eight figures does not
+        stall the page any more than filling them does.
+        """
+        for plot in weather_plots.values():
+            plot.figure.data = []
+            plot.figure.update_layout(
+                    annotations=[dict(
+                        text=message,
+                        xref='paper', yref='paper',
+                        x=0.5, y=0.5,
+                        xanchor='center', yanchor='middle',
+                        showarrow=False,
+                        font=dict(size=16, color='gray'),
+                    )],
+                    xaxis=dict(visible=False),
+                    yaxis=dict(visible=False),
+                )
+            await pushPlot(plot)
+
     async def _drawPlots():
         # One API for the whole pass, so the fifteen queries below are answered by one
         # client and cannot straddle two. Which client it was matters in the handler.
         api = query_api.get()
         if api is None:
+            # No database configured at all. Silently blank plots look like a fault that
+            # swallowed its own error, so say what is missing and where to fix it.
+            await blankPlots('No database configured (see Settings)')
             return
         try:
             for plot in weather_plots.values():
@@ -2007,21 +2034,7 @@ def main():
                 logger.debug("Plot pass dropped: its database client was replaced ({})".format(e))
                 return
             logger.error(f"Error updating weather plots: {e}")
-            for plot in weather_plots.values():
-                plot.figure.data = []
-                plot.figure.update_layout(
-                        annotations=[dict(
-                            text='No data available (check logs)',
-                            xref='paper', yref='paper',
-                            x=0.5, y=0.5,
-                            xanchor='center', yanchor='middle',
-                            showarrow=False,
-                            font=dict(size=16, color='gray'),
-                        )],
-                        xaxis=dict(visible=False),
-                        yaxis=dict(visible=False),
-                    )
-                updatePlot(plot)
+            await blankPlots('No data available (check logs)')
 
     # Tailwind's text colours are mutually exclusive, so a new one has to take the old
     # one off the element: which of two present classes wins is decided by stylesheet
@@ -2224,6 +2237,9 @@ def main():
         updateStream()
         updateAllskyImages()
         updateWeather()
+        # A database entered (or cleared) just now changes what the plots should say, and
+        # they would otherwise keep the old message until their next tick a minute away.
+        spawn(updatePlots())
 
 
     def onConnect():
