@@ -2423,6 +2423,15 @@ def main():
         do. ui.timer(None) would raise and take the whole settings-update handler with
         it. processSettingsUpdate() calls this again on every save, so a timer appears as
         soon as its interval is entered.
+
+        The timers are created with immediate=False. ui.timer defaults to firing its
+        callback at once, and both callers below already call all four callbacks
+        themselves -- so every save and every connect ran the whole refresh twice per
+        client, two plot passes included, precisely while the process is re-opening
+        serial ports and restarting three workers. The explicit calls are the half that
+        stays: a timer whose interval is unset is never created, so leaving the first
+        paint to the timers would mean an unconfigured refresh interval paints nothing
+        at all rather than painting once.
         """
         for thing in timers:
             timers[thing].cancel()
@@ -2442,7 +2451,7 @@ def main():
             if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
                 logger.warning("No usable {} set ({!r}), {} will not refresh".format(setting, interval, name))
                 continue
-            timers[name] = ui.timer(interval, callback)
+            timers[name] = ui.timer(interval, callback, immediate=False)
 
     def makeInfluxClient():
         oldClient = influx_client.get()
@@ -2483,6 +2492,11 @@ def main():
         updateButtons()
         updateStream()
         updateAllskyImages()
+        # The one callback this handler did not use to call for itself: the immediate
+        # first tick of the weather timer was doing it, and that tick is gone. The page
+        # body paints the labels once as it is built, but a client can connect a moment
+        # later than that, and the alternative is labels a whole refresh interval stale.
+        updateWeather()
         # getRoofState(), not the raw lastRoofState: stopRoof() zeroes the timestamp but
         # leaves the last real reading in place, so a client connecting after the roof
         # failed used to be shown convincing red/green limit-switch icons for a roof that
