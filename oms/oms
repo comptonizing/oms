@@ -458,9 +458,15 @@ def environmentWorkerLoop(generation):
                 # is how one quiet spell used to become a permanent one -- this warning
                 # once per timeout for hours, no readings stored, and updateFans switching
                 # the fans off on data over a minute old. The restart that fixed it fixed
-                # it by reopening the port, which is all this does, only sooner. Note that
-                # the reopen also drops DTR, so a board that has hung is reset by it: a
-                # restart curing the symptom never did prove the Pi side was at fault.
+                # it by reopening the port, which is all this does, only sooner.
+                #
+                # The reopen resets the board as well, which is deliberate. Opening the
+                # port asserts DTR, which the Nano's USB-serial bridge drives low, and the
+                # capacitor to RESET turns that falling edge into a reset pulse -- the same
+                # auto-reset the Arduino IDE uses to enter the bootloader. So this recovers
+                # a board that has hung, not only a serial port that has gone stale. It
+                # also means a restart curing the symptom never proved the Pi side was at
+                # fault: the restart reset the board too.
                 if quietSince is None:
                     quietSince = time.monotonic()
                     logger.warning("Got empty data from environment board")
