@@ -75,21 +75,46 @@ def grabRTSP(url: str, timeout=5):
         cap.release()
 
 
+def encodeImage(img, format="JPEG", **kwargs):
+    """Encodes a PIL image as a data URI, on whatever thread is calling.
+
+    ui.image accepts a PIL image directly, and that is the expensive way to give it one.
+    NiceGUI encodes such a source to PNG, writes it to a temporary file, removes the
+    previous FastAPI route and registers a new one for the new file (nicegui 3.15.0,
+    elements/image.py and mixins/source_element.py) -- all of it synchronously, inside
+    set_source(), which the refresh timers call *on the event loop*, once per connected
+    client. A full-resolution PNG encode is the kind of work that stalls a Pi for a
+    noticeable fraction of a second, and it was being done once per frame per client.
+
+    A data URI is just a string. helpers.is_file() rejects anything starting with "data:"
+    before it can become a Path, so set_source() does nothing but assign it, and the
+    encoding happens here instead: once per frame, on the worker thread that produced it,
+    no matter how many browsers are watching.
+
+    JPEG by default, because the caller with the volume is the CCTV frame: far cheaper to
+    encode than PNG and a fraction of the bytes to push down each websocket, for an image
+    nobody examines pixel by pixel. Callers whose image is flat colour and text pass
+    format="PNG", where lossy compression would only ring around the glyphs.
+    """
+    buffer = BytesIO()
+    img.save(buffer, format, **kwargs)
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    return "data:image/{};base64,{}".format(format.lower(), encoded)
+
+
 def createErrorImage(text: str):
     img = Image.new('RGB', (640, 360), color=(40, 40, 40))
     draw = ImageDraw.Draw(img)
 
     draw.text((20, 20), text, fill=(255, 255, 255))
 
-    buffer = BytesIO()
-    img.save(buffer, format='PNG')
-
-    encoded = base64.b64encode(buffer.getvalue()).decode()
-
-    return f'data:image/png;base64,{encoded}'
+    return encodeImage(img, "PNG")
 
 
 
+# The most recent CCTV frame as a data URI, or None when there is nothing to show. A
+# string rather than a PIL image on purpose -- see encodeImage() for what handing the
+# latter to ui.image costs on the event loop.
 last_stream_image = None
 last_stream_image_lock = threading.Lock()
 captureThread = None
@@ -107,7 +132,12 @@ def captureLoop():
             frame = None
         else:
             try:
-                frame = grabRTSP(s.q("stream_rtsp"))
+                # Encoded here, on this thread, rather than left as a PIL image for
+                # updateStream() to hand to ui.image -- that put a PNG encode and a
+                # temp-file write on the event loop for every client watching. Inside the
+                # same try as the grab, so an image that will not encode shows up as an
+                # error frame like any other failure instead of killing this pass.
+                frame = encodeImage(grabRTSP(s.q("stream_rtsp")), "JPEG", quality=80)
             except Exception as e:
                 frame = createErrorImage("{}".format(e))
         with last_stream_image_lock:
