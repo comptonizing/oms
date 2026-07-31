@@ -2135,8 +2135,10 @@ def main():
                 )
         await pushPlot(plot)
 
-    # The plot pass currently in flight for this client, if any.
+    # The plot pass currently in flight for this client, if any, and the lock that makes
+    # replacing it one indivisible step.
     plotRun = Container()
+    plotLock = asyncio.Lock()
 
     async def updatePlots():
         """Redraws the plots. Latest wins.
@@ -2150,18 +2152,31 @@ def main():
         figure is rebuilt from scratch, so a half-finished pass has nothing worth keeping,
         and cancelling is what makes the range selector feel immediate -- dropping the new
         request would ignore the click, and queueing it would answer it seconds late.
+
+        Cancelling suspends, so the swap has to happen under a lock or it reintroduces
+        exactly what it exists to prevent: two callers arriving together both read the
+        same pass, both find it not done -- a cancel is not delivered until the task next
+        runs -- both await it, and both then spawn a replacement. Two passes on the same
+        figures again, and plotRun holding only the second, so cancelPlots() could never
+        reach the first and it would run on into the closed client it was querying.
+
+        The lock covers the swap only, never the pass itself: a caller waiting for it
+        goes on to supersede whatever it finds, which is still latest-wins and not a
+        queue. Cancelling a pass that has already been cancelled is harmless, so the
+        worst the wait costs is one replacement that is thrown away unstarted.
         """
-        running = plotRun.get()
-        if running is not None and not running.done():
-            running.cancel()
-            try:
-                await running
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.debug("Superseded plot pass ended with {}".format(e))
-        task = spawn(_drawPlots())
-        plotRun.set(task)
+        async with plotLock:
+            running = plotRun.get()
+            if running is not None and not running.done():
+                running.cancel()
+                try:
+                    await running
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.debug("Superseded plot pass ended with {}".format(e))
+            task = spawn(_drawPlots())
+            plotRun.set(task)
         try:
             await task
         except asyncio.CancelledError:
