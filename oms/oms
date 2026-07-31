@@ -653,13 +653,39 @@ weatherCacheLock = threading.Lock()
 weatherCache = None
 # time.monotonic(); 0.0 means nothing is cached. See environmentLastData["timestamp"].
 weatherCacheTimestamp = 0.0
+# time.monotonic() of when the worker last found the station reachable again, or 0.0
+# while it is not reachable. Read by weatherWarmingUp().
+weatherAvailableSince = 0.0
+
+def weatherWarmingUp():
+    """Is the station reachable but yet to produce its first reading?
+
+    Powering the allsky back on does not bring the weather data back with it: the worker
+    takes up to a refresh period to notice, and then the fetch takes as long as the
+    station needs to answer. Nothing is wrong for that stretch, so the labels should read
+    as absent rather than as an error -- the same as while the camera is off.
+    """
+    if weatherThread is None or not weatherThread.is_alive():
+        # Nobody is fetching, so waiting is not going to produce a reading. That is a
+        # fault worth showing as one.
+        return False
+    with weatherCacheLock:
+        if weatherCache is not None:
+            return False        # a reading has landed; its age decides from here on
+        since = weatherAvailableSince
+    if since == 0.0:
+        return True             # the worker has not looked since the station came back
+    return (time.monotonic() - since) <= s.q("weather_refresh", fallback=5) * 3
 
 def weatherWorkerLoop():
-    global weatherStopEvent, weatherCache, weatherCacheTimestamp
+    global weatherStopEvent, weatherCache, weatherCacheTimestamp, weatherAvailableSince
     while not weatherStopEvent.is_set():
         try:
             reason = weatherUnavailableReason()
             if reason is None:
+                with weatherCacheLock:
+                    if weatherAvailableSince == 0.0:
+                        weatherAvailableSince = time.monotonic()
                 try:
                     data = getWeather()
                     with weatherCacheLock:
@@ -675,6 +701,7 @@ def weatherWorkerLoop():
                 with weatherCacheLock:
                     weatherCache = None
                     weatherCacheTimestamp = 0.0
+                    weatherAvailableSince = 0.0
             # Fan decisions are driven from here (rather than from roofLoop) so that the
             # network call above never delays the roof status poll loop.
             updateFans()
@@ -1975,10 +2002,25 @@ def main():
 
     def updateWeather():
         labelSize = "text-3xl"
+
+        def setLabel(name, text, color=""):
+            """Write one weather value, taking off whatever colour the label had before.
+
+            Every writer has to go through here: a label keeps the colour it was last
+            given, so the red left behind by an "Error" pass would otherwise outlive the
+            good reading that replaced it.
+            """
+            thing = weather_labels[name]
+            thing.set_text(text)
+            thing.classes((labelSize + " " + color).strip(), remove=weather_label_colors)
+
         reason = weatherUnavailableReason()
+        if reason is None and weatherWarmingUp():
+            reason = "the station has not answered since it came back yet"
         if reason is not None:
-            # Not an error: the station is unreachable because the allsky camera it hangs
-            # off is not running, which the allsky card next to this already spells out.
+            # Not an error: either the station is unreachable because the allsky camera it
+            # hangs off is not running -- which the allsky card next to this already
+            # spells out -- or it is reachable but still warming up.
             logger.debug("No weather data expected: {}".format(reason))
             for thing in weather_labels.values():
                 thing.set_text("N/A")
@@ -2007,8 +2049,7 @@ def main():
                 colstr = "text-orange-500"
             else:
                 colstr = "text-red-500"
-            weather_labels["env_temperature"].set_text("{:.1f} °C".format(temperature))
-            weather_labels["env_temperature"].classes(labelSize + " " + colstr)
+            setLabel("env_temperature", "{:.1f} °C".format(temperature), colstr)
 
             humidity = d["env_humidity"]
             if humidity < 10:
@@ -2021,12 +2062,10 @@ def main():
                 colstr = "text-orange-500"
             else:
                 colstr = "text-red-500"
-            weather_labels["env_humidity"].set_text("{:.1f} %".format(humidity))
-            weather_labels["env_humidity"].classes(labelSize + " " + colstr)
+            setLabel("env_humidity", "{:.1f} %".format(humidity), colstr)
 
             dewpoint = d["env_dewpoint"]
-            weather_labels["env_dewpoint"].set_text("{:.1f} °C".format(dewpoint))
-            weather_labels["env_dewpoint"].classes(labelSize)
+            setLabel("env_dewpoint", "{:.1f} °C".format(dewpoint))
 
             rain = d["rain_percentage"]
             if rain < 5:
@@ -2035,15 +2074,13 @@ def main():
                 colstr = "text-orange-500"
             else:
                 colstr = "text-red-500"
-            weather_labels["rain_percentage"].set_text("{:.0f} %".format(rain))
-            weather_labels["rain_percentage"].classes(labelSize + " " + colstr)
+            setLabel("rain_percentage", "{:.0f} %".format(rain), colstr)
 
             # No elevation entered means no sea-level correction, which is what an
             # elevation of zero computes anyway -- not a default, an identity.
             elevation = s.q("weather_elevation", fallback=0) or 0
             pressure = d["env_pressure"] + ((d["env_pressure"] * 9.80665 * elevation)/(287 * (273 + temperature + (elevation/400))))
-            weather_labels["env_pressure"].set_text("{:.0f} hPa".format(pressure))
-            weather_labels["env_pressure"].classes(labelSize)
+            setLabel("env_pressure", "{:.0f} hPa".format(pressure))
 
             sqm = d["sqm_mpsas"]
             if sqm < 18:
@@ -2053,12 +2090,10 @@ def main():
             else:
                 colstr = "text-green-500"
 
-            weather_labels["sqm_mpsas"].set_text("{:.1f}".format(sqm))
-            weather_labels["sqm_mpsas"].classes(labelSize + " " + colstr)
+            setLabel("sqm_mpsas", "{:.1f}".format(sqm), colstr)
 
             ir_sky = d["ir_sky"]
-            weather_labels["ir_sky"].set_text("{:.1f} °C".format(ir_sky))
-            weather_labels["ir_sky"].classes(labelSize)
+            setLabel("ir_sky", "{:.1f} °C".format(ir_sky))
 
             ir_diff = d["ir_diff"]
             if ir_diff < 15:
@@ -2067,8 +2102,7 @@ def main():
                 colstr = "text-orange-500"
             else:
                 colstr = "text-green-500"
-            weather_labels["ir_diff"].set_text("{:.1f} °C".format(ir_diff))
-            weather_labels["ir_diff"].classes(labelSize + " " + colstr)
+            setLabel("ir_diff", "{:.1f} °C".format(ir_diff), colstr)
 
             wind_speed = d["wind_speed"]
             if wind_speed < 15:
@@ -2077,8 +2111,7 @@ def main():
                 colstr = "text-orange-500"
             else:
                 colstr = "text-red-500"
-            weather_labels["wind_speed"].set_text("{:.1f} km/h".format(wind_speed))
-            weather_labels["wind_speed"].classes(labelSize + " " + colstr)
+            setLabel("wind_speed", "{:.1f} km/h".format(wind_speed), colstr)
 
             wind_gust = d["wind_gust"]
             if wind_gust < 30:
@@ -2087,8 +2120,7 @@ def main():
                 colstr = "text-orange-500"
             else:
                 colstr = "text-red-500"
-            weather_labels["wind_gust"].set_text("{:.1f} km/h".format(wind_gust))
-            weather_labels["wind_gust"].classes(labelSize + " " + colstr)
+            setLabel("wind_gust", "{:.1f} km/h".format(wind_gust), colstr)
         except Exception as e:
             logger.error("Error updating weather labels: {}".format(e))
 
