@@ -385,12 +385,14 @@ environmentSerial = None
 environmentThread = None
 # Bumped by stopEnvironmentWorker() whenever a worker is retired, exactly as roofGeneration
 # is for the roof. A worker carries the value it was started with and leaves as soon as it
-# no longer matches. Two things need that. A worker whose join expired goes on writing
-# environmentLastData, which is what updateFans reads to decide whether the fans may run:
-# both workers read the same board so the values agree, but the *timestamp* does not, and a
-# zombie refreshing it makes stale data look current. And startEnvironmentWorker() clears
-# the shared stop event, which would otherwise revive a zombie sitting in wait() and let it
-# re-open the port a stop had just closed -- the generation is what stops it instead.
+# no longer matches. Needed for two things now that startEnvironmentWorker() gives each
+# worker its own stop event (see environmentStopEvent below) rather than clearing a shared
+# one: a worker whose join expired goes on writing environmentLastData, which is what
+# updateFans reads to decide whether the fans may run -- both workers read the same board so
+# the values agree, but the *timestamp* does not, and a zombie refreshing it makes stale data
+# look current. And a worker can be blocked inside setupEnvironmentWorker() -- which is not
+# interruptible mid-flight -- when it is superseded; the generation rechecks around that call
+# are what stop it from going on to read a line that belongs to its replacement.
 environmentGeneration = 0
 # How long the board may say nothing at all before the worker gives up on the open port and
 # opens it again. The board talks constantly -- it emits LOG: lines between measurements --
@@ -413,6 +415,12 @@ environmentStopGrace = 3
 def environmentStopBudget():
     return numericSetting("weather_environment_timeout", 2) + environmentStopGrace
 environmentLock = threading.Lock()
+# The current worker's stop event, and only that. startEnvironmentWorker() gives each new
+# worker a fresh one rather than clearing this, so signalling one worker can never be undone
+# on behalf of another -- exactly the reasoning behind captureStopEvent and roofStopEvent.
+# Before this, the loop read this global directly, and startEnvironmentWorker()'s clear()
+# could un-signal a zombie still sitting in wait(), reviving it to reopen a port a stop had
+# just closed.
 environmentStopEvent = threading.Event()
 environmentParameterMap = { "T": "inside_temperature", "H": "inside_humidity" }
 environmentLastData = {}
@@ -545,13 +553,27 @@ def setupEnvironmentWorker(quiet=False):
         environmentLock.release()
     return True
 
-def environmentWorkerLoop(generation):
-    global environmentStopEvent, environmentInfluxClient, environmentSerial, environmentLock, environmentLastData, environmentWriteApi
+def environmentWorkerLoop(stopEvent, generation):
+    """The environment worker. Its stop event and its identity are arguments, not globals.
+
+    stopEvent is this worker's own, so a worker that stopEnvironmentWorker() signalled stays
+    signalled no matter what the next one does -- startEnvironmentWorker() gives each new
+    worker a fresh Event rather than clearing this one, exactly as captureStopEvent and
+    roofStopEvent already do.
+
+    generation still matters on top of that: a worker can be blocked inside
+    setupEnvironmentWorker() -- which acquires environmentLock and reopens the port -- when
+    it is superseded, and that call is not interruptible mid-flight. The stop event is only
+    noticed on the next loop-top check, by which point the port may already be stomped; the
+    generation rechecks around the call are what stop this worker from also reading a line
+    that belongs to its replacement once setup returns.
+    """
+    global environmentInfluxClient, environmentSerial, environmentLock, environmentLastData, environmentWriteApi
     # When the board fell silent, or None while it is talking. Only ever set from this
     # thread, and deliberately a local: it describes this worker's port, and a superseded
     # worker must not leave its silence behind for the next one to act on.
     quietSince = None
-    while not environmentStopEvent.is_set():
+    while not stopEvent.is_set():
         if generation != environmentGeneration:
             logger.warning("Environment worker {} superseded by {}, exiting".format(
                 generation, environmentGeneration))
@@ -564,22 +586,32 @@ def environmentWorkerLoop(generation):
             # environmentLastData never got a timestamp and updateFans always saw
             # stale data -- auto fan mode could never switch the fans on.
             if environmentSerial is None:
-                if environmentStopEvent.is_set():
+                if stopEvent.is_set():
                     # A stop is under way and has just closed the port. Re-opening it here
                     # would resurrect precisely what stopEnvironmentWorker() tore down.
-                    # This covers a stop in progress only; a worker revived later by
-                    # startEnvironmentWorker's environmentStopEvent.clear() is a separate
-                    # problem, and needs the per-worker event the roof worker now has.
+                    break
+                if generation != environmentGeneration:
+                    # Superseded since the loop-top check, before reaching setup -- nothing
+                    # has been touched yet, so exiting here is free.
+                    logger.warning("Environment worker {} superseded by {}, exiting".format(
+                        generation, environmentGeneration))
                     break
                 # Quietly: this runs every few seconds for as long as the board is
                 # missing, and the operator was already told once why.
                 setupEnvironmentWorker(quiet=True)
+                if generation != environmentGeneration:
+                    # Superseded while setup ran. It may already have reopened the port out
+                    # from under the worker that replaced this one -- that cannot be undone
+                    # from here -- but reading from it next would steal a line that belonged
+                    # to the replacement, so stop short of that.
+                    logger.info("Environment worker superseded during setup, exiting")
+                    break
                 # A fresh port starts with a clean slate, whatever closed the old one.
                 # Without this the silence measured against the previous port would carry
                 # over and the first timeout on the new one would reopen it again.
                 quietSince = None
             if environmentSerial is None:
-                environmentStopEvent.wait(numericSetting("weather_refresh", 5))
+                stopEvent.wait(numericSetting("weather_refresh", 5))
                 continue
             if not environmentLock.acquire(timeout=10):
                 logger.warning("Error acquiring environment lock")
@@ -666,7 +698,7 @@ def environmentWorkerLoop(generation):
                 environmentWriteApi.write(bucket=s.q("weather_db_bucket", fallback=None), org=s.q("weather_db_org", fallback=None), record=p)
         except Exception as e:
             logger.warning(f"Error in environment loop: {e}")
-            environmentStopEvent.wait(numericSetting("weather_refresh", 5))
+            stopEvent.wait(numericSetting("weather_refresh", 5))
         finally:
             if lockAcquired:
                 environmentLock.release()
@@ -721,16 +753,21 @@ def startEnvironmentWorker():
     """
     global environmentThread, environmentStopEvent
     stopEnvironmentWorker()
-    environmentStopEvent.clear()
+    # A fresh event per worker, handed over as an argument, rather than clearing the shared
+    # one -- exactly as startCaptureLoop() and makeRoof() do it. A previous worker that
+    # stopEnvironmentWorker() signalled but could not join is still waiting on *its* event;
+    # clearing that same object here used to un-signal it, so the orphan resumed and could
+    # reopen the port the stop had just closed.
+    workerStopEvent = threading.Event()
+    environmentStopEvent = workerStopEvent
     logger.info("Starting environment loop")
     if not setupEnvironmentWorker():
         logger.warning("Could not set up environment board, the worker will keep retrying")
     # stopEnvironmentWorker() bumped the generation above, so this worker takes the current
-    # value and every older one is already superseded -- including one still sitting in the
-    # wait() that the clear() just above would otherwise have released.
+    # value and every older one is already superseded.
     environmentThread = threading.Thread(
             target = environmentWorkerLoop,
-            args = (environmentGeneration,),
+            args = (workerStopEvent, environmentGeneration),
             daemon = True,
             name = "Environment worker"
             )
