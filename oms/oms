@@ -64,6 +64,8 @@ settingBounds = {
         "roof_fan_change_delay": (0, 600),
         "weather_elevation": (0, 9000),
         "roof_fan_temp_min": (-50, 50),
+        "roof_fan_humidity_deadband": (0, 50),
+        "roof_fan_temp_deadband": (0, 20),
         # BCM 2-27. 0 and 1 are ID_SD/ID_SC, reserved for HAT EEPROM detection, so they
         # are on the header but are not general-purpose pins.
         "cctv_pin": (2, 27),
@@ -1241,7 +1243,23 @@ def updateFans():
         return
     logger.debug(f"Weather data available: {weather}")
     tmin = numericSetting("roof_fan_temp_min", 5)
-    fansShouldBeOn = H_outside < H and T_outside > tmin
+    humidityBand = numericSetting("roof_fan_humidity_deadband", 5)
+    tempBand = numericSetting("roof_fan_temp_deadband", 2)
+    # Inside either dead band, that factor does not argue for a state either way -- it
+    # keeps whatever the fans are already doing rather than flip on a difference too
+    # small to matter. Only a crossing past the band flips it, which is what stops the
+    # last bit of flapping right at the threshold.
+    humidityDiff = H - H_outside
+    if abs(humidityDiff) > humidityBand:
+        humidityWantsOn = humidityDiff > 0
+    else:
+        humidityWantsOn = fansAreOn
+    tempDiff = T_outside - tmin
+    if abs(tempDiff) > tempBand:
+        tempAllowsOn = tempDiff > 0
+    else:
+        tempAllowsOn = fansAreOn
+    fansShouldBeOn = humidityWantsOn and tempAllowsOn
     if fansShouldBeOn == fansAreOn:
         logger.debug("Fan state already as requested")
         return
@@ -2234,6 +2252,8 @@ def main():
                     settings["roof_timeout"] = boundedNumber("Breakout board timeout (s)", "roof_timeout")
                     settings["roof_fan_change_delay"] = boundedNumber("Minimal time between fan state changes (s)", "roof_fan_change_delay")
                     settings["roof_fan_temp_min"] = boundedNumber("Minimum outside temperature for fan", "roof_fan_temp_min")
+                    settings["roof_fan_humidity_deadband"] = boundedNumber("Dead range for inside/outside humidity difference (%)", "roof_fan_humidity_deadband")
+                    settings["roof_fan_temp_deadband"] = boundedNumber("Dead range around minimum outside temperature (°C)", "roof_fan_temp_deadband")
 
             with ui.card().tight().classes("w-full"):
                 ui.label("Switches")
