@@ -48,6 +48,116 @@ indicator_colors = dict(on="green", off="red", unkn="gray")
 mainLoop = None
 
 backgroundTasks: set[asyncio.Task] = set()
+# Floor and ceiling for every numeric setting. Floors are inclusive:
+# roof_fan_change_delay accepts 0 deliberately, so that "no hysteresis at all" stays
+# available to anyone who wants it.
+#
+# This is not a defaults table. Nothing here supplies a value for a setting the operator
+# has not entered -- an unset setting still reads as None, and every read site keeps the
+# local fallback it already had. These only say which *entered* values are refused.
+settingBounds = {
+        "stream_refresh": (5, 600),
+        "weather_refresh": (5, 60),
+        "weather_plot_refresh": (10, 600),
+        "weather_environment_timeout": (2, 5),
+        "roof_timeout": (0.1, 2),
+        "roof_fan_change_delay": (0, 600),
+        "weather_elevation": (0, 9000),
+        "roof_fan_temp_min": (-50, 50),
+        # BCM 2-27. 0 and 1 are ID_SD/ID_SC, reserved for HAT EEPROM detection, so they
+        # are on the header but are not general-purpose pins.
+        "cctv_pin": (2, 27),
+        "allsky_pin": (2, 27),
+        "pier_pin": (2, 27),
+        "pc_pin": (2, 27),
+        "roof_pins_west_open": (2, 27),
+        "roof_pins_west_close": (2, 27),
+        "roof_pins_east_open": (2, 27),
+        "roof_pins_east_close": (2, 27),
+        }
+
+baudRates = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
+
+# The value last reported as unusable for each setting. A worker thread that reads a bad
+# interval every few seconds should say so once, not once a pass.
+_reportedBadSettings = {}
+
+def settingProblem(name, value, detail):
+    """Reports an unusable setting once, to the log and to the UI."""
+    if name in _reportedBadSettings and _reportedBadSettings[name] == value:
+        return
+    _reportedBadSettings[name] = value
+    msg = "Setting {} is unusable ({!r}): {}".format(name, value, detail)
+    logger.error(msg)
+    try:
+        triggerEvent("error", msg)
+    except Exception:
+        # No event loop yet -- this is reachable from initStuff() before the UI exists.
+        # The log line above is the part that must not be lost.
+        pass
+
+def numericSetting(name, fallback=None):
+    """The setting as a number inside its bounds, or `fallback`.
+
+    A drop-in for `s.q(name, fallback=X)` at every numeric read site, with the one
+    difference that a value outside settingBounds[name] is refused and reported rather
+    than used. The fallback that comes back is the caller's own -- the same one it
+    already had -- so nothing here invents a value for a setting nobody entered.
+
+    Unset returns the fallback silently: that is the normal state under the no-defaults
+    contract and says nothing about the operator's intentions. Out of bounds is reported,
+    because it means they entered something that cannot be honoured.
+    """
+    value = s.q(name, fallback=None)
+    if value is None or value == "":
+        return fallback
+    floor, ceiling = settingBounds[name]
+    # bool before number: isinstance(True, int) is True, and True would otherwise sail
+    # through every comparison below as 1.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        settingProblem(name, value, "not a number")
+        return fallback
+    if value < floor or value > ceiling:
+        settingProblem(name, value, "outside {} to {}".format(floor, ceiling))
+        return fallback
+    _reportedBadSettings.pop(name, None)
+    return value
+
+def storedBaud(name):
+    """The stored rate if it is one of the standard ones, otherwise None.
+
+    What the settings dialog shows. A rate outside the standard set vanishes rather than
+    being offered back for re-selection: there is no hardware it could be right for.
+    """
+    value = s.q(name, fallback=None)
+    return int(value) if value in baudRates else None
+
+def baudSetting(name):
+    """The baud rate to open a port with, or None -- which callers must treat as fatal.
+
+    The one numeric setting with no fallback, deliberately. An interval that is out of
+    range can be replaced with a sane one and everything downstream is merely differently
+    timed; a wrong baud does not fail cleanly, it yields bytes that parse into
+    plausible-looking garbage, and on the environment board that garbage drives the fans.
+    """
+    value = storedBaud(name)
+    if value is not None:
+        _reportedBadSettings.pop(name, None)
+        return value
+    raw = s.q(name, fallback=None)
+    if raw is not None and raw != "":
+        settingProblem(name, raw, "not one of the standard baud rates")
+    return None
+
+def boundedNumber(label, name, **kwargs):
+    """A settings field that carries its own bounds.
+
+    Built from settingBounds so the dialog and the guard cannot disagree: a bound changed
+    in one place is a bound changed in both.
+    """
+    floor, ceiling = settingBounds[name]
+    return ui.number(label, value=s.q(name, fallback=None), min=floor, max=ceiling, **kwargs)
+
 def spawn(coro):
     task = asyncio.create_task(coro)
     backgroundTasks.add(task)
@@ -189,7 +299,7 @@ def captureLoop(stopEvent, generation):
         finally:
             # This worker's own event. Already set for a worker on its way out, so neither
             # break above waits out a refresh period first.
-            stopEvent.wait(s.q("stream_refresh", fallback=5))
+            stopEvent.wait(numericSetting("stream_refresh", 5))
 
 def stopCaptureLoop():
     global captureThread, captureGeneration
@@ -288,6 +398,20 @@ environmentGeneration = 0
 # updateFans judges the readings by, so a reopen never throws away anything still in use,
 # and it is long enough that a board which is merely slow to answer is left alone.
 environmentSilenceTimeout = 60
+
+# On top of one full read: the parse and the lock handoff that follow it.
+#
+# The worker holds environmentLock across readline(), so anything waiting for that lock --
+# or joining the thread itself -- has to outlast a read, and how long a read lasts is a
+# setting. Derived rather than hardcoded for that reason: the flat 5s these waits used to
+# carry was sized against a 2s timeout, and would have begun failing the moment
+# weather_environment_timeout was set anywhere near its 5s ceiling. The failure is not
+# subtle -- stopEnvironmentWorker gives up on the lock and the port, opened exclusive=True,
+# stays claimed until the process exits.
+environmentStopGrace = 3
+
+def environmentStopBudget():
+    return numericSetting("weather_environment_timeout", 2) + environmentStopGrace
 environmentLock = threading.Lock()
 environmentStopEvent = threading.Event()
 environmentParameterMap = { "T": "inside_temperature", "H": "inside_humidity" }
@@ -370,7 +494,7 @@ def setupEnvironmentWorker(quiet=False):
             triggerEvent(event, msg)
 
     report("info", "Setting up environment sensor and database")
-    if not environmentLock.acquire(timeout=5):
+    if not environmentLock.acquire(timeout=environmentStopBudget()):
         report("warning", "Error acquiring environment lock")
         return False
     try:
@@ -395,10 +519,16 @@ def setupEnvironmentWorker(quiet=False):
             logger.debug("No weather database configured, environment readings will not be stored")
 
         port = s.q("weather_environment_port", fallback=None)
-        baud = s.q("weather_environment_baud", fallback=None)
-        timeout = s.q("weather_environment_timeout", fallback=2)
-        if port is None or baud is None:
+        baud = baudSetting("weather_environment_baud")
+        timeout = numericSetting("weather_environment_timeout", 2)
+        if port is None:
             report("warning", "Environment serial port not available", "warning")
+            return False
+        if baud is None:
+            # Separate from the port, and fatal rather than fallen back on: opening at
+            # the wrong rate reads bytes that parse into plausible numbers, and those
+            # numbers drive the fans.
+            report("warning", "Environment baud rate is not one of the standard rates", "warning")
             return False
         report("info", "Opening serial port {}".format(port))
         try:
@@ -449,7 +579,7 @@ def environmentWorkerLoop(generation):
                 # over and the first timeout on the new one would reopen it again.
                 quietSince = None
             if environmentSerial is None:
-                environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
+                environmentStopEvent.wait(numericSetting("weather_refresh", 5))
                 continue
             if not environmentLock.acquire(timeout=10):
                 logger.warning("Error acquiring environment lock")
@@ -524,12 +654,19 @@ def environmentWorkerLoop(generation):
                 break
             environmentLastData[key] = value
             environmentLastData["timestamp"] = time.monotonic()
+            # Released before the write, not after. environmentLock guards the serial
+            # port, and an Influx append is not a serial operation -- holding it here put
+            # a network client inside the critical section that stopEnvironmentWorker's
+            # close has to wait out, and that wait is what decides whether the port is
+            # ever released.
+            environmentLock.release()
+            lockAcquired = False
             if environmentWriteApi is not None:
                 p = Point("weather").field(key, value)
                 environmentWriteApi.write(bucket=s.q("weather_db_bucket", fallback=None), org=s.q("weather_db_org", fallback=None), record=p)
         except Exception as e:
             logger.warning(f"Error in environment loop: {e}")
-            environmentStopEvent.wait(s.q("weather_refresh", fallback=5))
+            environmentStopEvent.wait(numericSetting("weather_refresh", 5))
         finally:
             if lockAcquired:
                 environmentLock.release()
@@ -550,7 +687,7 @@ def stopEnvironmentWorker():
     if environmentThread is not None and environmentThread.is_alive():
         logger.info("Stopping environment thread")
         environmentStopEvent.set()
-        environmentThread.join(timeout=5)
+        environmentThread.join(timeout=environmentStopBudget())
         if environmentThread.is_alive():
             logger.warning("Environment thread still alive")
         else:
@@ -562,7 +699,7 @@ def stopEnvironmentWorker():
     # out from under a thread that is reading it invites an obscure crash. The lock decides:
     # holding it means nobody is mid-read. If it cannot be had, say so plainly and leave
     # the port alone rather than forcing it.
-    if not environmentLock.acquire(timeout=5):
+    if not environmentLock.acquire(timeout=environmentStopBudget()):
         logger.error(
                 "Could not acquire the environment lock to close the serial port and "
                 "database client; the port stays claimed until OMS exits")
@@ -863,7 +1000,7 @@ def weatherWarmingUp():
         since = weatherAvailableSince
     if since == 0.0:
         return True             # the worker has not looked since the station came back
-    return (time.monotonic() - since) <= s.q("weather_refresh", fallback=5) * 3
+    return (time.monotonic() - since) <= numericSetting("weather_refresh", 5) * 3
 
 def weatherWorkerLoop(stopEvent, generation):
     """The weather worker. Same worker-identity contract as captureLoop.
@@ -923,7 +1060,7 @@ def weatherWorkerLoop(stopEvent, generation):
         finally:
             # This worker's own event. Already set for a worker that is on its way out, so
             # the break above is not delayed by a refresh period.
-            stopEvent.wait(s.q("weather_refresh", fallback=5))
+            stopEvent.wait(numericSetting("weather_refresh", 5))
 
 def stopWeatherWorker():
     global weatherThread, weatherGeneration
@@ -1046,7 +1183,7 @@ def updateFans():
         return
     logger.debug(f"Environment data available: {environmentLastData}")
 
-    delay = s.q("roof_fan_change_delay", fallback=60)
+    delay = numericSetting("roof_fan_change_delay", 60)
     if time.monotonic() - lastFanChange < delay:
         logger.debug("Last change not too far in the past, skipping this one")
         return
@@ -1054,7 +1191,7 @@ def updateFans():
     with weatherCacheLock:
         weather = weatherCache
         weatherAge = time.monotonic() - weatherCacheTimestamp
-    weatherMaxAge = s.q("weather_refresh", fallback=5) * 3
+    weatherMaxAge = numericSetting("weather_refresh", 5) * 3
     if weather is None or weatherAge > weatherMaxAge:
         logger.debug("No recent weather data available, skipping fan update")
         return
@@ -1066,7 +1203,7 @@ def updateFans():
         logger.debug("Weather has no usable temperature or humidity, skipping fan update")
         return
     logger.debug(f"Weather data available: {weather}")
-    tmin = s.q("roof_fan_temp_min", fallback=5)
+    tmin = numericSetting("roof_fan_temp_min", 5)
     fansShouldBeOn = H_outside < H and T_outside > tmin
     if fansShouldBeOn == fansAreOn:
         logger.debug("Fan state already as requested")
@@ -1100,19 +1237,46 @@ def readRoofConfig():
     """
     if not checkRoofPins():
         return None
+    baud = baudSetting("roof_baud")
+    if baud is None:
+        if s.q("roof_baud", fallback=None) not in (None, ""):
+            # Set to something outside the standard rates. Fatal, and deliberately not
+            # fallen back on: a wrong rate does not fail, it returns limit-switch states
+            # that were never sent. baudSetting() has already reported which value.
+            logger.error("Roof baud rate is not one of the standard rates, roof unusable")
+            return None
+        # Never set at all, which is a different thing from set wrongly. This has always
+        # read as 9600, it is the rate in roof/roof.ino, and it is the only rate this
+        # board has ever been spoken to at -- so an installation that never filled the
+        # field in keeps its roof rather than losing it to a validation change.
+        baud = 9600
     try:
-        return {
+        config = {
                 "pinWestOpen": int(s.q("roof_pins_west_open")),
                 "pinWestClose": int(s.q("roof_pins_west_close")),
                 "pinEastOpen": int(s.q("roof_pins_east_open")),
                 "pinEastClose": int(s.q("roof_pins_east_close")),
                 "port": s.q("roof_port"),
-                "baud": s.q("roof_baud") if s.has("roof_baud") else 9600,
-                "timeout": s.q("roof_timeout") if s.has("roof_timeout") else 0.2,
+                "baud": baud,
+                # Falls back rather than refusing, unlike the baud above. A roof that
+                # answers on a different schedule is still a roof, and rejecting the
+                # whole configuration over a timeout would take the dome away -- and,
+                # through pinUsedForRoof(), stop protecting the four motion pins as well.
+                "timeout": numericSetting("roof_timeout", 0.2),
                 }
     except Exception as e:
         logger.error("Roof configuration is not usable: {}".format(e))
         return None
+    # A motor pin outside the header's range cannot be driven at all, so this is fatal in
+    # the way the timeout is not. It already failed, later and less clearly, when
+    # roof.Roof() handed the number to RPi.GPIO.
+    floor, ceiling = settingBounds["roof_pins_west_open"]
+    for key in ("pinWestOpen", "pinWestClose", "pinEastOpen", "pinEastClose"):
+        if not floor <= config[key] <= ceiling:
+            logger.error("Roof {} is {}, outside the usable GPIO range {} to {}".format(
+                key, config[key], floor, ceiling))
+            return None
+    return config
 
 class OwnerTrackingLock:
     def __init__(self):
@@ -1680,7 +1844,37 @@ def main():
         panel.set_visibility(True)
 
 
+    def settingsProblems():
+        """Everything in the dialog that is outside its bounds, phrased for the operator.
+
+        Only the fields with bounds are examined. An empty field is not a problem: not
+        entering a value is how a setting is left unconfigured, and that is a supported
+        state rather than a mistake.
+        """
+        problems = []
+        for thing, widget in settings.items():
+            if thing not in settingBounds:
+                continue
+            value = widget.value
+            if value is None or value == "":
+                continue
+            floor, ceiling = settingBounds[thing]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                problems.append("{} must be a number".format(thing))
+            elif value < floor or value > ceiling:
+                problems.append("{} must be between {} and {}".format(thing, floor, ceiling))
+        return problems
+
     async def saveSettings():
+        problems = settingsProblems()
+        if problems:
+            # Nothing is stored, rather than storing the fields that happen to be fine.
+            # A settings save is not a set of independent writes: the next statement
+            # re-opens two serial ports and restarts three workers, and doing that
+            # against a half-applied configuration is worse than not saving at all. The
+            # operator keeps what they typed and can correct it in place.
+            ui.notify("Not saved: " + "; ".join(problems), type="negative", multi_line=True)
+            return
         for thing in settings.keys():
             logger.debug("Setting {}: {}".format(thing, settings[thing].value))
             s.p(thing, settings[thing].value)
@@ -1883,13 +2077,13 @@ def main():
                 ui.label("Stream")
                 with ui.card_section().classes("w-full"):
                     settings["stream_rtsp"] = ui.input("RTSP URL", value=s.q("stream_rtsp", fallback=None)).classes("w-full")
-                    settings["stream_refresh"] = ui.number("Refresh (s)", value=s.q("stream_refresh", fallback=None))
+                    settings["stream_refresh"] = boundedNumber("Refresh (s)", "stream_refresh")
             with ui.card().tight().classes("w-full"):
                 ui.label("Weather")
                 with ui.card_section().classes("w-full"):
-                    settings["weather_refresh"] = ui.number("Refresh (s)", value=s.q("weather_refresh", fallback=None))
-                    settings["weather_plot_refresh"] = ui.number("Plot refresh (s)", value=s.q("weather_plot_refresh", fallback=None))
-                    settings["weather_elevation"] = ui.number("Elevation (m)", value=s.q("weather_elevation", fallback=None))
+                    settings["weather_refresh"] = boundedNumber("Refresh (s)", "weather_refresh")
+                    settings["weather_plot_refresh"] = boundedNumber("Plot refresh (s)", "weather_plot_refresh")
+                    settings["weather_elevation"] = boundedNumber("Elevation (m)", "weather_elevation")
                     settings["weather_image"] = ui.input("URL for latest allsky image", value=s.q("weather_image", fallback=None))
                     settings["weather_url"] = ui.input("URL for weather data scraping", value=s.q("weather_url", fallback=None))
                     settings["weather_db_url"] = ui.input("Weather database URL", value=s.q("weather_db_url", fallback=None))
@@ -1897,21 +2091,21 @@ def main():
                     settings["weather_db_token"] = ui.input("Weather database token", value=s.q("weather_db_token", fallback=None))
                     settings["weather_db_bucket"] = ui.input("Weather database bucket", value=s.q("weather_db_bucket", fallback=None))
                     settings["weather_environment_port"] = ui.input("Serial port for environment sensor breakout board", value=s.q("weather_environment_port", fallback=None))
-                    settings["weather_environment_baud"] = ui.number("Baud rate of the environment sensor breakout board", value=s.q("weather_environment_baud", fallback=None))
-                    settings["weather_environment_timeout"] = ui.number("Timeout for the environment sensor breakout board", value=s.q("weather_environment_timeout", fallback=None))
+                    settings["weather_environment_baud"] = ui.select(baudRates, label="Baud rate of the environment sensor breakout board", value=storedBaud("weather_environment_baud"))
+                    settings["weather_environment_timeout"] = boundedNumber("Timeout for the environment sensor breakout board", "weather_environment_timeout")
 
             with ui.card().tight().classes("w-full"):
                 ui.label("Roof")
                 with ui.card_section().classes("w-full"):
-                    settings["roof_pins_west_close"] = ui.number("Pin west close", value=s.q("roof_pins_west_close", fallback=None), step=1, format='%d')
-                    settings["roof_pins_west_open"] = ui.number("Pin west open", value=s.q("roof_pins_west_open", fallback=None), step=1, format='%d')
-                    settings["roof_pins_east_close"] = ui.number("Pin east close", value=s.q("roof_pins_east_close", fallback=None), step=1, format='%d')
-                    settings["roof_pins_east_open"] = ui.number("Pin east open", value=s.q("roof_pins_east_open", fallback=None), step=1, format='%d')
+                    settings["roof_pins_west_close"] = boundedNumber("Pin west close", "roof_pins_west_close", step=1, format='%d')
+                    settings["roof_pins_west_open"] = boundedNumber("Pin west open", "roof_pins_west_open", step=1, format='%d')
+                    settings["roof_pins_east_close"] = boundedNumber("Pin east close", "roof_pins_east_close", step=1, format='%d')
+                    settings["roof_pins_east_open"] = boundedNumber("Pin east open", "roof_pins_east_open", step=1, format='%d')
                     settings["roof_port"] = ui.input("Breakout board port", value=s.q("roof_port", fallback=None))
-                    settings["roof_baud"] = ui.number("Breakout board baud rate", value=s.q("roof_baud", fallback=None))
-                    settings["roof_timeout"] = ui.number("Breakout board timeout (s)", value=s.q("roof_timeout", fallback=None))
-                    settings["roof_fan_change_delay"] = ui.number("Minimal time between fan state changes (s)", value=s.q("roof_fan_change_delay", fallback=60))
-                    settings["roof_fan_temp_min"] = ui.number("Minimum outside temperature for fan", value=s.q("roof_fan_temp_min", fallback=5))
+                    settings["roof_baud"] = ui.select(baudRates, label="Breakout board baud rate", value=storedBaud("roof_baud"))
+                    settings["roof_timeout"] = boundedNumber("Breakout board timeout (s)", "roof_timeout")
+                    settings["roof_fan_change_delay"] = boundedNumber("Minimal time between fan state changes (s)", "roof_fan_change_delay")
+                    settings["roof_fan_temp_min"] = boundedNumber("Minimum outside temperature for fan", "roof_fan_temp_min")
 
             with ui.card().tight().classes("w-full"):
                 ui.label("Switches")
@@ -1919,22 +2113,22 @@ def main():
                     with ui.card().tight().classes("w-full"):
                         ui.label("CCTV")
                         with ui.card_section().classes("w-full"):
-                            settings["cctv_pin"] = ui.number("Pin", value=s.q("cctv_pin", fallback=None), step=1, format='%d')
+                            settings["cctv_pin"] = boundedNumber("Pin", "cctv_pin", step=1, format='%d')
                             settings["cctv_init"] = ui.select(["off", "on", "last"], value=s.q("cctv_init", fallback="off"))
                     with ui.card().tight().classes("w-full"):
                         ui.label("Allsky")
                         with ui.card_section().classes("w-full"):
-                            settings["allsky_pin"] = ui.number("Pin", value=s.q("allsky_pin", fallback=None), step=1, format='%d')
+                            settings["allsky_pin"] = boundedNumber("Pin", "allsky_pin", step=1, format='%d')
                             settings["allsky_init"] = ui.select(["off", "on", "last"], value=s.q("allsky_init", fallback="off"))
                     with ui.card().tight().classes("w-full"):
                         ui.label("Pier")
                         with ui.card_section().classes("w-full"):
-                            settings["pier_pin"] = ui.number("Pin", value=s.q("pier_pin", fallback=None), step=1, format='%d')
+                            settings["pier_pin"] = boundedNumber("Pin", "pier_pin", step=1, format='%d')
                             settings["pier_init"] = ui.select(["off", "on", "last"], value=s.q("pier_init", fallback="off"))
                     with ui.card().tight().classes("w-full"):
                         ui.label("PC")
                         with ui.card_section().classes("w-full"):
-                            settings["pc_pin"] = ui.number("Pin", value=s.q("pc_pin", fallback=None), step=1, format='%d')
+                            settings["pc_pin"] = boundedNumber("Pin", "pc_pin", step=1, format='%d')
                             settings["pc_init"] = ui.select(["off", "on", "last"], value=s.q("pc_init", fallback="off"))
             ui.button("Save & apply", on_click=saveSettings)
 
@@ -2340,7 +2534,7 @@ def main():
         with weatherCacheLock:
             d = weatherCache
             weatherAge = time.monotonic() - weatherCacheTimestamp
-        weatherMaxAge = s.q("weather_refresh", fallback=5) * 3
+        weatherMaxAge = numericSetting("weather_refresh", 5) * 3
         if d is None or weatherAge > weatherMaxAge:
             logger.warning("No recent weather data available")
             for thing in weather_labels.values():
@@ -2404,7 +2598,7 @@ def main():
 
             # No elevation entered means no sea-level correction, which is what an
             # elevation of zero computes anyway -- not a default, an identity.
-            elevation = s.q("weather_elevation", fallback=0) or 0
+            elevation = numericSetting("weather_elevation", 0)
             pressure = numbers["env_pressure"]
             if pressure is not None and elevation and temperature is None:
                 # The correction needs the temperature. Without it the raw reading would
@@ -2510,9 +2704,12 @@ def main():
                 "update_stream": ("stream_refresh", updateStream, None),
                 }
         for name, (setting, callback, fallback) in intervals.items():
-            interval = s.q(setting, fallback=fallback)
-            if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
-                logger.warning("No usable {} set ({!r}), {} will not refresh".format(setting, interval, name))
+            # The type and range check that used to be written out here lives in
+            # numericSetting now, along with the same check for every other numeric
+            # setting -- this was the only one that ever had it.
+            interval = numericSetting(setting, fallback)
+            if interval is None:
+                logger.warning("No usable {} set, {} will not refresh".format(setting, name))
                 continue
             timers[name] = ui.timer(interval, callback, immediate=False)
 
