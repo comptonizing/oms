@@ -166,14 +166,26 @@ def spawn(coro):
     task.add_done_callback(backgroundTasks.discard)
     return task
 
-def grabRTSP(url: str, timeout=5):
+# How long the RTSP open and the frame read may each take. Named because
+# captureStopBudget() is derived from it: the capture worker sits inside grabRTSP, so the
+# join that has to outlast a grab must be sized against this number and cannot be allowed
+# to drift away from it.
+rtspGrabTimeout = 5
+
+def grabRTSP(url: str, timeout=rtspGrabTimeout):
     logger.debug("Grabbing frame from {}".format(url))
     logger.debug("Opening capture")
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    # The timeouts go in the constructor's params list, not into set() afterwards. The
+    # open happens inside VideoCapture(), so a CAP_PROP_OPEN_TIMEOUT_MSEC set on the
+    # returned object arrives after the thing it was meant to bound has already finished
+    # -- which left the open governed only by FFMPEG's own default, tens of seconds
+    # against a black-holed TCP connect. That is why a capture worker could outlast its
+    # join by far more than the two timeouts below suggest.
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, [
+        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(timeout * 1000),
+        cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(timeout * 1000),
+        ])
     try:
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout * 1000)
-        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout * 1000)
-
         if not cap.isOpened():
             raise Exception("Failed to open RTSP stream at {}".format(url))
         logger.debug("Reading frame")
@@ -246,6 +258,26 @@ captureStopEvent = threading.Event()
 # a lock -- an int read is atomic under the GIL, and the check only has to be eventually
 # right.
 captureGeneration = 0
+
+# On top of the two timeouts a grab can spend: cap.release(), which FFMPEG does not bound,
+# and the JPEG encode of the frame that came back, which is real work on a Pi at 4K.
+captureStopGrace = 3
+
+def captureStopBudget():
+    """How long stopCaptureLoop() waits for its worker.
+
+    Derived from what the worker can actually be inside, the same way roofStopBudget()
+    and environmentStopBudget() are. A flat 5s was shorter than one grab -- open and read
+    are rtspGrabTimeout each -- so against a camera that was not answering the join did
+    not occasionally expire, it expired every time, and every settings save abandoned a
+    worker and logged a warning that read like a fault.
+
+    Abandonment is still handled rather than prevented: FFMPEG may overrun its own
+    timeouts and DNS is bounded by nothing, so this makes the common case join cleanly and
+    leaves the generation check to cover the rest.
+    """
+    return 2 * rtspGrabTimeout + captureStopGrace
+
 def captureLoop(stopEvent, generation):
     """The capture worker. Its stop event and its identity are arguments, not globals.
 
@@ -319,7 +351,8 @@ def stopCaptureLoop():
         # a fresh one instead of clearing this, so a worker that cannot be joined below can
         # never be woken again by the next start.
         captureStopEvent.set()
-        captureThread.join(timeout=5)
+        budget = captureStopBudget()
+        captureThread.join(timeout=budget)
         if captureThread.is_alive():
             # Not fatal, unlike the roof's equivalent: this worker holds no lock anything
             # else needs, and grabRTSP releases its capture in a finally, so it leaves of its
@@ -327,9 +360,11 @@ def stopCaptureLoop():
             # nothing more in the meantime. Worth saying out loud all the same -- it means
             # the camera or the RTSP stack is not answering within the join.
             logger.warning(
-                    "Capture worker did not stop within 5s and was abandoned. It is "
+                    "Capture worker did not stop within {:.1f}s and was abandoned. It is "
                     "superseded and will publish no further frames; it exits by itself once "
-                    "the grab it is stuck in returns")
+                    "the grab it is stuck in returns. Note it still holds an RTSP session "
+                    "until then, which the camera may count against its session "
+                    "limit".format(budget))
         else:
             logger.info("Capture loop stopped")
     # Cleared either way: a thread that outlived its join is not something anything should go
@@ -1060,6 +1095,25 @@ weatherThread = None
 # weatherCache, its timestamp, and drove updateFans() between them.
 weatherStopEvent = threading.Event()
 weatherGeneration = 0
+
+# On top of the scrape: parsing the payload, and the fan decision the worker makes right
+# after it -- which posts to a mailbox and never blocks on the roof, so it is small.
+weatherStopGrace = 3
+
+def weatherStopBudget():
+    """How long stopWeatherWorker() waits for its worker.
+
+    Derived from apiv1.WEATHER_HTTP_TIMEOUT rather than restating a number: the worker
+    spends its pass inside that request, and requests applies its timeout per phase, so a
+    station that accepts the connection and then says nothing costs twice it. A flat 5s
+    was shorter than a single phase, so the join expired on every settings save whenever
+    the station was slow.
+
+    DNS is not covered by the requests timeout at all, so this can still be overrun; that
+    is what the generation check is for.
+    """
+    return 2 * apiv1.WEATHER_HTTP_TIMEOUT + weatherStopGrace
+
 weatherCacheLock = threading.Lock()
 weatherCache = None
 # time.monotonic(); 0.0 means nothing is cached. See environmentLastData["timestamp"].
@@ -1155,12 +1209,13 @@ def stopWeatherWorker():
     if weatherThread is not None and weatherThread.is_alive():
         logger.info("Stopping weather thread")
         weatherStopEvent.set()
-        weatherThread.join(timeout=5)
+        budget = weatherStopBudget()
+        weatherThread.join(timeout=budget)
         if weatherThread.is_alive():
             logger.warning(
-                    "Weather worker did not stop within 5s and was abandoned. It is "
+                    "Weather worker did not stop within {:.1f}s and was abandoned. It is "
                     "superseded and will publish nothing more; it exits by itself once the "
-                    "scrape it is stuck in times out")
+                    "scrape it is stuck in times out".format(budget))
         else:
             logger.info("Weather thread stopped")
     # Cleared either way, as in stopCaptureLoop. Note what this costs: weatherWarmingUp()

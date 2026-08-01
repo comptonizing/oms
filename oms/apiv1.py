@@ -10,6 +10,14 @@ logger = logging.getLogger(__name__)
 
 __base = "/api/v1/"
 
+# How long a scrape of the weather station may take. Named rather than inline because
+# oms/oms derives the weather worker's stop budget from it: the worker sits inside this
+# call, so a join that has to outlast a scrape has to be sized against this number, and
+# the two must not be able to drift apart. Note requests applies it per phase -- connect
+# and read get one each -- so the worst case is twice this, and DNS resolution is not
+# covered by it at all.
+WEATHER_HTTP_TIMEOUT = 10
+
 @app.get(__base + "id")
 def id():
     logger.debug("id endpoint call")
@@ -27,7 +35,7 @@ def weather():
                 )
     try:
         logger.debug("Getting weather from {}".format(url))
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=WEATHER_HTTP_TIMEOUT)
     except Exception as e:
         logger.error("Error getting weather: {}".format(e))
         return JSONResponse(
