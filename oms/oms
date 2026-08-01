@@ -228,6 +228,10 @@ def createErrorImage(text: str):
 # string rather than a PIL image on purpose -- see encodeImage() for what handing the
 # latter to ui.image costs on the event loop.
 last_stream_image = None
+# time.monotonic() of the last frame publish (real or error), 0.0 until the first one.
+# Read by updateStream() to judge staleness -- see last_stream_image's own comment above
+# for why a failed grab still counts as a publish.
+last_stream_image_time = 0.0
 last_stream_image_lock = threading.Lock()
 captureThread = None
 # The current capture worker's stop event, and only that. startCaptureLoop() gives each new
@@ -259,7 +263,7 @@ def captureLoop(stopEvent, generation):
     for the stream ..." indefinitely and the traceback would go to threading.excepthook on
     stderr rather than through the logger. One bad pass costs a pass.
     """
-    global last_stream_image
+    global last_stream_image, last_stream_image_time
     while not stopEvent.is_set():
         if generation != captureGeneration:
             logger.warning("Capture worker {} superseded by {}, exiting".format(
@@ -292,6 +296,7 @@ def captureLoop(stopEvent, generation):
                 break
             with last_stream_image_lock:
                 last_stream_image = frame
+                last_stream_image_time = time.monotonic()
         except Exception as e:
             # last_stream_image is deliberately left alone: whatever it holds is a real
             # frame from a pass that worked, and it ages out through the UI's own staleness
@@ -2174,9 +2179,14 @@ def main():
                     status_indicators["pc"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'left: 6%; top: 35%; width: 8%').on("click", lambda: processClick("pc"))
                     with status_indicators["pc"]:
                         ui.label("PC")
+                    status_roof_stale = ui.label("").classes("absolute text-red-500 text-sm whitespace-nowrap") \
+                            .style("top: 100%; left: 50%; transform: translate(-50%, 0.5rem);")
+                    status_roof_stale.set_visibility(False)
                 with ui.card().classes("w-full"):
                     status_stream_image = ui.image(createErrorImage("Initializing ...")).classes("w-full").props('no-transition no-spinner')
                     status_stream_message = makeUnavailableMessage("videocam_off")
+                    status_stream_stale = ui.label("").classes("w-full text-center text-red-500")
+                    status_stream_stale.set_visibility(False)
                 with ui.card().classes("w-full"):
                     # No source yet: updateAllskyImages() fills it in below, so a browser
                     # never requests an image URL that is known to be unreachable.
@@ -2188,14 +2198,20 @@ def main():
                 with ui.card().classes("w-full lg:col-span-1"):
                     weather_allsky_image = ui.image().classes("w-full").props('no-transition no-spinner')
                     weather_allsky_message = makeUnavailableMessage("cloud_off")
-                with ui.grid().classes('grid-cols-2 lg:grid-cols-5 w-full gap-4 lg:col-span-2'):
-                    for thing in weather_items:
-                        with ui.card().classes("w-full"):
-                            ui.label(weather_items[thing])
-                            with ui.card_section().classes("w-full p-1"):
-                                weather_labels[thing] = ui.label("Loading ...").classes("w-full")
+                with ui.column().classes('w-full lg:col-span-2 gap-2'):
+                    with ui.grid().classes('grid-cols-2 lg:grid-cols-5 w-full gap-4'):
+                        for thing in weather_items:
+                            with ui.card().classes("w-full"):
+                                ui.label(weather_items[thing])
+                                with ui.card_section().classes("w-full p-1"):
+                                    weather_labels[thing] = ui.label("Loading ...").classes("w-full")
+                    weather_stale_label = ui.label("").classes("w-full text-right text-red-500")
+                    weather_stale_label.set_visibility(False)
 
-            weather_range_select = ui.select(list(weather_ranges.keys()), label="Time range", value="6h").classes("w-full md:w-64 bg-zinc-800")
+            with ui.row().classes('w-full items-center gap-4'):
+                weather_range_select = ui.select(list(weather_ranges.keys()), label="Time range", value="6h").classes("w-full md:w-64 bg-zinc-800")
+                weather_plot_stale_label = ui.label("").classes("text-red-500")
+                weather_plot_stale_label.set_visibility(False)
             weather_plots = {}
             with ui.grid().classes('grid-cols-1 lg:grid-cols-2 w-full gap-4'):
                 with ui.card().classes('w-full'):
@@ -2328,13 +2344,35 @@ def main():
 
         # TODO blinking arrows are missing
 
+    def updateRoofStaleness():
+        """Shows/hides the "last updated" label under the roof diagram.
 
+        Ticks on its own timer rather than off the roofUpdate event: a worker that has
+        gone silent -- the one case this exists to catch -- never fires that event again,
+        so nothing event-driven would ever notice. getRoofState() is read straight from
+        the worker's own publish, independent of whatever this client last happened to be
+        shown.
+        """
+        status, age = getRoofState()
+        if status is None:
+            # Nothing published yet, or the roof was torn down -- updateRoofIcons()
+            # already grays the whole diagram out for this, and there is no real
+            # last-known age to report alongside it.
+            status_roof_stale.set_visibility(False)
+            return
+        if age > roofStateMaxAge:
+            status_roof_stale.set_text("last updated {}s ago".format(int(age)))
+            status_roof_stale.set_visibility(True)
+        else:
+            status_roof_stale.set_visibility(False)
 
     def updateStream():
         reason = cctvUnavailableReason()
+        frameTime = None
         if reason is None:
             with last_stream_image_lock:
                 frame = last_stream_image
+                frameTime = last_stream_image_time
             if frame is None:
                 # The worker has not come back with anything yet -- either it has just
                 # started, or the camera was only just switched on and is still booting.
@@ -2342,6 +2380,18 @@ def main():
             else:
                 status_stream_image.set_source(frame)
         showUnavailable(status_stream_image, status_stream_message, reason)
+        # Only judged while the image itself is on screen: showUnavailable() already
+        # explains an unconfigured or not-yet-arrived stream, and a second label saying
+        # the same thing in different words would only be noise.
+        if reason is None and frameTime:
+            age = time.monotonic() - frameTime
+            if age > numericSetting("stream_refresh", 5) * 3:
+                status_stream_stale.set_text("last updated {}s ago".format(int(age)))
+                status_stream_stale.set_visibility(True)
+            else:
+                status_stream_stale.set_visibility(False)
+        else:
+            status_stream_stale.set_visibility(False)
 
     def updateAllskyImages():
         reason = allskyImageUnavailableReason()
@@ -2507,6 +2557,23 @@ def main():
     # replacing it one indivisible step.
     plotRun = Container()
     plotLock = asyncio.Lock()
+    # time.monotonic() of the last successful plot draw, or 0.0 if there has never been
+    # one. Separate from plotRun, which tracks the pass in flight rather than the last
+    # one to finish.
+    lastPlotDraw = Container(0.0)
+
+    def updatePlotStaleness():
+        ts = lastPlotDraw.get()
+        if not ts:
+            weather_plot_stale_label.set_visibility(False)
+            return
+        age = time.monotonic() - ts
+        maxAge = numericSetting("weather_plot_refresh", 60) * 3
+        if age > maxAge:
+            weather_plot_stale_label.set_text("last updated {}s ago".format(int(age)))
+            weather_plot_stale_label.set_visibility(True)
+        else:
+            weather_plot_stale_label.set_visibility(False)
 
     async def updatePlots(*, supersede=True):
         """Redraws the plots. Latest wins, unless the caller asks not to.
@@ -2628,17 +2695,18 @@ def main():
         # One API for the whole pass, so the fifteen queries below are answered by one
         # client and cannot straddle two. Which client it was matters in the handler.
         api = query_api.get()
-        if api is None:
-            # No database configured at all. Silently blank plots look like a fault that
-            # swallowed its own error, so say what is missing and where to fix it.
-            await blankPlots('No database configured (see Settings)')
-            return
         try:
+            if api is None:
+                # No database configured at all. Silently blank plots look like a fault
+                # that swallowed its own error, so say what is missing and where to fix it.
+                await blankPlots('No database configured (see Settings)')
+                return
             for plot in weather_plots.values():
                 plot.figure.layout.annotations = []
                 plot.figure.update_xaxes(visible=True)
                 plot.figure.update_yaxes(visible=True)
             await _updatePlots(api)
+            lastPlotDraw.set(time.monotonic())
         except Exception as e:
             if query_api.get() is not api:
                 # Not a database fault: the client this pass was querying was closed
@@ -2649,6 +2717,11 @@ def main():
                 return
             logger.error(f"Error updating weather plots: {e}")
             await blankPlots('No data available (check logs)')
+        finally:
+            # Runs on every path, including cancellation: whether this pass drew, failed,
+            # or was superseded, the label must reflect the true age of the last drawing
+            # that actually finished, not the outcome of this particular attempt.
+            updatePlotStaleness()
 
     # Tailwind's text colours are mutually exclusive, so a new one has to take the old
     # one off the element: which of two present classes wins is decided by stylesheet
@@ -2680,17 +2753,27 @@ def main():
             for thing in weather_labels.values():
                 thing.set_text("N/A")
                 thing.classes(labelSize + " text-gray-500", remove=weather_label_colors)
+            weather_stale_label.set_visibility(False)
             return
         with weatherCacheLock:
             d = weatherCache
-            weatherAge = time.monotonic() - weatherCacheTimestamp
+            cacheTimestamp = weatherCacheTimestamp
+        weatherAge = time.monotonic() - cacheTimestamp
         weatherMaxAge = numericSetting("weather_refresh", 5) * 3
         if d is None or weatherAge > weatherMaxAge:
             logger.warning("No recent weather data available")
             for thing in weather_labels.values():
                 thing.set_text("Error")
                 thing.classes(labelSize + " text-red-500", remove=weather_label_colors)
+            # 0.0 means the cache has never held anything at all, so there is no real
+            # last-known age to report -- "Error" above already says all there is to say.
+            if cacheTimestamp > 0.0:
+                weather_stale_label.set_text("last updated {}s ago".format(int(weatherAge)))
+                weather_stale_label.set_visibility(True)
+            else:
+                weather_stale_label.set_visibility(False)
             return
+        weather_stale_label.set_visibility(False)
         # Coerced up front, and every block below tests for None: a field the station
         # left out or sent as null shows as absent on its own label. Comparing it against
         # a threshold raises, and one raise used to cost every field after it its update
@@ -2862,6 +2945,10 @@ def main():
                 logger.warning("No usable {} set, {} will not refresh".format(setting, name))
                 continue
             timers[name] = ui.timer(interval, callback, immediate=False)
+        # Roof staleness has no configured interval to key off -- roofStateMaxAge is a
+        # fixed 5s threshold, not a setting -- so it is not in the table above and ticks
+        # on its own short, fixed cadence instead.
+        timers["update_roof_staleness"] = ui.timer(1.0, updateRoofStaleness, immediate=False)
 
     def makeInfluxClient():
         oldClient = influx_client.get()
@@ -2891,6 +2978,7 @@ def main():
         updateStream()
         updateAllskyImages()
         updateWeather()
+        updateRoofStaleness()
         # A database entered (or cleared) just now changes what the plots should say, and
         # they would otherwise keep the old message until their next tick a minute away.
         spawn(updatePlots())
@@ -2914,6 +3002,7 @@ def main():
         # this is the path that had no such event to receive. getRoofState() returns None
         # once the timestamp is zeroed, and updateRoofIcons handles None.
         updateRoofIcons(getRoofState()[0])
+        updateRoofStaleness()
         # Drawn once here rather than left blank until the first timer tick, which is a
         # whole plot interval away -- a minute of empty plots on a page that has just
         # loaded looks like a fault. Cheap to do: a pass this early is the only one
