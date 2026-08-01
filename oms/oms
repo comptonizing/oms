@@ -170,7 +170,7 @@ def spawn(coro):
 # captureStopBudget() is derived from it: the capture worker sits inside grabRTSP, so the
 # join that has to outlast a grab must be sized against this number and cannot be allowed
 # to drift away from it.
-rtspGrabTimeout = 5
+rtspGrabTimeout = 10
 
 def grabRTSP(url: str, timeout=rtspGrabTimeout):
     logger.debug("Grabbing frame from {}".format(url))
