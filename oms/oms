@@ -1441,13 +1441,23 @@ def serviceRoofOnce(roofInstance, generation):
     Works on the roofInstance its caller was given rather than on roof.Roof.get(): the
     singleton can be replaced under a worker that outlived its stopRoof(), and such a
     worker must not end up driving the roof that replaced it.
+
+    Returns False when the lock could not be taken, True otherwise. That return is what
+    lets roofLoop() count a timeout as a failure: it used to return None here and the
+    loop read that as success, reset its failure count and never backed off -- so an
+    abandoned worker holding the lock cost a blocking acquire and a log record every
+    roofLockTimeout seconds, indefinitely. Being superseded returns True on purpose: the
+    loop's own generation check ends it on the next pass, and inflating the backoff of a
+    worker that is leaving would only delay its exit.
     """
     global lastRoofState, lastRoofStateTime, lastRoofIconUpdate
     log = DeferredLog()
     event = DeferredEvents()
     if not roofLock.acquire(timeout=roofLockTimeout):
-        logger.warning("Timeout acquiring roof lock for status poll")
-        return
+        # Reported by the caller, not here: this is the failure that repeats every poll
+        # for as long as the lock is held, and it has to go through the same rate limit
+        # as the exceptions rather than emitting a blocking log write each time.
+        return False
     try:
         status = roofInstance.getStatus()
         if generation != roofGeneration:
@@ -1456,7 +1466,7 @@ def serviceRoofOnce(roofInstance, generation):
             # here would either drop them or run them against a roof that is being
             # replaced. The worker that replaced this one carries them out instead.
             log(logging.INFO, "Roof worker superseded mid-poll, discarding the result")
-            return
+            return True
         # Taken after the poll, so that a command posted while it was in flight is
         # picked up now, and so a failed poll leaves the mailbox untouched for the
         # next attempt. A command that fails once it has been taken is reported and
@@ -1479,7 +1489,7 @@ def serviceRoofOnce(roofInstance, generation):
         # Checked once more: a command can take a second or two, and being replaced during
         # one must not let this thread publish over what its replacement has written.
         logger.info("Roof worker superseded, not publishing its last poll")
-        return
+        return True
     changed = status != lastRoofState
     lastRoofState = status
     lastRoofStateTime = time.monotonic()
@@ -1487,6 +1497,7 @@ def serviceRoofOnce(roofInstance, generation):
     if changed or now - lastRoofIconUpdate > roofIconUpdateInterval:
         triggerEvent("roofUpdate", status)
         lastRoofIconUpdate = now
+    return True
 
 def roofLoop(stopEvent, roofInstance, generation):
     """The roof worker. Everything it needs is an argument, nothing is looked up.
@@ -1520,13 +1531,22 @@ def roofLoop(stopEvent, roofInstance, generation):
                     "Roof worker {} superseded by {}, exiting".format(generation, roofGeneration))
             break
         try:
-            serviceRoofOnce(roofInstance, generation)
-            failures = 0
-        except Exception as e:
-            failures += 1
             # Logging is a blocking write, so a board that is down must not be
             # allowed to emit one record per poll: that would stall this loop on the
             # log handler on top of whatever is already wrong with the serial port.
+            # Both kinds of failure go through the one counter and the one rate limit --
+            # a lock the poll could not take is as much a failed poll as an exception,
+            # and it is the kind that repeats for as long as the trouble lasts.
+            if serviceRoofOnce(roofInstance, generation):
+                failures = 0
+            else:
+                failures += 1
+                if failures == 1 or failures % roofPollLogEvery == 0:
+                    logger.warning(
+                            "Timeout acquiring roof lock for status poll "
+                            "({} in a row)".format(failures))
+        except Exception as e:
+            failures += 1
             if failures == 1 or failures % roofPollLogEvery == 0:
                 logger.error("Error in roof thread ({} in a row): {}".format(failures, e))
         now = time.monotonic()
@@ -1875,11 +1895,31 @@ def main():
             # operator keeps what they typed and can correct it in place.
             ui.notify("Not saved: " + "; ".join(problems), type="negative", multi_line=True)
             return
-        for thing in settings.keys():
-            logger.debug("Setting {}: {}".format(thing, settings[thing].value))
-            s.p(thing, settings[thing].value)
-        await initStuff()
-        triggerEvent("updateSettings")
+        # Applying takes ten to fifteen seconds -- two serial ports re-opened, three
+        # workers stopped and started -- and it used to do that with the button still
+        # live and nothing on screen to say anything was happening. Every impatient
+        # click queued another complete re-initialization behind initLock: the roof
+        # torn down and rebuilt again, and the environment port re-opened again, which
+        # asserts DTR and resets the board on the other end of it. The loading state
+        # lasts the whole pass; the notification only announces it, which is why both
+        # are here.
+        saveButton.disable()
+        saveButton.props("loading")
+        ui.notify("Applying settings ...", type="info")
+        try:
+            for thing in settings.keys():
+                logger.debug("Setting {}: {}".format(thing, settings[thing].value))
+                s.p(thing, settings[thing].value)
+            await initStuff()
+            triggerEvent("updateSettings")
+            # Says the pass finished, not that every part of it worked: initStuff()
+            # reports a step that failed on its own, through its own notification.
+            ui.notify("Settings applied", type="positive")
+        finally:
+            # In a finally so a failure cannot leave the button dead for the rest of the
+            # session -- there is no other way back from that but a page reload.
+            saveButton.props(remove="loading")
+            saveButton.enable()
 
     weather_items = {
             "env_temperature": "Temperature",
@@ -2130,7 +2170,9 @@ def main():
                         with ui.card_section().classes("w-full"):
                             settings["pc_pin"] = boundedNumber("Pin", "pc_pin", step=1, format='%d')
                             settings["pc_init"] = ui.select(["off", "on", "last"], value=s.q("pc_init", fallback="off"))
-            ui.button("Save & apply", on_click=saveSettings)
+            # Kept in a name so saveSettings() can disable it while it applies. The
+            # closure resolves it at click time, which is necessarily after this line.
+            saveButton = ui.button("Save & apply", on_click=saveSettings)
 
 
     def updateButtons():
@@ -2864,6 +2906,17 @@ def startWorkers():
 # loop the app has; a test process that runs several loops has to replace it between them.
 initLock = asyncio.Lock()
 
+# Set once the shutdown handler starts, so an initStuff() that has not begun yet returns
+# instead of rebuilding what is being torn down. Read and written on the event loop only.
+shuttingDown = False
+
+# How long shutdown() waits for a settings save to finish applying before tearing down
+# underneath it. A full initStuff() is ten to fifteen seconds -- stopRoof alone can spend
+# five joining its worker and five more on roofLock -- so this has to be comfortably more
+# than that, and still bounded: a wedged serial port must not be able to hold the process
+# open against whatever grace period the service manager allows.
+shutdownInitLockTimeout = 20
+
 async def initStuff():
     """(Re-)initializes the roof, the switches and the background workers.
 
@@ -2890,8 +2943,16 @@ async def initStuff():
     already in storage before saveSettings() gets here, so a second save that lands while
     the first is still applying has its values picked up by whichever pass reads them
     next. What is guaranteed is that no two passes ever run at the same time.
+
+    A pass that only gets the lock after shutdown() has started does nothing at all.
+    Re-opening two serial ports and starting three workers while the teardown that was
+    meant to be final is running would leave the process exiting with a roof it had
+    already switched off -- see shutdown().
     """
     async with initLock:
+        if shuttingDown:
+            logger.info("Shutting down, not applying settings")
+            return
         try:
             await asyncio.to_thread(makeRoof)
         except Exception as e:
@@ -2931,23 +2992,49 @@ async def shutdown():
     stopRoof and anything landing after it belongs to a roof that no longer exists, in a
     process that is exiting.
 
+    That last argument holds only while nothing re-creates the roof afterwards, and a
+    settings save in flight does exactly that: makeRoof() would take roofLock after this
+    handler released it, build a fresh Roof, open the port and start a worker -- after the
+    teardown had already switched the fans off and stopped the weather worker. The process
+    would then exit with the port open and the fans running, and nothing left to switch
+    them off, since RPi.GPIO leaves pin state untouched at exit. So the teardown runs under
+    initLock, and shuttingDown stops any pass that has not started yet. The wait is bounded
+    and proceeds anyway on expiry: an exit that cannot complete is worse than the race.
+
     asyncio.to_thread rather than run.io_bound: NiceGUI tears down its own executor on
     shutdown. Failures are collected rather than raised, because one teardown that throws
     must not leave the other three unreported.
     """
-    stops = (
-            ("capture loop", stopCaptureLoop),
-            ("environment worker", stopEnvironmentWorker),
-            ("weather worker", stopWeatherWorker),
-            ("roof", stopRoof),
-            )
-    results = await asyncio.gather(
-            *(asyncio.to_thread(stop) for _, stop in stops),
-            return_exceptions=True
-            )
-    for (name, _), result in zip(stops, results):
-        if isinstance(result, BaseException):
-            logger.error("Error stopping {}: {}".format(name, result))
+    global shuttingDown
+    # Before the lock is even attempted, so a save already waiting on initLock finds it
+    # set the moment it gets in rather than starting a re-initialization behind us.
+    shuttingDown = True
+    holdingInitLock = False
+    try:
+        await asyncio.wait_for(initLock.acquire(), timeout=shutdownInitLockTimeout)
+        holdingInitLock = True
+    except asyncio.TimeoutError:
+        logger.error(
+                "Settings were still being applied {}s into shutdown; tearing down "
+                "anyway. The roof may be left as that pass configured it".format(
+                    shutdownInitLockTimeout))
+    try:
+        stops = (
+                ("capture loop", stopCaptureLoop),
+                ("environment worker", stopEnvironmentWorker),
+                ("weather worker", stopWeatherWorker),
+                ("roof", stopRoof),
+                )
+        results = await asyncio.gather(
+                *(asyncio.to_thread(stop) for _, stop in stops),
+                return_exceptions=True
+                )
+        for (name, _), result in zip(stops, results):
+            if isinstance(result, BaseException):
+                logger.error("Error stopping {}: {}".format(name, result))
+    finally:
+        if holdingInitLock:
+            initLock.release()
 
 @app.on_startup
 async def startup():

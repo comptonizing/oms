@@ -103,7 +103,29 @@ class Switch():
         logger.debug("Setting switch at pin {} to off".format(self.pin))
         self.setState(State.OFF)
 
+    def release(self):
+        """Performs the on-destroy write now, once, instead of leaving it to collection.
+
+        __del__ runs whenever the object is actually collected, which can be a long way
+        after its owner dropped it -- a roof's motion relays are held by any abandoned
+        roof worker, which was started with the Roof as an argument and keeps it until
+        its serial read returns. By then the pin may belong to something else: a roof
+        that has been unconfigured no longer protects its pins through pinUsedForRoof(),
+        so a switch can claim one, and a collection landing afterwards would drive that
+        switch's equipment to this switch's off state with only a debug line to show for
+        it. Releasing clears the intent, so a later collection does nothing.
+
+        The intent is dropped before the write is attempted, deliberately: a write that
+        raises must not leave a second attempt pending for __del__, which would fail the
+        same way later with nobody left to report it.
+
+        Idempotent, and safe on a switch that has no on-destroy state.
+        """
+        state = self.__onDestroy
+        self.__onDestroy = None
+        if state is not None:
+            self.setState(state)
+
     def __del__(self):
         logger.debug("Destroying switch at pin {}".format(self.pin))
-        if self.__onDestroy is not None:
-            self.setState(self.__onDestroy)
+        self.release()

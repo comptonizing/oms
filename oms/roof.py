@@ -84,6 +84,11 @@ class Roof():
         process exit, so a relay nobody switched off stays energized with no software
         left to switch it.
 
+        stopMotion() de-energizes the relays and releaseMotionRelays() then cancels the
+        write they would otherwise make when they are collected. Both are needed: the
+        first is the one that reports failures, the second is the one that makes the
+        timing deterministic, and this instance can outlive the call by minutes.
+
         _instance is cleared before anything is torn down, because writeCmd()
         reconnects by itself when __serial is None: a caller still holding the instance
         would otherwise reopen the port being closed here. Afterwards it fails fast
@@ -100,6 +105,10 @@ class Roof():
             instance.stopMotion()
         except Exception as e:
             logger.error("Error stopping roof motion while resetting: {}".format(e))
+        try:
+            instance.releaseMotionRelays()
+        except Exception as e:
+            logger.error("Error releasing roof motion relays while resetting: {}".format(e))
         try:
             instance.disconnect()
         except Exception as e:
@@ -156,6 +165,33 @@ class Roof():
                 errors.append("pin {}: {}".format(sw.pin, e))
         if errors:
             raise RuntimeError("Could not stop roof motion: " + "; ".join(errors))
+
+    def releaseMotionRelays(self):
+        """Settles the relays' pins now, so their collection can never move them later.
+
+        Switch.__del__ drives its pin to the switch's on-destroy state whenever the
+        instance is actually collected, and a Roof can outlive being dropped by a long
+        way: roofLoop() is started with the instance as an argument, so a worker that
+        stopRoof() could not join holds it until its serial read returns. Should the roof
+        have been unconfigured in the meantime, pinUsedForRoof() no longer protects these
+        four pins and a switch can claim one -- and the collection that follows would then
+        de-energize that switch's equipment, unasked, logged only at debug.
+
+        Called from reset() rather than folded into stopMotion(), which stopRoof() also
+        calls on a roof that is meant to keep working. Dropping the on-destroy state there
+        would take away the backstop for every teardown that is not a reset.
+
+        Every relay is attempted even if one fails, and the failures are reported
+        together, exactly as stopMotion() does.
+        """
+        errors = []
+        for sw in self.__motionRelays:
+            try:
+                sw.release()
+            except Exception as e:
+                errors.append("pin {}: {}".format(sw.pin, e))
+        if errors:
+            raise RuntimeError("Could not release roof motion relays: " + "; ".join(errors))
 
     def disconnect(self):
         if self.__serial is None:
