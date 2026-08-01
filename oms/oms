@@ -2903,6 +2903,39 @@ def main():
     influx_client = Container()
     query_api = Container()
 
+    def clearTimers():
+        """Retires this client's refresh timers, for good.
+
+        delete(), not cancel(). cancel() only sets Timer._is_canceled, and nicegui's
+        Timer._should_stop() (elements/timer.py) reads that *last*:
+
+            self.is_deleted or self.client.id not in Client.instances or super()...
+
+        so it dereferences the client weakref before it ever looks at the flag. A
+        cancelled timer is still parked in its asyncio.sleep and only re-tests that
+        condition once the sleep expires -- so if nicegui collects the client in
+        between, the middle term raises "The client this element belongs to has been
+        deleted", which escapes the loop and takes Timer._cleanup()'s parent_slot
+        assertion with it. That is the traceback cancelling these was meant to remove,
+        and cancelling does not remove it. The window is one interval wide, and
+        stream_refresh and weather_plot_refresh both go up to 600s.
+
+        delete() sets _deleted, which _should_stop() tests *first* and short-circuits
+        on without touching the client, which _cleanup() also tests before touching
+        parent_slot, and which nicegui reaches through _handle_delete ->
+        cancel(with_current_invocation=True). It also detaches the element: a cancelled
+        timer stayed in the page (and as a timer.js component in the browser) until its
+        sleep ran out, so every settings save left up to five of them behind per client.
+
+        Guarded per timer, so that one failure cannot leave the rest attached.
+        """
+        for name, timer in timers.items():
+            try:
+                timer.delete()
+            except Exception as e:
+                logger.warning("Error deleting the {} timer: {}".format(name, e))
+        timers.clear()
+
     def initTimers():
         """(Re-)creates the refresh timers, skipping the ones with no interval set.
 
@@ -2921,9 +2954,7 @@ def main():
         paint to the timers would mean an unconfigured refresh interval paints nothing
         at all rather than painting once.
         """
-        for thing in timers:
-            timers[thing].cancel()
-        timers.clear()
+        clearTimers()
         # (setting, callback, fallback). Only the plots carry a fallback, and it is a
         # local one at the single place that reads it, not a defaults table coming back:
         # a plot pass costs fifteen queries, so leaving it unset must not mean "as often
@@ -3013,13 +3044,11 @@ def main():
 
     def onDisconnect():
         updateCallbacks.pop(ui.context.client.id, None)
-        # Left running, these keep looping after the client is gone: the next tick's
-        # _can_start() awaits self.client, and once NiceGUI garbage-collects the
-        # disconnected client that dereferences a dead weakref and raises instead of
-        # returning, which is the "client ... has been deleted" traceback in the logs.
-        for timer in timers.values():
-            timer.cancel()
-        timers.clear()
+        # Left running, these keep looping after the client is gone, and once NiceGUI
+        # garbage-collects it the next tick dereferences a dead weakref and raises the
+        # "client ... has been deleted" traceback instead of stopping quietly. See
+        # clearTimers() for why that needs delete() and why cancel() does not do it.
+        clearTimers()
         oldClient = influx_client.get()
         if oldClient is not None:
             cancelPlots()
