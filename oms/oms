@@ -1148,7 +1148,7 @@ def updateFans():
     the roof. Both facts it needs -- whether the roof is shut and whether the fans are
     running -- come from the same snapshot, so they cannot disagree.
     """
-    if not roof.Roof.isInitialized():
+    if roofUnavailableReason() is not None:
         return
     if s.q("fan_mode", fallback="off") != "auto":
         return
@@ -1354,6 +1354,29 @@ def getRoofState():
     if lastRoofStateTime == 0.0:
         return None, 0.0
     return lastRoofState, time.monotonic() - lastRoofStateTime
+
+def roofUnavailableReason():
+    """Why a roof command cannot be carried out, or None if it can.
+
+    Asks whether anything will *execute* the command, not merely whether a Roof object
+    exists. The two come apart on one path: makeRoof() returns False on a roofLock
+    timeout before it ever reaches Roof.reset(), so the previous instance survives with
+    its worker already joined and its handle cleared by stopRoof(). isInitialized()
+    then answers True for a roof nothing is polling, and a command posted into the
+    mailbox has no worker left to drain it -- the caller sees nothing wrong and nothing
+    happens.
+
+    roofThread is the honest test: roofLoop() is the mailbox's only consumer, and
+    stopRoof() clears the handle whether it joined the worker or abandoned it. Read
+    without a lock, exactly as weatherWarmingUp() reads weatherThread -- a reference
+    read is atomic under the GIL and this only has to be eventually right.
+    """
+    if not roof.Roof.isInitialized():
+        return "Roof not initialized"
+    thread = roofThread
+    if thread is None or not thread.is_alive():
+        return "Roof worker is not running"
+    return None
 
 # Work for the roof worker to carry out between status polls. The worker owns the
 # serial port on its own thread, so nothing else ever has to wait on roofLock to
@@ -1643,7 +1666,15 @@ def makeRoof():
     log = DeferredLog()
     event = DeferredEvents()
     if not roofLock.acquire(timeout=roofLockTimeout):
-        logger.error("Timeout acquiring roof lock while (re-)initializing roof")
+        # The old Roof instance survives this return -- reset() is a few lines below,
+        # inside the lock this call could not get -- so isInitialized() alone would
+        # still read True here. roofUnavailableReason() covers exactly this: roofThread
+        # is already None from stopRoof() above, so a fan command posted after this
+        # point is refused rather than silently dropped into a mailbox nothing drains.
+        msg = ("Timeout acquiring roof lock while (re-)initializing roof; the roof stays "
+               "unusable until the next successful save")
+        logger.error(msg)
+        triggerEvent("error", msg)
         triggerEvent("roofUpdate", None)
         return False
     try:
@@ -1720,9 +1751,14 @@ def setFans(mode, auto=False):
         logger.error(f"Ignoring unknown fan mode {mode}")
         triggerEvent("fanError", mode, "Unknown fan mode")
         return
-    if not roof.Roof.isInitialized():
-        logger.debug("Roof not initialized, ignoring")
-        triggerEvent("fanError", mode, "Roof not initialized")
+    reason = roofUnavailableReason()
+    if reason is not None:
+        # Posting anyway would drop the command silently -- roofUnavailableReason()
+        # covers the roof-worker-not-running case getRoofState() cannot: isInitialized()
+        # alone would still be true for a Roof left behind by a makeRoof() that timed out
+        # taking roofLock, and the mailbox would then have no worker left to drain it.
+        logger.debug(f"Not requesting fans {mode}: {reason}")
+        triggerEvent("fanError", mode, reason)
         return
     logger.info(f"Requesting fans {mode}")
     postRoofCommand("fans", (mode, auto))
@@ -1944,8 +1980,9 @@ def main():
             }
 
     def processClickFan():
-        if not roof.Roof.isInitialized():
-            ui.notify("Roof not initialized", type="negative")
+        reason = roofUnavailableReason()
+        if reason is not None:
+            ui.notify(reason, type="negative")
             return
         with ui.dialog() as dialog, ui.card():
             ui.label("Fan settings")
