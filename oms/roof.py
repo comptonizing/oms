@@ -61,6 +61,9 @@ class RoofState(Enum):
 
 class Roof():
     _instance = None
+    # writeCmd()'s default retry count, named so oms/oms's roofStopBudget() can derive the
+    # worst-case exchange time from the same number rather than a second, unrelated guess.
+    WRITE_RETRIES = 1
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is not None:
@@ -226,7 +229,7 @@ class Roof():
         self.__serial.write(payload)
         return self.__serial.read(size)
 
-    def writeCmd(self, cmd, retries=1):
+    def writeCmd(self, cmd, retries=WRITE_RETRIES):
         payload = (1 << cmd.value).to_bytes(1, "big")
         lastError = None
         for attempt in range(1, retries + 2):

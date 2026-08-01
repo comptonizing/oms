@@ -1335,9 +1335,9 @@ class OwnerTrackingLock:
     def __enter__(self):
         # Bounded, and loud when it expires. An unbounded acquire would hang the calling
         # thread for as long as the holder stays wedged, with nothing in the log to say
-        # why -- every explicit acquire() call site already passes roofLockTimeout and
+        # why -- every explicit acquire() call site already passes roofStopBudget() and
         # reports the timeout, so `with roofLock:` must not be the one path that does not.
-        if not self.acquire(timeout=roofLockTimeout):
+        if not self.acquire(timeout=roofStopBudget()):
             raise TimeoutError("Timeout acquiring roofLock")
         return self
 
@@ -1348,7 +1348,20 @@ roofLock = OwnerTrackingLock()
 # Only the roof worker and the makeRoof()/stopRoof() lifecycle take this lock now, and
 # the lifecycle paths join the worker first, so it is contended only in the window
 # where that join timed out.
-roofLockTimeout = 5
+#
+# On top of the worst a hold can run: serviceRoofOnce can make two writeCmd() calls in one
+# lock hold -- the status poll, and a fan command taken from the mailbox -- and each one
+# retries once, so the hold is bounded by two calls' worth of (WRITE_RETRIES + 1) attempts,
+# each up to roof_timeout. Derived rather than hardcoded for the same reason
+# environmentStopBudget() is: the flat 5s this used to be was sized against a 0.2s default
+# and only had a ~1s margin over the measured 4.00s hold at roof_timeout=2 -- a second
+# retry, a higher ceiling, or a real (non-pty) wedged bridge converts that silently into
+# abandoned workers and "fans and motion may still be on" at shutdown.
+roofStopGrace = 3
+
+def roofStopBudget():
+    attempts = roof.Roof.WRITE_RETRIES + 1
+    return 2 * attempts * numericSetting("roof_timeout", 0.2) + roofStopGrace
 roofThread = None
 # The current roof worker's stop event, and only that. makeRoof() replaces it for each new
 # worker rather than clearing it, and the worker itself holds its own reference, so
@@ -1506,14 +1519,14 @@ def serviceRoofOnce(roofInstance, generation):
     lets roofLoop() count a timeout as a failure: it used to return None here and the
     loop read that as success, reset its failure count and never backed off -- so an
     abandoned worker holding the lock cost a blocking acquire and a log record every
-    roofLockTimeout seconds, indefinitely. Being superseded returns True on purpose: the
+    roofStopBudget() seconds, indefinitely. Being superseded returns True on purpose: the
     loop's own generation check ends it on the next pass, and inflating the backoff of a
     worker that is leaving would only delay its exit.
     """
     global lastRoofState, lastRoofStateTime, lastRoofIconUpdate
     log = DeferredLog()
     event = DeferredEvents()
-    if not roofLock.acquire(timeout=roofLockTimeout):
+    if not roofLock.acquire(timeout=roofStopBudget()):
         # Reported by the caller, not here: this is the failure that repeats every poll
         # for as long as the lock is held, and it has to go through the same rate limit
         # as the exceptions rather than emitting a blocking log write each time.
@@ -1652,7 +1665,8 @@ def stopRoof():
         # fresh one instead of clearing this, so a worker that could not be joined below
         # cannot be woken up again by the next initialization.
         roofStopEvent.set()
-        roofThread.join(timeout=5)
+        budget = roofStopBudget()
+        roofThread.join(timeout=budget)
         if roofThread.is_alive():
             # Kept, not forgotten. It is superseded and cannot act, but it is still a
             # thread and it is probably holding roofLock inside a serial read, which is
@@ -1660,17 +1674,17 @@ def stopRoof():
             # bridge from something invisible into something the log states outright.
             abandonedRoofThreads.append(roofThread)
             logger.error(
-                    "Roof worker did not stop within 5s and was abandoned "
+                    "Roof worker did not stop within {:.1f}s and was abandoned "
                     "({} abandoned in total). The serial port is most likely wedged; "
                     "the roof may not come back before OMS is restarted".format(
-                        len(abandonedRoofThreads)))
+                        budget, len(abandonedRoofThreads)))
         else:
             logger.info("Roof stopped")
         # Either way this name no longer refers to a worker anything should join or
         # signal: a successful stop leaves none, and an abandoned one is tracked above.
         roofThread = None
     log = DeferredLog()
-    if roofLock.acquire(timeout=roofLockTimeout):
+    if roofLock.acquire(timeout=roofStopBudget()):
         try:
             if roof.Roof.isInitialized():
                 # Motion first: it is a local GPIO write that cannot hang, while
@@ -1702,7 +1716,7 @@ def makeRoof():
     config = readRoofConfig()
     log = DeferredLog()
     event = DeferredEvents()
-    if not roofLock.acquire(timeout=roofLockTimeout):
+    if not roofLock.acquire(timeout=roofStopBudget()):
         # The old Roof instance survives this return -- reset() is a few lines below,
         # inside the lock this call could not get -- so isInitialized() alone would
         # still read True here. roofUnavailableReason() covers exactly this: roofThread
