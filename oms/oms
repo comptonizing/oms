@@ -454,23 +454,22 @@ for thing in environmentParameterMap.values():
 # 0.0 still means "never read", since monotonic() is never 0 in practice.
 environmentLastData["timestamp"] = 0.0
 
-def closeEnvironmentResources():
-    """Closes the serial port and the InfluxDB client, and forgets both.
+def closeEnvironmentDatabase():
+    """Closes the InfluxDB write API and client, and forgets both.
 
-    Called from the two places that need it: setupEnvironmentWorker() before it rebuilds
-    them, which is what it always did inline, and stopEnvironmentWorker() once the worker
-    has gone, which never happened at all. Everything a restart already cleaned up was
-    simply leaked at shutdown -- the port is opened exclusive=True, so its flock was held
-    until the process exited, and whatever the write API still had batched was dropped.
+    Deliberately takes no lock and must not be called under one. environmentLock guards
+    the serial port, and none of this is the serial port -- while closing the write API
+    flushes whatever is still batched, which is bounded by max_close_wait at five
+    seconds against a database that has gone away. Holding the lock across that put a
+    five second network wait inside the critical section that stopEnvironmentWorker's
+    own bounded acquire has to outlast, and losing that race is what leaves the port
+    claimed until the process exits.
 
-    Each close is guarded separately: one that fails must not stop the others, since the
+    Each close is guarded separately: one that fails must not stop the other, since the
     whole point is to leave nothing behind. The write API goes first, because flushing it
     needs the client it belongs to.
-
-    The caller holds environmentLock. Closing a port another thread is reading from is not
-    something to do on the off chance.
     """
-    global environmentSerial, environmentInfluxClient, environmentWriteApi
+    global environmentInfluxClient, environmentWriteApi
     if environmentWriteApi is not None:
         try:
             environmentWriteApi.close()
@@ -483,6 +482,18 @@ def closeEnvironmentResources():
         except Exception as e:
             logger.warning("Error closing the environment database client: {}".format(e))
         environmentInfluxClient = None
+
+def closeEnvironmentSerial():
+    """Closes the serial port and forgets it.
+
+    The caller holds environmentLock. Closing a port another thread is reading from is
+    not something to do on the off chance -- which is exactly why this half is separate
+    from the database half above, and the only half that needs the lock at all.
+
+    Without this the port stays claimed: it is opened exclusive=True, so its flock
+    outlives the worker and is only released when the process exits.
+    """
+    global environmentSerial
     if environmentSerial is not None:
         try:
             environmentSerial.close()
@@ -509,43 +520,62 @@ def setupEnvironmentWorker(quiet=False):
             triggerEvent(event, msg)
 
     report("info", "Setting up environment sensor and database")
+
+    # Everything down to the acquire below used to run under environmentLock, and none
+    # of it is the board: settings reads, an InfluxDB client, a blocking log write and up
+    # to four triggerEvent calls, plus the write API flush inside the old
+    # closeEnvironmentResources(). environmentLock exists to say "nobody is mid-read on
+    # the port", and the longer it is held for other reasons the likelier
+    # stopEnvironmentWorker's bounded acquire is to expire -- which leaves the port
+    # claimed until OMS exits. Same rule the roof worker keeps with DeferredLog and
+    # DeferredEvents; here it is simpler to just not take the lock yet.
+    closeEnvironmentDatabase()
+    _db_url = s.q("weather_db_url", fallback=None)
+    _db_token = s.q("weather_db_token", fallback=None)
+    _db_org = s.q("weather_db_org", fallback=None)
+    if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
+        try:
+            environmentInfluxClient = InfluxDBClient(
+                    url = _db_url,
+                    token = _db_token,
+                    org = _db_org
+                )
+            environmentWriteApi = environmentInfluxClient.write_api(write_options=environmentWriteOptions)
+        except Exception as e:
+            report("error", f"Error setting up influx client: {e}", "error")
+            return False
+    else:
+        # Not an error: the sensor is still read and the fan logic still works,
+        # the readings just are not archived and the plots stay empty.
+        logger.debug("No weather database configured, environment readings will not be stored")
+
+    port = s.q("weather_environment_port", fallback=None)
+    baud = baudSetting("weather_environment_baud")
+    timeout = numericSetting("weather_environment_timeout", 2)
+    if port is None:
+        report("warning", "Environment serial port not available", "warning")
+        return False
+    if baud is None:
+        # Separate from the port, and fatal rather than fallen back on: opening at
+        # the wrong rate reads bytes that parse into plausible numbers, and those
+        # numbers drive the fans.
+        report("warning", "Environment baud rate is not one of the standard rates", "warning")
+        return False
+    report("info", "Opening serial port {}".format(port))
+
+    # The board, and only the board. Note the two returns above no longer close the
+    # serial port on their way out, where closeEnvironmentResources() used to: on both
+    # paths that reach this function -- startEnvironmentWorker(), straight after a
+    # stopEnvironmentWorker() that closed it, and the worker loop's retry, which only
+    # runs when environmentSerial is already None -- there is no port open to close.
     if not environmentLock.acquire(timeout=environmentStopBudget()):
         report("warning", "Error acquiring environment lock")
         return False
+    # Collected rather than reported in place, so that the UI event and the log write do
+    # not happen while the lock is held.
+    failure = None
     try:
-        closeEnvironmentResources()
-        _db_url = s.q("weather_db_url", fallback=None)
-        _db_token = s.q("weather_db_token", fallback=None)
-        _db_org = s.q("weather_db_org", fallback=None)
-        if _db_url not in [None, ""] and _db_token not in [None, ""] and _db_org not in [None, ""]:
-            try:
-                environmentInfluxClient = InfluxDBClient(
-                        url = _db_url,
-                        token = _db_token,
-                        org = _db_org
-                    )
-                environmentWriteApi = environmentInfluxClient.write_api(write_options=environmentWriteOptions)
-            except Exception as e:
-                report("error", f"Error setting up influx client: {e}", "error")
-                return False
-        else:
-            # Not an error: the sensor is still read and the fan logic still works,
-            # the readings just are not archived and the plots stay empty.
-            logger.debug("No weather database configured, environment readings will not be stored")
-
-        port = s.q("weather_environment_port", fallback=None)
-        baud = baudSetting("weather_environment_baud")
-        timeout = numericSetting("weather_environment_timeout", 2)
-        if port is None:
-            report("warning", "Environment serial port not available", "warning")
-            return False
-        if baud is None:
-            # Separate from the port, and fatal rather than fallen back on: opening at
-            # the wrong rate reads bytes that parse into plausible numbers, and those
-            # numbers drive the fans.
-            report("warning", "Environment baud rate is not one of the standard rates", "warning")
-            return False
-        report("info", "Opening serial port {}".format(port))
+        closeEnvironmentSerial()
         try:
             environmentSerial = Serial(port, baud, timeout=timeout, write_timeout=timeout, exclusive=True)
             environmentSerial.reset_input_buffer()
@@ -553,11 +583,13 @@ def setupEnvironmentWorker(quiet=False):
             if not environmentSerial.is_open:
                 raise RuntimeError("Unknown error")
         except SerialException as e:
-            report("warning", "Can not open serial port {}: {}".format(port, e), "error")
+            failure = "Can not open serial port {}: {}".format(port, e)
             environmentSerial = None
-            return False
     finally:
         environmentLock.release()
+    if failure is not None:
+        report("warning", failure, "error")
+        return False
     return True
 
 def environmentWorkerLoop(stopEvent, generation):
@@ -620,7 +652,12 @@ def environmentWorkerLoop(stopEvent, generation):
             if environmentSerial is None:
                 stopEvent.wait(numericSetting("weather_refresh", 5))
                 continue
-            if not environmentLock.acquire(timeout=10):
+            # Derived, not a flat 10: the holders this waits out are setup opening the
+            # port and a stop closing it, both of which are now bounded by the same
+            # validated timeout plus its grace. It was the last hardcoded lock budget
+            # left after the roof's and the stop path's were derived, and at 10 it was
+            # twice the longest hold it could ever be waiting for.
+            if not environmentLock.acquire(timeout=environmentStopBudget()):
                 logger.warning("Error acquiring environment lock")
                 continue
             lockAcquired = True
@@ -734,17 +771,22 @@ def stopEnvironmentWorker():
     # Cleared either way: a thread that outlived its join is not something anything should
     # go on to join or signal again.
     environmentThread = None
+    # The database first and without the lock: it is not the board, and closing the write
+    # API flushes whatever is batched, which against an unreachable InfluxDB costs the
+    # full max_close_wait. Holding environmentLock across that only made the acquire below
+    # -- the one that decides whether the port is ever released -- more likely to expire.
+    closeEnvironmentDatabase()
     # The worker can still be inside readline() if that join expired, and closing a port
     # out from under a thread that is reading it invites an obscure crash. The lock decides:
     # holding it means nobody is mid-read. If it cannot be had, say so plainly and leave
     # the port alone rather than forcing it.
     if not environmentLock.acquire(timeout=environmentStopBudget()):
         logger.error(
-                "Could not acquire the environment lock to close the serial port and "
-                "database client; the port stays claimed until OMS exits")
+                "Could not acquire the environment lock to close the serial port; "
+                "it stays claimed until OMS exits")
         return
     try:
-        closeEnvironmentResources()
+        closeEnvironmentSerial()
     finally:
         environmentLock.release()
 
@@ -1648,7 +1690,12 @@ def roofLoop(stopEvent, roofInstance, generation):
         now = time.monotonic()
         # Back off while the board is unhappy, so a dead port is polled every few
         # seconds rather than continuously.
-        nextPoll += roofPollPeriod * min(2 ** failures, roofPollBackoffMax)
+        # The exponent is capped as well as the result. failures climbs for as long as the
+        # board is down -- a day of it is ~170k consecutive failures -- and 2 ** that is a
+        # 17,000-bit integer built from scratch every pass only to be thrown away by the
+        # min(). 16 is already far past roofPollBackoffMax, so no value this can return
+        # changes.
+        nextPoll += roofPollPeriod * min(2 ** min(failures, 16), roofPollBackoffMax)
         if nextPoll <= now:
             # Fell behind: a poll overran its slot. Resync so catch-up polls cannot
             # run back to back and starve other threads of roofLock.
