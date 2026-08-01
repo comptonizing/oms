@@ -9,6 +9,7 @@ import asyncio
 import threading
 import base64
 import json
+from enum import Enum
 import cv2
 from parse import parse
 from PIL import Image, ImageDraw
@@ -61,6 +62,20 @@ settingBounds = {
         "weather_plot_refresh": (10, 600),
         "weather_environment_timeout": (2, 5),
         "roof_timeout": (0.1, 2),
+        # Motion budgets. roof_travel_timeout covers one half's whole motion in either
+        # direction -- kick, rod push and run for an open, run and tighten for a close --
+        # so it has to sit above the measured ~30 s of travel plus a worst-case rod phase.
+        "roof_travel_timeout": (60, 120),
+        # Never zero, and never short. The kick has to carry the half far enough from its
+        # closed position that the rod is not pushing against a half still hard on its
+        # seat -- do that and the rods snap off. 1.5 s is the measured minimum with buffer.
+        "roof_kick_time": (1.5, 4),
+        # Bounds the rod's whole stroke, which the firmware fixes at MAX_EXTENDED (20 s in
+        # roof/motor.h). The floor is above that on purpose: anything shorter would expire
+        # before the rod could possibly finish, so every open would fault.
+        "roof_rod_timeout": (25, 60),
+        "roof_close_overrun": (0, 5),
+        "roof_close_start_timeout": (5, 30),
         "roof_fan_change_delay": (0, 600),
         "weather_elevation": (0, 9000),
         "roof_fan_temp_min": (-50, 50),
@@ -1513,6 +1528,21 @@ lastRoofStateTime = 0.0
 # How stale the published state may be before a fan decision refuses to use it.
 roofStateMaxAge = 5
 
+# Which way each half is being driven, as last published by the roof worker. Kept beside
+# lastRoofState rather than folded into it because it is not in the status word at all:
+# the four motion relays are Pi GPIO and the Arduino cannot see them. Read lock-free, the
+# same way lastRoofState and roofThread already are.
+lastRoofDrive = {half: None for half in roof.RoofHalf}
+
+def getRoofDrive():
+    """Which way each half is being driven, as {RoofHalf: Direction | None}.
+
+    A copy, so a caller iterating it cannot see the worker swap it underneath. Reports the
+    relays, not the sequence: an arrow lit by this is showing that a contactor is closed,
+    which is the thing an operator actually wants to know.
+    """
+    return dict(lastRoofDrive)
+
 def getRoofState():
     """Returns (state, age in seconds) as last published by the roof worker.
 
@@ -1590,6 +1620,410 @@ roofPollBackoffMax = 10
 # smaller number keeps a dead board about as visible in the log as it used to be.
 roofPollLogEvery = 10
 
+class MotionPhase(Enum):
+    IDLE = 0
+    # Opening a half: the rod goes out the moment the half starts opening, alongside a
+    # short run that pays out belt; everything then holds until the rod has completed its
+    # stroke, and only after that does gravity get its run.
+    OPEN_KICK = 1
+    OPEN_SETTLE = 2
+    OPEN_RUN = 3
+    # Closing a half: confirm the rod is out of the way, pull the half up, then keep
+    # pulling briefly past the switches so it seats tight.
+    CLOSE_RODCLEAR = 4
+    CLOSE_RUN = 5
+    CLOSE_TIGHTEN = 6
+    FAULT = 7
+
+# How long to wait for a rod to confirm itself retracted before giving up. Derived from
+# the firmware rather than guessed: Motor::isRetracted() only answers true 20 s
+# (MAX_EXTENDED) after the last retract command, and extend() auto-retracts 20 s after the
+# extend, so the honest worst case is 40 s. This budget deliberately does not come out of
+# roof_travel_timeout -- it is a firmware wait, not motion, and nothing is energized during
+# it. In practice the roof has been open far longer than that and the phase falls straight
+# through.
+roofRodClearBudget = 45
+
+class RoofMotion:
+    """Where the roof sequence has got to. Owned by the roof worker thread.
+
+    Read from other threads only through getRoofDrive(), which reports the relays rather
+    than this. Nothing outside the worker writes it.
+    """
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.phase = MotionPhase.IDLE
+        self.action = None
+        self.half = None
+        self.queue = []
+        # The whole-half travel budget, and the current phase's own. Both are
+        # time.monotonic() stamps; None means "not started yet", which is how an
+        # energizing phase tells the difference between "waiting for the dead time to
+        # elapse" and "running".
+        self.deadline = None
+        self.phaseDeadline = None
+        # Whether this half's rod has been sent out yet. Opening starts it immediately, so
+        # this exists only to make that send happen exactly once per half.
+        self.rodSent = False
+        # Whether "the motor is now running" has been logged for this half. The run phases
+        # call drive() every tick, and one line per tick for two minutes would bury the
+        # transitions that actually matter.
+        self.runLogged = False
+
+    @property
+    def running(self):
+        return self.phase not in (MotionPhase.IDLE, MotionPhase.FAULT)
+
+roofMotion = RoofMotion()
+
+# The order the halves move in, and it is not symmetric. West opens first because the east
+# half cannot clear until it has; closing runs the other way for the same reason.
+roofMotionOrder = {
+        "open": [roof.RoofHalf.WEST, roof.RoofHalf.EAST],
+        "close": [roof.RoofHalf.EAST, roof.RoofHalf.WEST],
+        }
+
+def failRoofMotion(roofInstance, reason, log, event):
+    """Ends a motion badly: relays off, roof latched, operator told.
+
+    faultMotion() does the de-energizing and logs the reason itself, so this only adds the
+    phase the failure happened in -- which is the part that says what was being attempted.
+    """
+    phase = roofMotion.phase.name
+    try:
+        roofInstance.faultMotion(reason)
+    except Exception as e:
+        log(logging.ERROR, "Could not fault roof motion: {}".format(e))
+    log(logging.ERROR, "Roof motion failed in {}: {}".format(phase, reason))
+    event("roofMotionError", reason)
+    roofMotion.reset()
+    roofMotion.phase = MotionPhase.FAULT
+
+def enterMotionPhase(phase, log, detail):
+    """Moves to the next phase and says so. Every transition goes through here.
+
+    Roof motion is the one thing in OMS that can wreck the hardware, and it runs unattended
+    over minutes -- so the log has to be enough to reconstruct exactly what happened
+    afterwards, without a debug level being turned on first. INFO for that reason, and
+    through the deferred collector so the write still happens outside roofLock.
+    """
+    log(logging.INFO, "Roof {} [{}]: {} -> {} ({})".format(
+        roofMotion.action, roofMotion.half.value.lower(),
+        roofMotion.phase.name, phase.name, detail))
+    roofMotion.phase = phase
+
+def startRoofMotionHalf(now, log, event):
+    """Begins the next half's sequence, or ends the motion if there is none left."""
+    if not roofMotion.queue:
+        log(logging.INFO, "Roof {} complete".format(roofMotion.action))
+        action = roofMotion.action
+        roofMotion.reset()
+        event("roofMotionDone", action)
+        return action
+    roofMotion.half = roofMotion.queue.pop(0)
+    roofMotion.deadline = now + numericSetting("roof_travel_timeout", 90)
+    roofMotion.phaseDeadline = None
+    # Per half, not per motion: the second half gets its own rod push, and its own
+    # "now running" line.
+    roofMotion.rodSent = False
+    roofMotion.runLogged = False
+    if roofMotion.action == "open":
+        # Always through the kick. There is no skip-the-kick path any more: roof_kick_time
+        # has a floor of 1.5 s precisely because a rod pushing a half that is still hard on
+        # its seat breaks off, so "open without kicking first" is not a thing to offer.
+        roofMotion.phase = MotionPhase.OPEN_KICK
+    else:
+        roofMotion.phase = MotionPhase.CLOSE_RODCLEAR
+        # The rod wait is not motion, so it runs outside the travel budget. The budget is
+        # restarted when CLOSE_RUN actually energizes the relay.
+        roofMotion.deadline = None
+        roofMotion.phaseDeadline = now + roofRodClearBudget
+    log(logging.INFO, "Roof {}: starting {} half".format(
+        roofMotion.action, roofMotion.half.value.lower()))
+    return None
+
+def advanceRoofMotion(roofInstance, status, log, event):
+    """One step of the roof sequence. Runs on the worker thread with roofLock held.
+
+    Called on every tick, including one whose status poll failed -- timers still have to
+    fire and relays still have to come off when the board goes away. `status` is None on
+    such a tick, and the rule that follows from it is absolute: **a tick with no fresh
+    status may only stop relays or fault, never energize one.** Phases waiting on a switch
+    simply cannot progress, so they run to their deadline and fail, which is the right
+    answer for "the board vanished mid-travel".
+
+    Never blocks and never sleeps. Each call does at most one relay write and one serial
+    command, so the lock hold stays in milliseconds and roofStopBudget() stays honest --
+    which is the whole reason the sequence is a state machine rather than a function that
+    drives the roof and waits for it.
+    """
+    if not roofMotion.running:
+        return
+    if not roofInstance.motionReady:
+        # Faulted underneath us, almost certainly by a consistency check inside the
+        # getStatus() a few lines up the call stack. Everything is already de-energized.
+        log(logging.ERROR, "Roof motion abandoned in {}: {}".format(
+            roofMotion.phase.name, roofInstance.motionFaultReason))
+        event("roofMotionError", roofInstance.motionFaultReason)
+        roofMotion.reset()
+        roofMotion.phase = MotionPhase.FAULT
+        return
+
+    now = time.monotonic()
+    half = roofMotion.half
+    # Checked before any phase: a phase that cannot make progress -- a board that stopped
+    # answering, a half that is not moving -- has to end here rather than run on.
+    if roofMotion.deadline is not None and now > roofMotion.deadline:
+        failRoofMotion(roofInstance, "{} half did not finish its {} within {:.0f}s".format(
+            half.value.lower(), roofMotion.action,
+            numericSetting("roof_travel_timeout", 90)), log, event)
+        return
+
+    phase = roofMotion.phase
+
+    # A half that is already where it is being sent needs nothing done to it. Reachable
+    # whenever the roof was found part-way -- one half open, the other shut -- and without
+    # this an "open" would kick, rod and run an already-open half before noticing. Guarded
+    # on driving() so it only ever short-circuits a half nothing has energized yet.
+    if (status is not None
+            and phase in (MotionPhase.OPEN_KICK, MotionPhase.OPEN_SETTLE,
+                          MotionPhase.CLOSE_RODCLEAR)
+            and roofInstance.driving(half) is None):
+        target = (roof.RoofState.OPEN if roofMotion.action == "open"
+                  else roof.RoofState.CLOSED)
+        if roofInstance.halfPosition(half, status=status) is target:
+            log(logging.INFO, "Roof {}: {} half is already there".format(
+                roofMotion.action, half.value.lower()))
+            startRoofMotionHalf(now, log, event)
+            return
+
+    # The rod goes out the moment the half starts opening, not after the kick has finished.
+    # A half can stick a little way *past* its closed switches -- far enough for them to
+    # report clear, not far enough for gravity to take over -- so "the switches went clear"
+    # is not proof the half is free. Pushing from the start, and then holding until the rod
+    # has run its whole stroke, is what makes that guarantee real.
+    #
+    # Sent here rather than in startRoofMotionHalf() so that a half which is already open
+    # is skipped above without a pointless rod push, and so that the send has a status in
+    # hand and can be retried on the next tick if the board is not answering yet.
+    if (roofMotion.action == "open" and not roofMotion.rodSent
+            and phase in (MotionPhase.OPEN_KICK, MotionPhase.OPEN_SETTLE)):
+        if status is None:
+            return
+        log(logging.INFO, "Roof open: pushing the {} half off its seat".format(
+            half.value.lower()))
+        roofInstance.extendRod(half)
+        roofMotion.rodSent = True
+
+    if phase is MotionPhase.OPEN_KICK:
+        if roofMotion.phaseDeadline is None:
+            # Not running yet. drive() answers False while the half is still inside its
+            # dead time; the kick clock only starts once the relay is genuinely energized,
+            # so a kick is always its full length rather than however much of it was left
+            # after the dead time.
+            if status is not None and roofInstance.drive(half, roof.Direction.OPEN):
+                kick = numericSetting("roof_kick_time", 2)
+                roofMotion.phaseDeadline = now + kick
+                log(logging.INFO, "Roof open [{}]: driving OPEN for a {:.1f}s kick".format(
+                    half.value.lower(), kick))
+            return
+        if now < roofMotion.phaseDeadline:
+            return
+        roofInstance.stopHalf(half)
+        # From here the phase is bounded by the rod, not by the dead time. drive() enforces
+        # REVERSE_DEAD_TIME by itself when OPEN_RUN comes to energize the relay again, and
+        # a rod stroke is an order of magnitude longer than it anyway.
+        roofMotion.phaseDeadline = now + numericSetting("roof_rod_timeout", 30)
+        enterMotionPhase(MotionPhase.OPEN_SETTLE, log,
+                         "kick done, relays off, holding for the rod stroke")
+        return
+
+    if phase is MotionPhase.OPEN_SETTLE:
+        if roofMotion.phaseDeadline is None:
+            # Only reachable if the phase was entered without going through the kick, which
+            # nothing does now that roof_kick_time has a floor. Bounded anyway.
+            roofMotion.phaseDeadline = now + numericSetting("roof_rod_timeout", 30)
+            return
+        if status is None:
+            if now > roofMotion.phaseDeadline:
+                failRoofMotion(roofInstance,
+                        "no status while waiting for the {} rod to finish its stroke".format(
+                            half.value.lower()), log, event)
+            return
+        if roofInstance.rodExtendRequested(half, status=status):
+            # Still driving out. The firmware clears this bit when it auto-retracts at the
+            # end of the stroke (Motor::update(), MAX_EXTENDED), and that transition is the
+            # only "fully extended" signal the board offers -- there is no position sensor
+            # on the rod. Waiting for it is what distinguishes a half that has been properly
+            # shoved from one that merely twitched off its switches.
+            if now > roofMotion.phaseDeadline:
+                failRoofMotion(roofInstance,
+                        "{} rod did not finish its stroke within {:.0f}s".format(
+                            half.value.lower(), numericSetting("roof_rod_timeout", 30)),
+                        log, event)
+            return
+        # Stroke complete, and the rod is already on its way back under its own timer -- no
+        # retract is sent, since one now would only restart the firmware's 20 s
+        # confirmation clock for nothing.
+        if any(status[sw.bit] for sw in half.closedSwitches):
+            # The rod has pushed as hard as it is ever going to and the half is still on
+            # its seat. This is the "something is terribly wrong" case.
+            failRoofMotion(roofInstance,
+                    "{} half still reports closed after a full rod stroke".format(
+                        half.value.lower()), log, event)
+            return
+        roofMotion.phaseDeadline = None
+        enterMotionPhase(MotionPhase.OPEN_RUN, log,
+                         "rod stroke complete and the half is off its seat")
+        return
+
+    if phase is MotionPhase.OPEN_RUN:
+        if status is None:
+            return
+        if roofInstance.halfPosition(half, status=status) is roof.RoofState.OPEN:
+            roofInstance.stopHalf(half)
+            log(logging.INFO, "Roof open [{}]: fully open, relays off".format(
+                half.value.lower()))
+            startRoofMotionHalf(now, log, event)
+            return
+        if roofInstance.drive(half, roof.Direction.OPEN) and not roofMotion.runLogged:
+            roofMotion.runLogged = True
+            log(logging.INFO, "Roof open [{}]: driving OPEN, gravity has it".format(
+                half.value.lower()))
+        return
+
+    if phase is MotionPhase.CLOSE_RODCLEAR:
+        if status is None:
+            if now > roofMotion.phaseDeadline:
+                failRoofMotion(roofInstance,
+                        "no status while waiting for the {} rod to retract".format(
+                            half.value.lower()), log, event)
+            return
+        if roofInstance.rodRetracted(half, status=status):
+            roofMotion.deadline = now + numericSetting("roof_travel_timeout", 90)
+            roofMotion.phaseDeadline = None
+            enterMotionPhase(MotionPhase.CLOSE_RUN, log,
+                             "rod confirmed retracted, travel budget starts")
+            return
+        if not roofInstance.rodExtendRequested(half, status=status):
+            # Already on its way back; the firmware just has not confirmed it yet. Sending
+            # another retract would restart its 20 s confirmation timer for nothing.
+            if now > roofMotion.phaseDeadline:
+                failRoofMotion(roofInstance,
+                        "{} rod did not confirm retracted within {:.0f}s".format(
+                            half.value.lower(), roofRodClearBudget), log, event)
+            return
+        log(logging.INFO, "Roof close [{}]: retracting the rod before closing".format(
+            half.value.lower()))
+        roofInstance.retractRod(half)
+        return
+
+    if phase is MotionPhase.CLOSE_RUN:
+        if status is None:
+            return
+        if roofInstance.halfPosition(half, status=status) is roof.RoofState.CLOSED:
+            # Keep pulling. The board's switches are informational and the motor has its
+            # own internal end stop, so overrunning them is what seats the half tight.
+            roofMotion.phaseDeadline = now + numericSetting("roof_close_overrun", 2)
+            enterMotionPhase(MotionPhase.CLOSE_TIGHTEN, log,
+                             "closed switches engaged, pulling {:.1f}s past them".format(
+                                 numericSetting("roof_close_overrun", 2)))
+            return
+        if roofMotion.phaseDeadline is not None and now > roofMotion.phaseDeadline:
+            # The half never left its open position: the belt is slipping, the motor is
+            # not turning, or the drive is disconnected. Running it for the rest of the
+            # travel budget against a half that is not moving is exactly what must not
+            # happen, so this ends now rather than at the outer deadline.
+            failRoofMotion(roofInstance,
+                    "{} half still reports open {:.0f}s after closing started".format(
+                        half.value.lower(), numericSetting("roof_close_start_timeout", 10)),
+                    log, event)
+            return
+        started = roofInstance.drive(half, roof.Direction.CLOSE)
+        if started and roofMotion.phaseDeadline is None and not roofMotion.runLogged:
+            roofMotion.phaseDeadline = now + numericSetting("roof_close_start_timeout", 10)
+            roofMotion.runLogged = True
+            log(logging.INFO, "Roof close [{}]: driving CLOSE, pulling the half up".format(
+                half.value.lower()))
+        if started and roofMotion.phaseDeadline is not None and not any(
+                status[sw.bit] for sw in half.openSwitches):
+            # Confirmed moving. Retire the start check so it cannot fire later.
+            roofMotion.phaseDeadline = None
+            log(logging.INFO, "Roof close [{}]: confirmed off its open switches".format(
+                half.value.lower()))
+        return
+
+    if phase is MotionPhase.CLOSE_TIGHTEN:
+        if now < roofMotion.phaseDeadline:
+            return
+        roofInstance.stopHalf(half)
+        log(logging.INFO, "Roof close [{}]: seated and relays off".format(half.value.lower()))
+        startRoofMotionHalf(now, log, event)
+        return
+
+def executeMotionCommand(roofInstance, status, action, log, event):
+    """Starts, or stops, a roof motion. Runs with roofLock held on the worker thread."""
+    if action == "stop":
+        if not roofMotion.running:
+            log(logging.DEBUG, "No roof motion to stop")
+            return
+        log(logging.WARNING, "Roof motion stopped on request during {}".format(
+            roofMotion.phase.name))
+        roofInstance.stopMotion()
+        roofMotion.reset()
+        event("roofMotionStopped")
+        return
+    if not roofInstance.motionReady:
+        # The latch on the Roof is the authority here, not the phase: an operator can
+        # clear it, and this must then let a motion through.
+        log(logging.ERROR, "Refusing to {} the roof: motion is faulted ({})".format(
+            action, roofInstance.motionFaultReason))
+        event("roofMotionError", roofInstance.motionFaultReason)
+        return
+    if roofMotion.phase is MotionPhase.FAULT:
+        # Cleared on the Roof but the sequence still remembers how it ended. Drop it, so
+        # the refusal above is the only thing that ever blocks a motion.
+        roofMotion.reset()
+    if roofMotion.running:
+        log(logging.WARNING, "Refusing to {} the roof: a {} is already in progress".format(
+            action, roofMotion.action))
+        event("roofMotionError", "A roof motion is already in progress")
+        return
+    target = roof.RoofState.OPEN if action == "open" else roof.RoofState.CLOSED
+    if roofInstance.position(status=status) is target:
+        log(logging.INFO, "Roof is already {}".format(action))
+        event("roofMotionDone", action)
+        return
+    roofMotion.reset()
+    roofMotion.action = action
+    roofMotion.queue = list(roofMotionOrder[action])
+    log(logging.INFO, "Roof {} requested".format(action))
+    startRoofMotionHalf(time.monotonic(), log, event)
+
+def requestRoofMotion(action):
+    """Asks the roof worker to open, close or stop. Returns without touching the roof.
+
+    Fire and forget, exactly like setFans(): the worker owns the serial port and the
+    relays, and reports back through events. Nothing calls this yet -- the operator
+    controls, the API and the weather-driven close are all still to come -- but the
+    interface they will use is this one.
+    """
+    if action not in ("open", "close", "stop"):
+        logger.error("Ignoring unknown roof motion {}".format(action))
+        triggerEvent("roofMotionError", "Unknown roof motion")
+        return
+    reason = roofUnavailableReason()
+    if reason is not None:
+        # Posting anyway would drop the command into a mailbox with no worker to drain it,
+        # and the caller would see nothing wrong while nothing happened.
+        logger.warning("Not requesting roof {}: {}".format(action, reason))
+        triggerEvent("roofMotionError", reason)
+        return
+    logger.info("Requesting roof {}".format(action))
+    postRoofCommand("motion", action)
+
 def executeFanCommand(roofInstance, status, mode, auto, log, event):
     """Switches the fans unless the just-polled status says they are already there.
 
@@ -1643,7 +2077,7 @@ def serviceRoofOnce(roofInstance, generation):
     loop's own generation check ends it on the next pass, and inflating the backoff of a
     worker that is leaving would only delay its exit.
     """
-    global lastRoofState, lastRoofStateTime, lastRoofIconUpdate
+    global lastRoofState, lastRoofStateTime, lastRoofIconUpdate, lastRoofDrive
     log = DeferredLog()
     event = DeferredEvents()
     if not roofLock.acquire(timeout=roofStopBudget()):
@@ -1651,8 +2085,19 @@ def serviceRoofOnce(roofInstance, generation):
         # for as long as the lock is held, and it has to go through the same rate limit
         # as the exceptions rather than emitting a blocking log write each time.
         return False
+    drive = None
+    pollError = None
     try:
-        status = roofInstance.getStatus()
+        try:
+            status = roofInstance.getStatus()
+        except Exception as e:
+            # Caught rather than allowed to propagate, so that the motion machine below
+            # still runs on this tick. Its timers have to keep firing and its relays have
+            # to keep coming off when the board goes away -- that is precisely the moment
+            # a half must not be left driving. Re-raised after the lock is released, so
+            # the caller still counts and rate-limits the failure exactly as before.
+            status = None
+            pollError = e
         if generation != roofGeneration:
             # Superseded while this read was in flight. The mailbox is deliberately left
             # untouched: takeRoofCommands() removes what it hands out, so taking commands
@@ -1664,27 +2109,70 @@ def serviceRoofOnce(roofInstance, generation):
         # picked up now, and so a failed poll leaves the mailbox untouched for the
         # next attempt. A command that fails once it has been taken is reported and
         # dropped rather than retried, matching what the old blocking setFans() did.
-        commands = takeRoofCommands()
-        if "fans" in commands:
-            mode, auto = commands["fans"]
-            try:
-                newStatus = executeFanCommand(roofInstance, status, mode, auto, log, event)
-                if newStatus is not None:
-                    status = newStatus
-            except Exception as e:
-                log(logging.ERROR, f"Error switching fans {mode}: {e}")
-                event("fanError", mode, str(e))
+        #
+        # Only with a status in hand: every command is judged against the reading the
+        # poll just returned, and a motion started blind is a motion started against an
+        # unknown roof.
+        if status is not None:
+            commands = takeRoofCommands()
+            if "fans" in commands:
+                mode, auto = commands["fans"]
+                try:
+                    newStatus = executeFanCommand(roofInstance, status, mode, auto, log, event)
+                    if newStatus is not None:
+                        status = newStatus
+                except Exception as e:
+                    log(logging.ERROR, f"Error switching fans {mode}: {e}")
+                    event("fanError", mode, str(e))
+            if "motion" in commands:
+                action = commands["motion"]
+                try:
+                    executeMotionCommand(roofInstance, status, action, log, event)
+                except Exception as e:
+                    failRoofMotion(roofInstance, f"could not start roof {action}: {e}",
+                                   log, event)
+        try:
+            advanceRoofMotion(roofInstance, status, log, event)
+        except Exception as e:
+            # A relay write that raised, most likely. The roof is mid-motion with at
+            # least one contactor possibly still energized, so this cannot be logged and
+            # shrugged off: fault it, which de-energizes everything and refuses any
+            # further motion until an operator has looked.
+            failRoofMotion(roofInstance, f"error during roof motion: {e}", log, event)
+        drive = {half: roofInstance.driving(half) for half in roof.RoofHalf}
     finally:
         roofLock.release()
         log.flush()
         event.flush()
+    if pollError is not None:
+        # The drive state is published even so. It comes from the relays, not from the
+        # board, so a board that stopped answering says nothing about it -- and this is
+        # precisely the path on which the motion machine has just de-energized a half.
+        # Leaving it stale would keep an arrow pulsing for a roof that has already
+        # stopped, which is the one thing the arrows must never do.
+        #
+        # The status goes out as the last one actually read, which is what the indicators
+        # are already showing. lastRoofStateTime is deliberately not touched, so
+        # updateRoofStaleness() still reports the reading as exactly as old as it is.
+        if drive != lastRoofDrive:
+            lastRoofDrive = drive
+            triggerEvent("roofUpdate", lastRoofState)
+        # The poll is still a failed poll. Raised out here, with the lock released and the
+        # deferred log and events already flushed, so the caller's counter and rate limit
+        # see it exactly as they did before the motion machine existed.
+        raise pollError
     if generation != roofGeneration:
         # Checked once more: a command can take a second or two, and being replaced during
         # one must not let this thread publish over what its replacement has written.
         logger.info("Roof worker superseded, not publishing its last poll")
         return True
-    changed = status != lastRoofState
+    # The drive state is part of what changed, not just the status word. Which way a half
+    # is being driven is a Pi relay, invisible to the board, so a motion starting or
+    # stopping moves no status bit at all -- and without this an arrow could take up to
+    # roofIconUpdateInterval to appear, or worse, to go away once a half has stopped.
+    changed = status != lastRoofState or drive != lastRoofDrive
     lastRoofState = status
+    lastRoofDrive = drive
     lastRoofStateTime = time.monotonic()
     now = time.monotonic()
     if changed or now - lastRoofIconUpdate > roofIconUpdateInterval:
@@ -1743,6 +2231,16 @@ def roofLoop(stopEvent, roofInstance, generation):
             if failures == 1 or failures % roofPollLogEvery == 0:
                 logger.error("Error in roof thread ({} in a row): {}".format(failures, e))
         now = time.monotonic()
+        if roofMotion.running:
+            # Never back off with the roof in motion. The backoff exists so a dead board
+            # is not hammered, but the motion machine's phases are timed off this tick:
+            # at roofPollBackoffMax the interval reaches ~5 s, and a 2 s kick evaluated on
+            # a 5 s tick is a 5 s kick. A half that is moving gets the full poll rate
+            # whatever the board is doing.
+            nextPoll += roofPollPeriod
+            if nextPoll <= now:
+                nextPoll = now + roofPollPeriod
+            continue
         # Back off while the board is unhappy, so a dead port is polled every few
         # seconds rather than continuously.
         # The exponent is capped as well as the result. failures climbs for as long as the
@@ -1775,11 +2273,15 @@ def reapAbandonedRoofThreads():
     abandonedRoofThreads = alive
 
 def stopRoof():
-    global roofThread, roofStopEvent, roofGeneration, roofLock, lastRoofStateTime
+    global roofThread, roofStopEvent, roofGeneration, roofLock, lastRoofStateTime, lastRoofDrive
     # Anything still pending was meant for the roof that is going away, and the fans
     # are about to be switched off regardless.
     clearRoofCommands()
     lastRoofStateTime = 0.0
+    # The sequence belonged to the roof that is going away. Dropped here rather than left
+    # to the worker, which may be the thing that could not be joined below.
+    roofMotion.reset()
+    lastRoofDrive = {half: None for half in roof.RoofHalf}
     # Before the join, not after: from here on any worker still running is superseded,
     # whether it manages to stop or not, and must not publish or execute anything more.
     roofGeneration += 1
@@ -1829,7 +2331,21 @@ def stopRoof():
             roofLock.release()
             log.flush()
     else:
-        logger.warning("Timeout acquiring roof lock while stopping roof, fans and motion may still be on")
+        logger.error(
+                "Timeout acquiring roof lock while stopping roof; de-energizing the motion "
+                "relays without it, the fans may still be on")
+        # Deliberately outside the lock. roofLock serializes access to the board and the
+        # relays, but a motion relay left energized is a roof still moving with nothing
+        # left to stop it, and this is the path where the worker could not be joined --
+        # so it is very likely still driving. stopMotion() is a local GPIO write that
+        # cannot hang and only ever drives pins to OFF, so the worst a race with the
+        # abandoned worker can do is stop the roof twice. fansOff() stays inside the
+        # lock, because it talks to a board that may be wedged.
+        if roof.Roof.isInitialized():
+            try:
+                roof.Roof.get().stopMotion()
+            except Exception as e:
+                logger.error("Error stopping roof motion without the lock: {}".format(e))
     triggerEvent("roofUpdate", None)
 
 
@@ -1866,8 +2382,30 @@ def makeRoof():
             instance = roof.Roof.get()
             # Publish the first status here rather than leaving the state unknown
             # until the worker's first poll: the auto mode can then act right away.
+            #
+            # This read is also where the roof is picked up as it was found. Its
+            # consistency checks run inside getStatus(), so a roof that comes up with a
+            # broken switch or in an impossible position latches the motion fault before
+            # anything has a chance to command a motion -- no extra code needed here.
             lastRoofState = instance.getStatus()
             lastRoofStateTime = time.monotonic()
+            found = instance.position(status=lastRoofState)
+            if found is roof.RoofState.UNKN:
+                # Neither fully open nor fully closed. Nothing is assumed and nothing is
+                # commanded: an operator decides what to do with a roof found part-way.
+                log(logging.WARNING,
+                    "Roof is neither fully open nor fully closed; no motion will be "
+                    "offered until an operator resolves it")
+            else:
+                log(logging.INFO, "Roof picked up {}".format(found.name.lower()))
+            # Said plainly, every startup. Starting OMS observes the roof and drives
+            # nothing: the sequence begins IDLE, the four relays were de-energized as they
+            # were constructed a few lines above, and no motion exists that could resume --
+            # a motion lives only in this process, so a restart cannot inherit one.
+            log(logging.INFO,
+                "Roof motion is idle at startup, nothing is being driven; motion is {}".format(
+                    "ready" if instance.motionReady
+                    else "REFUSED: " + str(instance.motionFaultReason)))
             event("roofUpdate", lastRoofState)
             # Started while the lock is held, deliberately: roofLoop() waits a poll
             # period before its first acquire and the lock is released a few
@@ -2368,6 +2906,11 @@ def main():
                     settings["roof_port"] = ui.input("Breakout board port", value=s.q("roof_port", fallback=None))
                     settings["roof_baud"] = ui.select(baudRates, label="Breakout board baud rate", value=storedBaud("roof_baud"))
                     settings["roof_timeout"] = boundedNumber("Breakout board timeout (s)", "roof_timeout")
+                    settings["roof_travel_timeout"] = boundedNumber("Maximum travel time per roof half (s)", "roof_travel_timeout")
+                    settings["roof_kick_time"] = boundedNumber("Initial run before the push rods (s)", "roof_kick_time")
+                    settings["roof_rod_timeout"] = boundedNumber("Time for a push rod to complete its stroke (s)", "roof_rod_timeout")
+                    settings["roof_close_start_timeout"] = boundedNumber("Time for a half to start closing (s)", "roof_close_start_timeout")
+                    settings["roof_close_overrun"] = boundedNumber("Extra pull after the closed switches (s)", "roof_close_overrun")
                     settings["roof_fan_change_delay"] = boundedNumber("Minimal time between fan state changes (s)", "roof_fan_change_delay")
                     settings["roof_fan_temp_min"] = boundedNumber("Minimum outside temperature for fan", "roof_fan_temp_min")
                     settings["roof_fan_humidity_deadband"] = boundedNumber("Dead range for inside/outside humidity difference (%)", "roof_fan_humidity_deadband")
@@ -2444,7 +2987,23 @@ def main():
         for thing in status_indicators["fans"]:
             thing.classes(add=animateAdd, remove=animateRemove)
 
-        # TODO blinking arrows are missing
+        # The arrows already carry animate-pulse from where they were built, so lighting
+        # one is purely a matter of visibility. Which way a half is being driven is not in
+        # `status` at all -- the four motion relays are Pi GPIO and the board cannot see
+        # them -- so it comes from the worker's separate publish. Read through
+        # getRoofDrive() rather than roof.Roof.get(): this runs with a non-None status even
+        # when no roof exists (onConnect passes an all-False list), and the singleton would
+        # raise ValueError there and take out the connect handler.
+        #
+        # The two arrows on a side are mutually exclusive by construction, because
+        # driving() answers with one direction or None.
+        drive = getRoofDrive()
+        for half in roof.RoofHalf:
+            side = half.value.lower()
+            status_indicators[side + "_open"].set_visibility(
+                    drive.get(half) is roof.Direction.OPEN)
+            status_indicators[side + "_close"].set_visibility(
+                    drive.get(half) is roof.Direction.CLOSE)
 
     def updateRoofStaleness():
         """Shows/hides the "last updated" label under the roof diagram.

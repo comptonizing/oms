@@ -1,4 +1,5 @@
 import logging
+import time
 from enum import Enum
 import numpy as np
 from serial import Serial, SerialException
@@ -43,6 +44,28 @@ class RoofSwitch(Enum):
         """Index of this switch in a decoded status."""
         return self.value.value
 
+class RoofHalf(Enum):
+    """One movable half of the roof, and the switches that report where it is.
+
+    The switch pairs are derived from RoofSwitch by name rather than restated, so the
+    wiring stays written down in exactly one place -- the same rule RoofSwitch.bit keeps
+    for the status bits.
+    """
+    WEST = "WEST"
+    EAST = "EAST"
+
+    @property
+    def openSwitches(self):
+        return tuple(sw for sw in RoofSwitch if sw.name.startswith(self.value + "_OPEN"))
+
+    @property
+    def closedSwitches(self):
+        return tuple(sw for sw in RoofSwitch if sw.name.startswith(self.value + "_CLOSED"))
+
+class Direction(Enum):
+    OPEN = 0
+    CLOSE = 1
+
 class CMD(Enum):
     STATUS = 0
     FANS_ON = 1
@@ -64,6 +87,17 @@ class Roof():
     # writeCmd()'s default retry count, named so oms/oms's roofStopBudget() can derive the
     # worst-case exchange time from the same number rather than a second, unrelated guess.
     WRITE_RETRIES = 1
+    # How long a half must sit with both its relays de-energized before the opposite
+    # direction may be energized. Break-before-make with a real gap, not just an ordering:
+    # a belt drive reversed while the motor is still turning fights its own inertia, and
+    # both relays are switching mains-side contactors.
+    REVERSE_DEAD_TIME = 2.0
+    # Consecutive polls that must agree before "both halves adrift" is believed. Checks 1
+    # and 2 below need a switch to spuriously *engage*, which does not happen; this one
+    # fires on a switch spuriously *disengaging*, which a dirty contact or vibration on the
+    # parked half can do for a single sample. Counted in polls rather than seconds because
+    # it is tied to oms/oms's roofPollPeriod, not to the site.
+    ABSENCE_STRIKES = 3
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is not None:
@@ -131,10 +165,35 @@ class Roof():
         # Registered as they are created, so that a construction that fails partway
         # through still leaves stopMotion() able to de-energize the relays that exist.
         self.__motionRelays = []
+        # Motion state, set up before the relays exist: __makeMotionRelay() drives a pin,
+        # and anything that touches a pin has to be able to reach these.
+        self.__motionFaultReason = None
+        self.__driving = {half: None for half in RoofHalf}
+        # Monotonic stamp of the last de-energize per half, which is what the dead time is
+        # measured from. Starts at construction, so the first drive() on a freshly built
+        # Roof also waits it out rather than energizing a relay the instant OMS starts.
+        now = time.monotonic()
+        self.__lastStopped = {half: now for half in RoofHalf}
+        self.__absenceStrikes = 0
         self.__switchWestOpen = self.__makeMotionRelay(pinWestOpen)
         self.__switchWestClose = self.__makeMotionRelay(pinWestClose)
         self.__switchEastOpen = self.__makeMotionRelay(pinEastOpen)
         self.__switchEastClose = self.__makeMotionRelay(pinEastClose)
+        # The only mapping from (half, direction) to a relay. drive() and stopHalf() go
+        # through this; nothing else is allowed to touch these four objects.
+        self.__relays = {
+                (RoofHalf.WEST, Direction.OPEN): self.__switchWestOpen,
+                (RoofHalf.WEST, Direction.CLOSE): self.__switchWestClose,
+                (RoofHalf.EAST, Direction.OPEN): self.__switchEastOpen,
+                (RoofHalf.EAST, Direction.CLOSE): self.__switchEastClose,
+                }
+        # Stated outright at startup rather than left to be inferred. Every one of these
+        # pins was driven to its off level by Switch's constructor before this line, so
+        # this reports what has already happened rather than an intention.
+        logger.info(
+                "Roof motion relays created de-energized: west open pin {}, west close pin "
+                "{}, east open pin {}, east close pin {}".format(
+                    pinWestOpen, pinWestClose, pinEastOpen, pinEastClose))
         self.connect()
         # Superseded by RoofSwitch and the per-switch accessors below; derived from the
         # enum rather than restating the mapping. Nothing outside this class reads them
@@ -153,12 +212,127 @@ class Roof():
         self.__motionRelays.append(sw)
         return sw
 
+    @property
+    def motionReady(self):
+        """Whether motion is permitted. False from the moment anything faults."""
+        return self.__motionFaultReason is None
+
+    @property
+    def motionFaultReason(self):
+        return self.__motionFaultReason
+
+    def faultMotion(self, reason):
+        """Latches a motion fault and de-energizes everything. Never raises.
+
+        Idempotent, and deliberately unable to fail: it is called from getStatus(), which
+        the fan poll and the UI both sit on, and a fault that raised would take out paths
+        that have nothing to do with motion. The de-energize failing is itself logged, but
+        the latch is set either way -- refusing further motion is the one thing that must
+        happen no matter what else went wrong.
+        """
+        first = self.__motionFaultReason is None
+        if first:
+            self.__motionFaultReason = reason
+        try:
+            self.stopMotion()
+        except Exception as e:
+            logger.error("Could not de-energize the roof while faulting motion: {}".format(e))
+        if first:
+            logger.error("Roof motion faulted, no further motion until cleared: {}".format(reason))
+
+    def clearMotionFault(self):
+        """Clears the latch unconditionally, for an operator who has looked at the roof.
+
+        It does not refuse while the offending condition is still live, on purpose. The
+        next getStatus() re-latches it, and serviceRoofOnce() polls *before* it takes
+        commands from the mailbox, so a clear followed straight away by a motion command
+        cannot get a motion past a live fault. Refusing instead would leave an operator
+        whose roof is genuinely mispositioned -- both halves adrift, check 3 below --
+        unable to move it by software at all, with no way out but the hardware. Letting
+        them try and watch it come straight back is a far better answer than a flat no.
+
+        The strike counter goes back to zero with it, so a condition that is still there
+        takes the full ABSENCE_STRIKES polls to re-latch rather than snapping back on the
+        first one.
+        """
+        if self.__motionFaultReason is None:
+            return
+        logger.warning("Clearing roof motion fault: {}".format(self.__motionFaultReason))
+        self.__motionFaultReason = None
+        self.__absenceStrikes = 0
+
+    def driving(self, half):
+        """The direction `half` is currently being driven, or None."""
+        return self.__driving[half]
+
+    def drive(self, half, direction):
+        """Energizes one relay of one half, if that is safe to do this instant.
+
+        Returns True when the relay is energized, False when it is not yet -- never an
+        error, never a block. False means "ask again"; this class does not sleep and does
+        not retry, because it runs under roofLock on the roof worker thread and a hold
+        that outlasts roofStopBudget() is what makes a settings save abandon a worker
+        mid-travel.
+
+        The two relays of a half are a direction pair driving one motor, and energizing
+        both is the failure this method exists to make impossible. Every path below is
+        off-before-on, and after a reversal the half sits with both relays de-energized
+        for REVERSE_DEAD_TIME before the other direction is allowed.
+        """
+        if not self.motionReady:
+            raise RuntimeError("Roof motion is faulted: {}".format(self.__motionFaultReason))
+        current = self.__driving[half]
+        if current is direction:
+            # Already going the right way. No write at all -- re-driving an energized pin
+            # every poll would be harmless but it would also bury the real transitions in
+            # the GPIO log, which is where a reversal has to be readable.
+            return True
+        if current is not None:
+            # Reversal. De-energize now and start the clock; nothing is energized on this
+            # call, whatever the answer would have been.
+            self.stopHalf(half)
+            return False
+        waited = time.monotonic() - self.__lastStopped[half]
+        if waited < self.REVERSE_DEAD_TIME:
+            return False
+        self.__relays[(half, direction)].on()
+        self.__driving[half] = direction
+        return True
+
+    def stopHalf(self, half):
+        """De-energizes both relays of one half and starts its dead time.
+
+        Both are attempted even if one raises, for the same reason stopMotion() does it:
+        leaving a contactor energized because the other pin write failed is not an
+        acceptable outcome.
+        """
+        errors = []
+        for direction in Direction:
+            try:
+                self.__relays[(half, direction)].off()
+            except Exception as e:
+                errors.append("pin {}: {}".format(self.__relays[(half, direction)].pin, e))
+        # Recorded as stopped regardless of whether the writes landed. If one failed the
+        # relay may well still be energized, but the intent is stopped and the dead time
+        # has to be observed before anything reverses -- and the caller faults on the
+        # exception below, which is what actually stops further motion.
+        self.__driving[half] = None
+        self.__lastStopped[half] = time.monotonic()
+        if errors:
+            raise RuntimeError("Could not stop roof {} half: {}".format(
+                half.value.lower(), "; ".join(errors)))
+
     def stopMotion(self):
         """De-energizes every motion relay.
 
         All of them are attempted even if one fails: leaving a contactor energized
         because some other pin write raised is not an acceptable outcome. Failures are
         collected and reported together, once everything has been tried.
+
+        Iterates __motionRelays rather than calling stopHalf() twice, so that a
+        half-constructed instance -- __relays is built after the four relays exist, and
+        __init__ can fail in between -- still de-energizes whatever was made. The
+        per-half bookkeeping is updated separately below for the same reason.
         """
         errors = []
         for sw in self.__motionRelays:
@@ -166,6 +340,10 @@ class Roof():
                 sw.off()
             except Exception as e:
                 errors.append("pin {}: {}".format(sw.pin, e))
+        now = time.monotonic()
+        for half in RoofHalf:
+            self.__driving[half] = None
+            self.__lastStopped[half] = now
         if errors:
             raise RuntimeError("Could not stop roof motion: " + "; ".join(errors))
 
@@ -271,14 +449,133 @@ class Roof():
                 ret[thing.value] = True
         return ret
 
+    def __decodeAndCheck(self, response):
+        """Decodes a board reply and runs the consistency checks over it.
+
+        Every exchange that returns a status word goes through here, not just getStatus():
+        it must be impossible to observe an inconsistent roof without acting on it,
+        whichever call happened to do the reading.
+        """
+        status = self.decodeResponse(response)
+        self.__checkConsistency(status)
+        return status
+
+    def __checkConsistency(self, status):
+        """Faults motion if the switches report something that cannot physically be.
+
+        Three checks, and the rules they use differ on purpose. A *contradiction* needs a
+        switch to spuriously engage, which a false contact closure would have to cause and
+        which essentially does not happen -- so one sample is believed, and one switch is
+        enough. An *absence* is a switch spuriously disengaging, which a dirty contact or
+        vibration on the parked half does manage from time to time -- so that one wants
+        both switches of a pair and several polls in a row before it halts a moving roof.
+
+        Never raises: it is reached from the fan poll and from the UI's status read, and
+        those must not start failing because the roof developed a wiring fault.
+        """
+        for half in RoofHalf:
+            openSeen = any(status[sw.bit] for sw in half.openSwitches)
+            closedSeen = any(status[sw.bit] for sw in half.closedSwitches)
+            if openSeen and closedSeen:
+                # 1. The two ends of one half's travel, both reporting engaged. There is no
+                # position that does this, so it is broken wiring or a broken switch.
+                self.faultMotion(
+                        "{} half reports open and closed at the same time".format(
+                            half.value.lower()))
+                return
+        if (any(status[sw.bit] for sw in RoofHalf.WEST.closedSwitches)
+                and any(status[sw.bit] for sw in RoofHalf.EAST.openSwitches)):
+            # 2. West shut with east open. The sequences never produce it -- opening runs
+            # west then east, closing runs east then west -- so whenever east reports open,
+            # west is fully open and its closed switches are at the far end of travel.
+            self.faultMotion("west half reports closed while the east half reports open")
+            return
+        # 3. Neither half at an end position. Only one half ever moves at a time and the
+        # other is parked, so both being adrift means something moved uncommanded or a
+        # switch has failed. Subsumes the all-eight-disengaged case. Debounced, per above.
+        if (self.halfPosition(RoofHalf.WEST, status=status) is RoofState.UNKN
+                and self.halfPosition(RoofHalf.EAST, status=status) is RoofState.UNKN):
+            self.__absenceStrikes += 1
+            if self.__absenceStrikes >= self.ABSENCE_STRIKES:
+                self.faultMotion(
+                        "neither half is fully open or fully closed ({} polls in a row)".format(
+                            self.__absenceStrikes))
+            return
+        self.__absenceStrikes = 0
+
     def getStatus(self):
-        return self.decodeResponse(self.writeCmd(CMD.STATUS))
+        return self.__decodeAndCheck(self.writeCmd(CMD.STATUS))
 
     def fansOn(self):
-        return self.decodeResponse(self.writeCmd(CMD.FANS_ON))
+        return self.__decodeAndCheck(self.writeCmd(CMD.FANS_ON))
 
     def fansOff(self):
-        return self.decodeResponse(self.writeCmd(CMD.FANS_OFF))
+        return self.__decodeAndCheck(self.writeCmd(CMD.FANS_OFF))
+
+    # The rods are the Arduino's two linear actuators, one per half. Extending one shoves
+    # a half that has stuck on its seat far enough for gravity to take over; the firmware
+    # retracts it again by itself after Motor::MAX_EXTENDED (20 s).
+    __rodCommands = {
+            (RoofHalf.WEST, True): CMD.WEST_EXTEND,
+            (RoofHalf.WEST, False): CMD.WEST_RETRACT,
+            (RoofHalf.EAST, True): CMD.EAST_EXTEND,
+            (RoofHalf.EAST, False): CMD.EAST_RETRACT,
+            }
+    __rodStateBits = {
+            RoofHalf.WEST: ResponseState.WEST_STATE,
+            RoofHalf.EAST: ResponseState.EAST_STATE,
+            }
+    __rodRequestBits = {
+            RoofHalf.WEST: ResponseState.WEST_REQ,
+            RoofHalf.EAST: ResponseState.EAST_REQ,
+            }
+
+    def extendRod(self, half):
+        return self.__decodeAndCheck(self.writeCmd(self.__rodCommands[(half, True)]))
+
+    def retractRod(self, half):
+        return self.__decodeAndCheck(self.writeCmd(self.__rodCommands[(half, False)]))
+
+    def rodRetracted(self, half, status=None):
+        """Whether the firmware confirms this half's rod is back and settled.
+
+        Note what the sketch means by it: Motor::isRetracted() only answers true once
+        MAX_EXTENDED (20 s) has passed since the *last retract command*, so this stays
+        False for 20 s after a retract and for up to 40 s after an extend, which
+        auto-retracts at 20 s. Waiting on it is therefore never instant.
+        """
+        if status is None:
+            status = self.getStatus()
+        return not status[self.__rodStateBits[half].value]
+
+    def rodExtendRequested(self, half, status=None):
+        if status is None:
+            status = self.getStatus()
+        return status[self.__rodRequestBits[half].value]
+
+    def halfPosition(self, half, status=None):
+        """Where one half is: OPEN, CLOSED, or UNKN for anything in between.
+
+        Both switches of a pair are required, unlike the contradiction checks above. A
+        half with one open switch engaged is not open, it is somewhere near open, and
+        nothing may advance on that.
+        """
+        if status is None:
+            status = self.getStatus()
+        if all(status[sw.bit] for sw in half.openSwitches):
+            return RoofState.OPEN
+        if all(status[sw.bit] for sw in half.closedSwitches):
+            return RoofState.CLOSED
+        return RoofState.UNKN
+
+    def position(self, status=None):
+        """The roof as a whole: OPEN or CLOSED only when both halves agree."""
+        if status is None:
+            status = self.getStatus()
+        west = self.halfPosition(RoofHalf.WEST, status=status)
+        if west is not self.halfPosition(RoofHalf.EAST, status=status):
+            return RoofState.UNKN
+        return west
 
     def fansAreOn(self, status=None):
         if status is None:

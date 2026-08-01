@@ -1,0 +1,109 @@
+// The roof motion state machine, as implemented in oms/oms (advanceRoofMotion) and
+// oms/roof.py (the interlocks it drives through).
+//
+// One transition per worker poll (roofPollPeriod, 0.5 s). Each step does at most one
+// relay write and one serial command, so the roofLock hold stays in milliseconds and
+// stopRoof() keeps working mid-travel.
+//
+// Render:  dot -Tsvg roof-motion.dot -o roof-motion.svg
+//          dot -Tpng -Gdpi=150 roof-motion.dot -o roof-motion.png
+
+digraph RoofMotion {
+    rankdir=TB;
+    bgcolor="white";
+    fontname="Helvetica";
+    labelloc="t";
+    label=<<b>Roof motion state machine</b><br/>
+           <font point-size="11">one step per worker poll · west opens first, east closes first</font><br/>
+           <font point-size="10" color="#555555">green = a relay is energized · grey = both relays off</font><br/>
+           <font point-size="10" color="#555555">a half already at its target is skipped from OPEN_KICK or CLOSE_RODCLEAR, before anything is energized</font>>;
+    fontsize=18;
+
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,
+          margin="0.18,0.10"];
+    edge [fontname="Helvetica", fontsize=9, color="#444444"];
+
+    // Both relays off.
+    node [fillcolor="#eceff1", color="#90a4ae"];
+    IDLE            [label="IDLE", fillcolor="#cfd8dc", color="#607d8b"];
+    OPEN_SETTLE     [label="OPEN_SETTLE\nrelays off, rod running its stroke"];
+    CLOSE_RODCLEAR  [label="CLOSE_RODCLEAR\nwaiting on the rod"];
+
+    // A relay is energized.
+    node [fillcolor="#c8e6c9", color="#4caf50"];
+    OPEN_KICK       [label="OPEN_KICK\ndriving OPEN"];
+    OPEN_RUN        [label="OPEN_RUN\ndriving OPEN"];
+    CLOSE_RUN       [label="CLOSE_RUN\ndriving CLOSE"];
+    CLOSE_TIGHTEN   [label="CLOSE_TIGHTEN\nstill driving CLOSE"];
+
+    FAULT [label="FAULT\nlatched, everything de-energized",
+           shape=box, style="rounded,filled", fillcolor="#ffcdd2", color="#c62828",
+           fontcolor="#b71c1c"];
+
+    // ---- opening -----------------------------------------------------------------
+    subgraph cluster_open {
+        label="opening a half   (west, then east)";
+        fontname="Helvetica"; fontsize=12; fontcolor="#33691e";
+        color="#aed581"; style="rounded"; bgcolor="#f6fbf3";
+        OPEN_KICK; OPEN_SETTLE; OPEN_RUN;
+    }
+
+    IDLE -> OPEN_KICK [label="  command \"open\"\l  roof_kick_time > 0\l  → extendRod() at once\l", color="#33691e"];
+    // roof_kick_time has a 1.5 s floor, so there is no skip-the-kick path: a rod pushing a
+    // half still hard on its seat snaps off.
+
+    OPEN_KICK -> OPEN_SETTLE [label="  roof_kick_time elapsed\l  → stopHalf()\l"];
+    OPEN_SETTLE -> OPEN_RUN  [label="  rod stroke complete (REQ cleared)\l  and the closed switches are clear\l"];
+    OPEN_RUN -> OPEN_KICK    [label="  half fully open → stopHalf()\l  next half\l",
+                              color="#1565c0", fontcolor="#1565c0", constraint=false];
+
+    // ---- closing -----------------------------------------------------------------
+    subgraph cluster_close {
+        label="closing a half   (east, then west)";
+        fontname="Helvetica"; fontsize=12; fontcolor="#4527a0";
+        color="#b39ddb"; style="rounded"; bgcolor="#f7f5fc";
+        CLOSE_RODCLEAR; CLOSE_RUN; CLOSE_TIGHTEN;
+    }
+
+    IDLE -> CLOSE_RODCLEAR [label="  command \"close\"\l", color="#4527a0"];
+
+    CLOSE_RODCLEAR -> CLOSE_RUN [label="  rod confirmed retracted\l  travel budget starts here\l"];
+    CLOSE_RUN -> CLOSE_TIGHTEN  [label="  both closed switches engaged\l"];
+    CLOSE_TIGHTEN -> CLOSE_RODCLEAR [label="  roof_close_overrun elapsed\l  → stopHalf(), next half\l",
+                                     color="#1565c0", fontcolor="#1565c0", constraint=false];
+
+    // ---- completion ---------------------------------------------------------------
+    OPEN_RUN -> IDLE      [label="  last half done\l", color="#1565c0", fontcolor="#1565c0",
+                           constraint=false];
+    CLOSE_TIGHTEN -> IDLE [label="  last half done\l", color="#1565c0", fontcolor="#1565c0",
+                           constraint=false];
+
+    // ---- the phase-specific faults -------------------------------------------------
+    edge [color="#c62828", fontcolor="#b71c1c", style=dashed];
+
+    OPEN_SETTLE -> FAULT [label="  rod stroke did not finish\l  within roof_rod_timeout,\l  or the half is still closed\l  after a full stroke\l"];
+    CLOSE_RUN -> FAULT [label="  still reports open after\l  roof_close_start_timeout\l"];
+    CLOSE_RODCLEAR -> FAULT [label="  rod never confirmed\l  (roofRodClearBudget)\l"];
+
+    // ---- the faults that apply to every running phase ------------------------------
+    ANY [label=<<b>from any running phase</b><br align="left"/>
+                <font point-size="10">
+                · roof_travel_timeout for this half exceeded<br align="left"/>
+                · a Roof consistency check latched (any status read)<br align="left"/>
+                · a relay write raised<br align="left"/>
+                </font>>,
+         shape=note, style=filled, fillcolor="#fff8e1", color="#ffb300",
+         fontcolor="#5d4037", fontsize=11];
+    ANY -> FAULT [label="  faultMotion()\l"];
+
+    // ---- getting out again ----------------------------------------------------------
+    edge [color="#00695c", fontcolor="#00695c", style=solid];
+    FAULT -> IDLE [label="  Roof.clearMotionFault()\l  re-latches on the next poll\l  if still live\l",
+                   constraint=false];
+
+    STOP [label="command \"stop\"", shape=plaintext, fontcolor="#00695c", fontsize=11];
+    STOP -> IDLE [label="  stopMotion()\l"];
+
+    { rank=same; IDLE; STOP; }
+    { rank=same; FAULT; ANY; }
+}
