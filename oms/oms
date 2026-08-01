@@ -2924,6 +2924,13 @@ def main():
 
     def onDisconnect():
         updateCallbacks.pop(ui.context.client.id, None)
+        # Left running, these keep looping after the client is gone: the next tick's
+        # _can_start() awaits self.client, and once NiceGUI garbage-collects the
+        # disconnected client that dereferences a dead weakref and raises instead of
+        # returning, which is the "client ... has been deleted" traceback in the logs.
+        for timer in timers.values():
+            timer.cancel()
+        timers.clear()
         oldClient = influx_client.get()
         if oldClient is not None:
             cancelPlots()
