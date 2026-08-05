@@ -101,8 +101,11 @@ digraph RoofMotion {
     FAULT -> IDLE [label="  Roof.clearMotionFault()\l  re-latches on the next poll\l  if still live\l",
                    constraint=false];
 
-    STOP [label="command \"stop\"", shape=plaintext, fontcolor="#00695c", fontsize=11];
-    STOP -> IDLE [label="  stopMotion()\l"];
+    STOP [label=<<b>command "stop"</b><br align="left"/>
+                 <font point-size="9">straight to the relays, on the caller's thread:<br align="left"/>
+                 needs no board, no worker and no roofLock<br align="left"/></font>>,
+          shape=plaintext, fontcolor="#00695c", fontsize=11];
+    STOP -> IDLE [label="  stopMotion(), then the worker\l  drops the sequence\l"];
 
     { rank=same; IDLE; STOP; }
     { rank=same; FAULT; ANY; }

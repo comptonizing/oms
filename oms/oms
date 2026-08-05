@@ -1543,6 +1543,26 @@ def getRoofDrive():
     """
     return dict(lastRoofDrive)
 
+def publishRoofDrive(roofInstance):
+    """Republishes the drive state from the relays, firing roofUpdate if it changed.
+
+    serviceRoofOnce() does this at the end of every tick it completes, but the relays can
+    be de-energized by paths that never reach that point: the lock-timeout path, and
+    requestRoofMotion()'s stop, which goes straight to the relays on the caller's own
+    thread and may be the last thing that ever happens if the worker is gone. Leaving the
+    published state stale there would keep an arrow pulsing for a roof that has already
+    stopped, which is the one thing the arrows must never do.
+
+    The status word goes out unchanged, as the last one actually read: no board was
+    consulted here, so nothing is known about it that was not known before.
+    """
+    global lastRoofDrive
+    drive = {half: roofInstance.driving(half) for half in roof.RoofHalf}
+    if drive == lastRoofDrive:
+        return
+    lastRoofDrive = drive
+    triggerEvent("roofUpdate", lastRoofState)
+
 def getRoofState():
     """Returns (state, age in seconds) as last published by the roof worker.
 
@@ -1605,6 +1625,23 @@ def clearRoofCommands():
     with roofCommandLock:
         roofCommands = {}
 
+def takeRoofStop():
+    """Removes a pending stop from the mailbox, leaving everything else in it.
+
+    Separate from takeRoofCommands() because a stop is the one command that must be
+    carried out on a tick whose status poll failed. It needs no status -- it drops the
+    relays and nothing else -- and that tick is exactly the one on which a half may be
+    energized with the board no longer answering. Every other command is judged against a
+    fresh reading and waits in the mailbox until there is one, which is a property the
+    fans rely on and must not lose.
+    """
+    with roofCommandLock:
+        pending = roofCommands.get("motion")
+        if pending is not None and pending[0] == "stop":
+            del roofCommands["motion"]
+            return True
+        return False
+
 # One poll is a 3-byte exchange at 9600 baud plus up to the 10 ms the board spends in its
 # own delay(), so ~13 ms of work. 0.05 dates from when a command had to wait for the next
 # poll to be carried out; the command mailbox removed that, and nothing needs roof status
@@ -1643,6 +1680,18 @@ class MotionPhase(Enum):
 # it. In practice the roof has been open far longer than that and the phase falls straight
 # through.
 roofRodClearBudget = 45
+
+# How old a queued open or close may be when the worker finally reaches it. A command
+# normally waits one poll period; the honest worst case is a poll that failed plus the
+# backoff that follows it (roofPollPeriod * roofPollBackoffMax, ~5 s) plus a roofLock hold
+# of up to roofStopBudget(). Thirty seconds is several times that, so nothing legitimate
+# ever expires, and it is short enough that the roof cannot start moving minutes after
+# somebody asked it to -- which is what a board that went away for a while used to
+# produce, because the mailbox holds a command until there is a status to judge it
+# against. A constant rather than a setting: it is arithmetic on the poll rate, not a
+# property of the site. A stop is never expired, and never reaches the check: takeRoofStop()
+# has already taken it, and a stop is never the wrong thing to do however old it is.
+roofMotionCommandMaxAge = 30.0
 
 class RoofMotion:
     """Where the roof sequence has got to. Owned by the roof worker thread.
@@ -1963,17 +2012,47 @@ def advanceRoofMotion(roofInstance, status, log, event):
         startRoofMotionHalf(now, log, event)
         return
 
-def executeMotionCommand(roofInstance, status, action, log, event):
-    """Starts, or stops, a roof motion. Runs with roofLock held on the worker thread."""
-    if action == "stop":
-        if not roofMotion.running:
-            log(logging.DEBUG, "No roof motion to stop")
-            return
+def stopRoofMotion(roofInstance, log, event):
+    """Drops every motion relay and abandons the sequence. Needs no status.
+
+    Which is why it is a function of its own rather than a branch of
+    executeMotionCommand(): it has to work on a tick whose poll failed, and that is
+    precisely the tick on which a half may be energized with nothing left to notice.
+
+    The de-energize is unconditional. A stop is a panic button, not a phase transition, so
+    it does not first ask what the sequence thinks it is doing -- stopMotion() drives all
+    four relays off whatever the answer, and a sequence that believes itself idle while a
+    contactor is closed is exactly the state a stop exists to end. Only the bookkeeping is
+    conditional: a FAULT phase is left standing as the record of how the last motion
+    ended, because clearing that is Roof.clearMotionFault() and an operator's decision.
+    """
+    running = roofMotion.running
+    if running:
         log(logging.WARNING, "Roof motion stopped on request during {}".format(
             roofMotion.phase.name))
-        roofInstance.stopMotion()
+    else:
+        log(logging.INFO, "Roof stop requested with no motion running; de-energizing anyway")
+    roofInstance.stopMotion()
+    if running:
         roofMotion.reset()
         event("roofMotionStopped")
+
+def executeMotionCommand(roofInstance, status, action, postedAt, log, event):
+    """Starts a roof motion. Runs with roofLock held on the worker thread.
+
+    Opens and closes only. A stop never arrives here: takeRoofStop() takes it out of the
+    mailbox before the status is even examined, and stopRoofMotion() carries it out.
+    """
+    age = time.monotonic() - postedAt
+    if age > roofMotionCommandMaxAge:
+        # Queued while the board was not answering: the mailbox holds a command until
+        # there is a status to judge it against, and that wait is unbounded. The roof may
+        # have been moved by hand since, and one that starts moving a minute after it was
+        # asked to is worse than one that refuses. Said out loud rather than dropped
+        # quietly, so the operator learns their command went nowhere.
+        log(logging.WARNING,
+            "Dropping the roof {} asked for {:.0f}s ago, too old to act on".format(action, age))
+        event("roofMotionError", "Roof {} was dropped, it was {:.0f}s old".format(action, age))
         return
     if not roofInstance.motionReady:
         # The latch on the Roof is the authority here, not the phase: an operator can
@@ -2003,16 +2082,58 @@ def executeMotionCommand(roofInstance, status, action, log, event):
     startRoofMotionHalf(time.monotonic(), log, event)
 
 def requestRoofMotion(action):
-    """Asks the roof worker to open, close or stop. Returns without touching the roof.
+    """Asks the roof to open or close, or stops it outright.
 
-    Fire and forget, exactly like setFans(): the worker owns the serial port and the
-    relays, and reports back through events. Nothing calls this yet -- the operator
-    controls, the API and the weather-driven close are all still to come -- but the
-    interface they will use is this one.
+    Open and close are fire and forget, exactly like setFans(): the worker owns the serial
+    port and the relays, judges the command against a status it has just read, and reports
+    back through events. Nothing calls this yet -- the operator controls, the API and the
+    weather-driven close are all still to come -- but the interface they will use is this
+    one.
+
+    **A stop is not fire and forget, on purpose.** It needs no worker, no serial port, no
+    status and no lock, because de-energizing is four local GPIO writes -- and every
+    situation where a stop matters most is one where the mailbox does not work: a board
+    that has stopped answering, a worker wedged in a serial read, a worker that has died
+    outright. So a stop goes straight to the relays here, on the caller's thread, and is
+    posted as well so the worker abandons its sequence when it next runs. If it never runs
+    again, the roof is still stopped.
     """
     if action not in ("open", "close", "stop"):
         logger.error("Ignoring unknown roof motion {}".format(action))
         triggerEvent("roofMotionError", "Unknown roof motion")
+        return
+    if action == "stop":
+        if not roof.Roof.isInitialized():
+            # Nothing to de-energize: Roof.reset() drives all four pins off as it drops
+            # the instance, so there is no roof left holding a relay closed.
+            logger.warning("Roof stop requested with no roof initialized, nothing to de-energize")
+            triggerEvent("roofMotionError", "Roof not initialized")
+            return
+        try:
+            # Deliberately without roofLock. roofLock serializes the board and the relays,
+            # but a motion relay left energized is a roof still moving with nothing left to
+            # stop it, and this call cannot hang and only ever drives pins to OFF -- the
+            # worst a race with the worker can do is stop the roof twice. The same
+            # reasoning stopRoof() already uses on its own lock-timeout path.
+            roof.Roof.get().stopMotion()
+            logger.warning("Roof stopped on request, motion relays de-energized")
+        except Exception as e:
+            # Every relay was attempted before this raised; stopMotion() collects the
+            # failures rather than giving up on the first. A relay that would not come off
+            # must refuse further motion, so this latches as well as reporting.
+            logger.error("Error de-energizing the roof on a stop request: {}".format(e))
+            roof.Roof.get().faultMotion("could not de-energize on a stop request: {}".format(e))
+            triggerEvent("roofMotionError", "Could not de-energize the roof: {}".format(e))
+        # The arrows come from the relays, and the worker may never run again to publish
+        # this itself -- a wedged or dead worker is exactly why a stop comes through here.
+        publishRoofDrive(roof.Roof.get())
+        # Posted regardless, so the worker drops whatever sequence it is running. Without
+        # it the machine would keep ticking and OPEN_RUN would energize the half again on
+        # its next pass -- though not immediately, because stopMotion() has just stamped
+        # the dead time and drive() refuses for REVERSE_DEAD_TIME, which is four poll
+        # periods. takeRoofStop() runs before the machine on every tick, so the stop is
+        # always taken first and the half never comes back on.
+        postRoofCommand("motion", (action, time.monotonic()))
         return
     reason = roofUnavailableReason()
     if reason is not None:
@@ -2022,7 +2143,9 @@ def requestRoofMotion(action):
         triggerEvent("roofMotionError", reason)
         return
     logger.info("Requesting roof {}".format(action))
-    postRoofCommand("motion", action)
+    # Stamped, so a command that sat in the mailbox through a board outage is dropped by
+    # executeMotionCommand() instead of starting a motion long after it was asked for.
+    postRoofCommand("motion", (action, time.monotonic()))
 
 def executeFanCommand(roofInstance, status, mode, auto, log, event):
     """Switches the fans unless the just-polled status says they are already there.
@@ -2056,6 +2179,60 @@ def executeFanCommand(roofInstance, status, mode, auto, log, event):
     event("fanUpdate", mode, auto)
     return newStatus
 
+def enforceRoofStopWithoutLock(roofInstance):
+    """Stops the roof from serviceRoofOnce()'s lock-timeout path, where nothing else can.
+
+    Two things have to happen even when roofLock cannot be taken, because both are about a
+    half that is energized right now and neither of them needs the board:
+
+    * A stop waiting in the mailbox. requestRoofMotion() has already de-energized the
+      relays on the caller's thread, but the sequence is worker state and only the worker
+      may drop it -- and while it stands, the first tick that does get the lock would
+      drive the half again.
+    * A travel budget that has run out. Every deadline in the sequence is enforced by
+      advanceRoofMotion(), which runs under the lock, so while the lock is held by
+      something else -- an abandoned worker wedged in a serial read is the case that
+      actually happens -- a half stays energized with nothing checking how long it has
+      been there.
+
+    Deliberately without the lock, on the reasoning stopRoof() already uses for its own
+    timeout path: roofLock serializes the board and the relays, but stopMotion() is a local
+    GPIO write that cannot hang and only ever drives pins to OFF, so the worst a race with
+    whoever holds the lock can do is stop the roof twice.
+
+    Runs on the worker thread with no lock held, so it logs and fires events directly
+    rather than through the deferred collectors.
+    """
+    stopped = takeRoofStop()
+    # A phase with no travel budget has both relays off -- CLOSE_RODCLEAR waiting on the
+    # rod is the only one -- so there is nothing there to time out.
+    expired = (roofMotion.running and roofMotion.deadline is not None
+               and time.monotonic() > roofMotion.deadline)
+    if not stopped and not expired:
+        return
+    if stopped:
+        logger.warning("Roof stop carried out without the roof lock")
+    else:
+        logger.error("Roof {} exceeded its travel budget while the roof lock was "
+                     "unavailable".format(roofMotion.action))
+    try:
+        roofInstance.stopMotion()
+    except Exception as e:
+        # A relay that would not come off has to refuse further motion, exactly as it does
+        # on the in-lock path. faultMotion() tries every relay again and never raises.
+        logger.error("Error de-energizing the roof without the lock: {}".format(e))
+        roofInstance.faultMotion("could not de-energize the roof without the lock: {}".format(e))
+    # Dropped here rather than left for a tick that may never come. The relays are off;
+    # leaving the sequence standing would only let it energize them again.
+    if roofMotion.running:
+        roofMotion.reset()
+    # Published from here too: this path returns before serviceRoofOnce() gets to do it.
+    publishRoofDrive(roofInstance)
+    if stopped:
+        triggerEvent("roofMotionStopped")
+    else:
+        triggerEvent("roofMotionError", "Roof motion timed out while the roof lock was unavailable")
+
 def serviceRoofOnce(roofInstance, generation):
     """One status poll plus whatever commands are pending, in a single lock hold.
 
@@ -2081,6 +2258,9 @@ def serviceRoofOnce(roofInstance, generation):
     log = DeferredLog()
     event = DeferredEvents()
     if not roofLock.acquire(timeout=roofStopBudget()):
+        # A pending stop and an expired travel budget both have to be acted on even here,
+        # where the machine cannot run at all. Without the lock, deliberately -- see there.
+        enforceRoofStopWithoutLock(roofInstance)
         # Reported by the caller, not here: this is the failure that repeats every poll
         # for as long as the lock is held, and it has to go through the same rate limit
         # as the exceptions rather than emitting a blocking log write each time.
@@ -2105,6 +2285,18 @@ def serviceRoofOnce(roofInstance, generation):
             # replaced. The worker that replaced this one carries them out instead.
             log(logging.INFO, "Roof worker superseded mid-poll, discarding the result")
             return True
+        # Taken before the status is even looked at, and before the machine is advanced.
+        # Before the status, because a stop needs none and the tick whose poll just failed
+        # is the one an operator most wants it to work on. Before the machine, because
+        # otherwise a phase could energize a half on the very tick the stop arrived.
+        if takeRoofStop():
+            try:
+                stopRoofMotion(roofInstance, log, event)
+            except Exception as e:
+                # A relay write failed while stopping. That is the one failure that has to
+                # latch: faultMotion() tries every relay again and refuses further motion
+                # until an operator has looked at it.
+                failRoofMotion(roofInstance, f"could not stop roof motion: {e}", log, event)
         # Taken after the poll, so that a command posted while it was in flight is
         # picked up now, and so a failed poll leaves the mailbox untouched for the
         # next attempt. A command that fails once it has been taken is reported and
@@ -2125,9 +2317,10 @@ def serviceRoofOnce(roofInstance, generation):
                     log(logging.ERROR, f"Error switching fans {mode}: {e}")
                     event("fanError", mode, str(e))
             if "motion" in commands:
-                action = commands["motion"]
+                # Only ever an open or a close by now; takeRoofStop() took any stop above.
+                action, postedAt = commands["motion"]
                 try:
-                    executeMotionCommand(roofInstance, status, action, log, event)
+                    executeMotionCommand(roofInstance, status, action, postedAt, log, event)
                 except Exception as e:
                     failRoofMotion(roofInstance, f"could not start roof {action}: {e}",
                                    log, event)
