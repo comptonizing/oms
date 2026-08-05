@@ -1734,6 +1734,56 @@ roofMotionOrder = {
         "close": [roof.RoofHalf.EAST, roof.RoofHalf.WEST],
         }
 
+def retractRoofRods(roofInstance, status, log):
+    """Sends a retract to every rod that is still commanded out. Best effort.
+
+    A rod left sticking out of a roof that has stopped is doing no good and is in the way:
+    the next close has to wait for it in CLOSE_RODCLEAR before it may pull anything up. So
+    every path that stops a motion asks for this.
+
+    Unlike de-energizing, it is not something a stop may depend on. The relays are Pi GPIO
+    and come off with four local writes that cannot fail to be attempted; a rod lives on
+    the Arduino and needs the serial port, which means the lock, a board that is answering,
+    and a worker to do it. This therefore runs only where all three hold, and the firmware
+    is the real backstop either way: Motor::update() retracts each rod by itself after
+    MAX_EXTENDED (20 s) whatever OMS manages here. This only makes it prompt.
+
+    Only rods whose firmware state is still EXTEND are touched. Retracting one that is
+    already on its way back would restart the board's 20 s isRetracted() clock for nothing,
+    and the next close would then sit in CLOSE_RODCLEAR waiting the whole of it out -- the
+    same reasoning CLOSE_RODCLEAR itself uses before sending one.
+
+    Both halves, not just the one that was moving. A stop de-energizes both, so leaving the
+    other half's rod out because it was not the one being driven would be an odd exception
+    to make -- and in practice only one is ever out, so the loop costs nothing.
+
+    Returns False if anything could not be sent, so the caller can leave it for a tick that
+    can.
+    """
+    ok = True
+    for half in roof.RoofHalf:
+        try:
+            if not roofInstance.rodExtendRequested(half, status=status):
+                continue
+            log(logging.INFO, "Roof stop: retracting the {} rod".format(half.value.lower()))
+            roofInstance.retractRod(half)
+        except Exception as e:
+            log(logging.WARNING, "Could not retract the {} rod: {}".format(
+                half.value.lower(), e))
+            ok = False
+    return ok
+
+def requestRodRetract():
+    """Leaves a rod retract for the worker, for stop paths that cannot do it themselves.
+
+    requestRoofMotion()'s direct stop and enforceRoofStopWithoutLock() both run without
+    roofLock, and failRoofMotion() may have no usable status -- none of them may touch the
+    serial port. The relays are already off by the time any of them gets here, so the rod
+    is not urgent; it only has to happen, and the mailbox is what guarantees it reaches the
+    one thread allowed to talk to the board.
+    """
+    postRoofCommand("rods", "retract")
+
 def failRoofMotion(roofInstance, reason, log, event):
     """Ends a motion badly: relays off, roof latched, operator told.
 
@@ -1749,6 +1799,10 @@ def failRoofMotion(roofInstance, reason, log, event):
     event("roofMotionError", reason)
     roofMotion.reset()
     roofMotion.phase = MotionPhase.FAULT
+    # A fault stops a motion as surely as a stop does, and the rod must not be left out
+    # because of it. Deferred rather than sent here: this is reached from paths whose
+    # status may be stale or absent, and one of them is a serial exchange that just failed.
+    requestRodRetract()
 
 def enterMotionPhase(phase, log, detail):
     """Moves to the next phase and says so. Every transition goes through here.
@@ -1848,17 +1902,32 @@ def advanceRoofMotion(roofInstance, status, log, event):
             startRoofMotionHalf(now, log, event)
             return
 
-    # The rod goes out the moment the half starts opening, not after the kick has finished.
-    # A half can stick a little way *past* its closed switches -- far enough for them to
-    # report clear, not far enough for gravity to take over -- so "the switches went clear"
-    # is not proof the half is free. Pushing from the start, and then holding until the rod
-    # has run its whole stroke, is what makes that guarantee real.
+    # The rod goes out as early as it safely can, and no earlier.
     #
-    # Sent here rather than in startRoofMotionHalf() so that a half which is already open
-    # is skipped above without a pointless rod push, and so that the send has a status in
-    # hand and can be retried on the next tick if the board is not answering yet.
+    # As early as possible, because the belt paying out lets the half start to fall, and a
+    # half dropping onto its belt loads the whole building. The rod is there to take that
+    # descent, not only to shove a stuck half -- so it has to be pushing while the slack
+    # appears, not after. It is also what makes the open honest: a half can stick a little
+    # way *past* its closed switches, far enough for them to report clear and not far
+    # enough for gravity to take over, so "the switches went clear" is not proof the half
+    # is free. Pushing from the start and holding until the stroke completes is.
+    #
+    # And no earlier, because "the phase says OPEN_KICK" is not the same as "the motor is
+    # turning". drive() refuses for REVERSE_DEAD_TIME after any stop -- a stop then an
+    # immediate re-open, a motion within 2 s of startup, anything after a fault -- and in
+    # that window the phase is OPEN_KICK with both relays off and the belt still taut. A
+    # rod driven against a half held rigid by a taut belt is what snaps it off, and that is
+    # the same failure roof_kick_time's 1.5 s floor exists to prevent but cannot catch,
+    # because this is an ordering problem rather than a duration one. Gating on driving()
+    # makes "the belt was already paying out" a guarantee instead of the usual case.
+    #
+    # OPEN_KICK only, not OPEN_SETTLE: driving() also answers OPEN during OPEN_RUN, and a
+    # rod whose send failed for the whole kick must not fire midway through the gravity
+    # run. The retry window is the kick, and a send that never lands leaves OPEN_SETTLE
+    # waiting on a stroke that is not happening, which is the right way for it to fail.
     if (roofMotion.action == "open" and not roofMotion.rodSent
-            and phase in (MotionPhase.OPEN_KICK, MotionPhase.OPEN_SETTLE)):
+            and phase is MotionPhase.OPEN_KICK
+            and roofInstance.driving(half) is roof.Direction.OPEN):
         if status is None:
             return
         log(logging.INFO, "Roof open: pushing the {} half off its seat".format(
@@ -2012,12 +2081,14 @@ def advanceRoofMotion(roofInstance, status, log, event):
         startRoofMotionHalf(now, log, event)
         return
 
-def stopRoofMotion(roofInstance, log, event):
+def stopRoofMotion(roofInstance, status, log, event):
     """Drops every motion relay and abandons the sequence. Needs no status.
 
     Which is why it is a function of its own rather than a branch of
     executeMotionCommand(): it has to work on a tick whose poll failed, and that is
-    precisely the tick on which a half may be energized with nothing left to notice.
+    precisely the tick on which a half may be energized with nothing left to notice. The
+    status is taken only so the rods can be retracted when there happens to be one; the
+    stop itself does not depend on it.
 
     The de-energize is unconditional. A stop is a panic button, not a phase transition, so
     it does not first ask what the sequence thinks it is doing -- stopMotion() drives all
@@ -2033,6 +2104,11 @@ def stopRoofMotion(roofInstance, log, event):
     else:
         log(logging.INFO, "Roof stop requested with no motion running; de-energizing anyway")
     roofInstance.stopMotion()
+    # The relays are off; the rods still need the port. Done inline when there is a status
+    # to say which of them are actually out, and left to a later tick when there is not --
+    # this is the one path that runs with the board possibly gone.
+    if status is None or not retractRoofRods(roofInstance, status, log):
+        requestRodRetract()
     if running:
         roofMotion.reset()
         event("roofMotionStopped")
@@ -2127,6 +2203,10 @@ def requestRoofMotion(action):
         # The arrows come from the relays, and the worker may never run again to publish
         # this itself -- a wedged or dead worker is exactly why a stop comes through here.
         publishRoofDrive(roof.Roof.get())
+        # The rods are the other half of stopping, and they are the part this thread may
+        # not do: they live on the board, behind the port, behind the lock. Left for the
+        # worker. If it never runs again the firmware retracts them on its own timer.
+        requestRodRetract()
         # Posted regardless, so the worker drops whatever sequence it is running. Without
         # it the machine would keep ticking and OPEN_RUN would energize the half again on
         # its next pass -- though not immediately, because stopMotion() has just stamped
@@ -2228,6 +2308,8 @@ def enforceRoofStopWithoutLock(roofInstance):
         roofMotion.reset()
     # Published from here too: this path returns before serviceRoofOnce() gets to do it.
     publishRoofDrive(roofInstance)
+    # No lock here either, so the rods go back on the mailbox rather than to the port.
+    requestRodRetract()
     if stopped:
         triggerEvent("roofMotionStopped")
     else:
@@ -2291,7 +2373,7 @@ def serviceRoofOnce(roofInstance, generation):
         # otherwise a phase could energize a half on the very tick the stop arrived.
         if takeRoofStop():
             try:
-                stopRoofMotion(roofInstance, log, event)
+                stopRoofMotion(roofInstance, status, log, event)
             except Exception as e:
                 # A relay write failed while stopping. That is the one failure that has to
                 # latch: faultMotion() tries every relay again and refuses further motion
@@ -2307,6 +2389,12 @@ def serviceRoofOnce(roofInstance, generation):
         # unknown roof.
         if status is not None:
             commands = takeRoofCommands()
+            if "rods" in commands:
+                # Left by a stop that could not reach the board itself. Attempted once and
+                # then dropped rather than retried forever: the firmware retracts each rod
+                # by itself after MAX_EXTENDED, so a second failure is not worth a warning
+                # every poll for as long as the roof stays up.
+                retractRoofRods(roofInstance, status, log)
             if "fans" in commands:
                 mode, auto = commands["fans"]
                 try:

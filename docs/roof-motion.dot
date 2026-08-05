@@ -31,7 +31,7 @@ digraph RoofMotion {
 
     // A relay is energized.
     node [fillcolor="#c8e6c9", color="#4caf50"];
-    OPEN_KICK       [label="OPEN_KICK\ndriving OPEN"];
+    OPEN_KICK       [label="OPEN_KICK\ndriving OPEN\nrod goes out once the relay is closed"];
     OPEN_RUN        [label="OPEN_RUN\ndriving OPEN"];
     CLOSE_RUN       [label="CLOSE_RUN\ndriving CLOSE"];
     CLOSE_TIGHTEN   [label="CLOSE_TIGHTEN\nstill driving CLOSE"];
@@ -48,9 +48,15 @@ digraph RoofMotion {
         OPEN_KICK; OPEN_SETTLE; OPEN_RUN;
     }
 
-    IDLE -> OPEN_KICK [label="  command \"open\"\l  roof_kick_time > 0\l  → extendRod() at once\l", color="#33691e"];
+    IDLE -> OPEN_KICK [label="  command \"open\"\l", color="#33691e"];
     // roof_kick_time has a 1.5 s floor, so there is no skip-the-kick path: a rod pushing a
     // half still hard on its seat snaps off.
+    //
+    // extendRod() is sent as soon as drive() has actually closed the relay, and not before.
+    // Early, because the belt paying out lets the half start to fall and the rod is what
+    // takes that descent -- a half dropping onto its belt loads the building. Not earlier,
+    // because drive() refuses for REVERSE_DEAD_TIME after any stop, and in that window the
+    // phase is OPEN_KICK with the belt still taut.
 
     OPEN_KICK -> OPEN_SETTLE [label="  roof_kick_time elapsed\l  → stopHalf()\l"];
     OPEN_SETTLE -> OPEN_RUN  [label="  rod stroke complete (REQ cleared)\l  and the closed switches are clear\l"];
@@ -105,7 +111,7 @@ digraph RoofMotion {
                  <font point-size="9">straight to the relays, on the caller's thread:<br align="left"/>
                  needs no board, no worker and no roofLock<br align="left"/></font>>,
           shape=plaintext, fontcolor="#00695c", fontsize=11];
-    STOP -> IDLE [label="  stopMotion(), then the worker\l  drops the sequence\l"];
+    STOP -> IDLE [label="  stopMotion(), then the worker\l  drops the sequence and\l  retracts any rod still out\l"];
 
     { rank=same; IDLE; STOP; }
     { rank=same; FAULT; ANY; }
