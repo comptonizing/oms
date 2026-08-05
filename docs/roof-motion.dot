@@ -31,7 +31,7 @@ digraph RoofMotion {
 
     // A relay is energized.
     node [fillcolor="#c8e6c9", color="#4caf50"];
-    OPEN_KICK       [label="OPEN_KICK\ndriving OPEN\nrod goes out once the relay is closed"];
+    OPEN_KICK       [label="OPEN_KICK\ndriving OPEN\nrod goes out once the relay is closed,\nand is retried until the board acknowledges"];
     OPEN_RUN        [label="OPEN_RUN\ndriving OPEN"];
     CLOSE_RUN       [label="CLOSE_RUN\ndriving CLOSE"];
     CLOSE_TIGHTEN   [label="CLOSE_TIGHTEN\nstill driving CLOSE"];
@@ -87,7 +87,7 @@ digraph RoofMotion {
     // ---- the phase-specific faults -------------------------------------------------
     edge [color="#c62828", fontcolor="#b71c1c", style=dashed];
 
-    OPEN_SETTLE -> FAULT [label="  rod stroke did not finish\l  within roof_rod_timeout,\l  or the half is still closed\l  after a full stroke\l"];
+    OPEN_SETTLE -> FAULT [label="  the extend was never acknowledged,\l  so there is no stroke to wait for;\l  or it did not finish within\l  roof_rod_timeout; or the half is\l  still closed after a full stroke\l"];
     CLOSE_RUN -> FAULT [label="  still reports open after\l  roof_close_start_timeout\l"];
     CLOSE_RODCLEAR -> FAULT [label="  rod never confirmed\l  (roofRodClearBudget)\l"];
 
@@ -97,6 +97,7 @@ digraph RoofMotion {
                 · roof_travel_timeout for this half exceeded<br align="left"/>
                 · a Roof consistency check latched (any status read)<br align="left"/>
                 · a relay write raised<br align="left"/>
+                · the board refused a command (CMDUNKN) past writeCmd()'s retries<br align="left"/>
                 </font>>,
          shape=note, style=filled, fillcolor="#fff8e1", color="#ffb300",
          fontcolor="#5d4037", fontsize=11];

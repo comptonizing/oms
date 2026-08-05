@@ -1713,8 +1713,9 @@ class RoofMotion:
         # elapse" and "running".
         self.deadline = None
         self.phaseDeadline = None
-        # Whether this half's rod has been sent out yet. Opening starts it immediately, so
-        # this exists only to make that send happen exactly once per half.
+        # Whether the board has acknowledged this half's extend -- not merely that one was
+        # written. It gates the send to once per half, and OPEN_SETTLE reads it to tell a
+        # finished rod stroke from one that never started.
         self.rodSent = False
         # Whether "the motor is now running" has been logged for this half. The run phases
         # call drive() every tick, and one line per tick for two minutes would bury the
@@ -1926,14 +1927,29 @@ def advanceRoofMotion(roofInstance, status, log, event):
     # run. The retry window is the kick, and a send that never lands leaves OPEN_SETTLE
     # waiting on a stroke that is not happening, which is the right way for it to fail.
     if (roofMotion.action == "open" and not roofMotion.rodSent
-            and phase is MotionPhase.OPEN_KICK
+            and phase is MotionPhase.OPEN_KICK and status is not None
             and roofInstance.driving(half) is roof.Direction.OPEN):
-        if status is None:
-            return
-        log(logging.INFO, "Roof open: pushing the {} half off its seat".format(
-            half.value.lower()))
-        roofInstance.extendRod(half)
-        roofMotion.rodSent = True
+        # The reply is the acknowledgement, so it is read rather than discarded. The
+        # firmware sets m_state = EXTEND inside extend() and only then builds the status,
+        # so an accepted extend always answers with this half's REQ bit set. Anything else
+        # -- a corrupted reply word, a board that took the bytes without acting -- leaves
+        # rodSent False and the next tick tries again, still inside the kick. rodSent has
+        # to mean "the board acknowledged", not "we wrote bytes", because OPEN_SETTLE
+        # below refuses to wait on a stroke that was never accepted. A rejected command
+        # does not arrive here at all: writeCmd() retries it and then raises, which
+        # serviceRoofOnce() turns into a fault.
+        #
+        # Nothing in this block returns, so a rod that will not go out never stalls the
+        # phase machine: the kick still ends on its own deadline, with its relay coming
+        # off on time, and OPEN_SETTLE is where the failure is decided.
+        replied = roofInstance.extendRod(half)
+        if roofInstance.rodExtendRequested(half, status=replied):
+            roofMotion.rodSent = True
+            log(logging.INFO, "Roof open: pushing the {} half off its seat".format(
+                half.value.lower()))
+        else:
+            log(logging.WARNING, "The {} rod did not take its extend command".format(
+                half.value.lower()))
 
     if phase is MotionPhase.OPEN_KICK:
         if roofMotion.phaseDeadline is None:
@@ -1959,6 +1975,19 @@ def advanceRoofMotion(roofInstance, status, log, event):
         return
 
     if phase is MotionPhase.OPEN_SETTLE:
+        if not roofMotion.rodSent:
+            # The kick ran its full length and no tick in it got the extend acknowledged,
+            # so there is no stroke to wait for. Without this the phase would sit out
+            # roof_rod_timeout and then blame the rod for not finishing something it never
+            # started -- or worse, find REQ clear (it was never set) and the closed
+            # switches clear (the kick alone can shake them off a half that is stuck a
+            # little past them) and promote to OPEN_RUN, running the half open on gravity
+            # having never pushed it. Failing costs nothing here: the kick already ended
+            # with stopHalf(), so both relays are off.
+            failRoofMotion(roofInstance,
+                    "the {} rod never accepted its extend command".format(
+                        half.value.lower()), log, event)
+            return
         if roofMotion.phaseDeadline is None:
             # Only reachable if the phase was entered without going through the kick, which
             # nothing does now that roof_kick_time has a floor. Bounded anyway.

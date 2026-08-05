@@ -415,12 +415,18 @@ class Roof():
                 if self.__serial is None:
                     self.connect()
                 data = self.__transact(payload, self.RESPONSE_SIZE)
-                if len(data) == self.RESPONSE_SIZE:
+                if len(data) != self.RESPONSE_SIZE:
+                    # The board only answers when spoken to, so a short read means this
+                    # exchange is over. Recovering requires re-sending the command;
+                    # reading again without one can only ever time out.
+                    lastError = "incomplete response ({} of {} bytes)".format(len(data), self.RESPONSE_SIZE)
+                elif self.__rejected(data):
+                    # Retry rather than give up: the command byte is built here from CMD
+                    # and is always one the firmware knows, so a rejection means it
+                    # arrived corrupted, and re-sending is exactly what fixes that.
+                    lastError = "board did not recognise {}".format(cmd.name)
+                else:
                     return data
-                # The board only answers when spoken to, so a short read means this
-                # exchange is over. Recovering requires re-sending the command;
-                # reading again without one can only ever time out.
-                lastError = "incomplete response ({} of {} bytes)".format(len(data), self.RESPONSE_SIZE)
             except (SerialException, OSError, RuntimeError) as e:
                 lastError = str(e)
                 # Drop the connection so the next attempt reopens it. Never raises.
@@ -439,6 +445,20 @@ class Roof():
         self.disconnect()
         raise SerialException("No valid response from roof board on {} after {} attempts: {}".format(
             self.__port, retries + 1, lastError))
+
+    def __rejected(self, response):
+        """Whether this reply is the firmware's "I did not understand that".
+
+        cmdUnkn() answers an unrecognised command with CMDUNKN set and every other bit
+        clear, which is why this cannot be left to the decoder: a rejection decodes as a
+        perfectly plausible status -- no switch engaged, neither rod out, fans off. Read
+        as one it is actively dangerous. OPEN_SETTLE takes a clear REQ bit for a finished
+        rod stroke and would run the half open on gravity having never pushed it;
+        CLOSE_RODCLEAR takes a clear STATE bit for a stowed rod and would close a half
+        onto one still out; and the absence check would blame the roof for what is a
+        link fault. So it is treated as a failed exchange, which is what it is.
+        """
+        return bool(int.from_bytes(response, "little") & (1 << ResponseState.CMDUNKN.value))
 
     def decodeResponse(self, response):
         buff = np.frombuffer(response, dtype=np.uint16)[0]
