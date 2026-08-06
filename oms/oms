@@ -1735,6 +1735,34 @@ def roofOpenPrepBudget():
             + numericSetting("roof_rod_timeout", 30)
             + 4 * roofPollPeriod)
 
+def roofBlindDriveBudget():
+    """How long a contactor may stay closed with no fresh status behind it.
+
+    The run phases are the only two that hold a relay while waiting on a switch, and they
+    were the only two that met a failed poll with a bare return -- so the phases with both
+    relays off failed fast on a silent board and the phases pulling a motor ran on for
+    whatever was left of roof_travel_timeout, which at the run phases is all of it, freshly
+    stamped. That is 60-120s of driving blind, and since travel is ~30s the likely half of
+    it is a half already on its switches with the motor stalled against its own end stop --
+    against a deliberate roof_close_overrun of about 2s. The board going quiet is also not
+    independent of the roof being in trouble: one pinched cable on a moving half produces
+    both.
+
+    Sized against a poll rather than picked, so a board configured to be slow is not
+    punished for it: one term is what a failed poll spends inside its own tick, one is the
+    gap to the next, and three of them is three or four consecutive failures -- the same
+    debounce depth ABSENCE_STRIKES already applies to deciding a half has gone adrift. That
+    is 2.7s at a roof_timeout of 0.2 and 13.5s at its ceiling of 2, either of which is a
+    different order of thing from a full travel budget.
+
+    Deliberately not a re-based roofMotion.deadline: that one stays on roof_travel_timeout
+    because it is also what arms enforceRoofStopWithoutLock(), which is the only thing that
+    can drop these relays when the worker is wedged holding roofLock. This bounds the other
+    failure -- worker healthy, board gone -- and the two need separate numbers.
+    """
+    attempts = roof.Roof.WRITE_RETRIES + 1
+    return 3 * (attempts * numericSetting("roof_timeout", 0.2) + roofPollPeriod)
+
 # How old a queued open or close may be when the worker finally reaches it. A command
 # normally waits one poll period; the honest worst case is a poll that failed plus the
 # backoff that follows it (roofPollPeriod * roofPollBackoffMax, ~5 s) plus a roofLock hold
@@ -1782,6 +1810,12 @@ class RoofMotion:
         # call drive() every tick, and one line per tick for two minutes would bury the
         # transitions that actually matter.
         self.runLogged = False
+        # When the run phases last found themselves without a status, or None when the
+        # last one they saw was good. Only the run phases touch it, and they clear it on
+        # every tick that has a status, so a poll that fails once and then recovers costs
+        # a motion nothing. It is not a deadline: the budget it is measured against is
+        # read when it is checked, so a settings change takes effect immediately.
+        self.blindSince = None
 
     @property
     def running(self):
@@ -1866,6 +1900,34 @@ def failRoofMotion(roofInstance, reason, log, event):
     # status may be stale or absent, and one of them is a serial exchange that just failed.
     requestRodRetract()
 
+def blindRunTooLong(roofInstance, now, half, log, event):
+    """Whether a run phase has held its contactor blind for longer than it may.
+
+    Called by OPEN_RUN and CLOSE_RUN in place of the bare `return` they used to meet a
+    failed poll with. Shared rather than written out twice because the two phases have
+    drifted apart before -- CLOSE_RUN grew roof_close_start_timeout and OPEN_RUN did not --
+    and this is the one bound that has to mean the same thing on both, since what it
+    protects (a motor pulling with nothing watching it) is identical.
+
+    Returns True once it has failed the motion, so the caller returns either way; the
+    difference is only whether the relay is still up. The first blind tick just starts the
+    clock: one failed poll in the middle of a two-minute travel is ordinary, and aborting
+    on it would trade a rare hazard for a common nuisance -- one that latches, since
+    failRoofMotion() faults and nothing yet clears that.
+    """
+    if roofMotion.blindSince is None:
+        roofMotion.blindSince = now
+        log(logging.WARNING, "Roof {} [{}]: no status while running, still driving".format(
+            roofMotion.action, half.value.lower()))
+        return False
+    budget = roofBlindDriveBudget()
+    if now - roofMotion.blindSince <= budget:
+        return False
+    failRoofMotion(roofInstance,
+            "no status for {:.1f}s while the {} half was running".format(
+                budget, half.value.lower()), log, event)
+    return True
+
 def enterMotionPhase(phase, log, detail):
     """Moves to the next phase and says so. Every transition goes through here.
 
@@ -1921,6 +1983,13 @@ def advanceRoofMotion(roofInstance, status, log, event):
     status may only stop relays or fault, never energize one.** Phases waiting on a switch
     simply cannot progress, so they run to their deadline and fail, which is the right
     answer for "the board vanished mid-travel".
+
+    Every phase has a bound it fails on when blind, and the bound is the phase's own, not
+    the outer budget. That distinction is the whole of it: the rule above is about the
+    write, and a relay already closed keeps pulling through a tick that writes nothing at
+    all -- so the two phases that hold a contactor are exactly the two where "run to the
+    deadline" had to mean something shorter than roof_travel_timeout. They get
+    roofBlindDriveBudget(); see blindRunTooLong().
 
     Never blocks and never sleeps. Each call does at most one relay write and one serial
     command, so the lock hold stays in milliseconds and roofStopBudget() stays honest --
@@ -2111,7 +2180,9 @@ def advanceRoofMotion(roofInstance, status, log, event):
 
     if phase is MotionPhase.OPEN_RUN:
         if status is None:
+            blindRunTooLong(roofInstance, now, half, log, event)
             return
+        roofMotion.blindSince = None
         if roofInstance.halfPosition(half, status=status) is roof.RoofState.OPEN:
             roofInstance.stopHalf(half)
             log(logging.INFO, "Roof open [{}]: fully open, relays off".format(
@@ -2152,7 +2223,9 @@ def advanceRoofMotion(roofInstance, status, log, event):
 
     if phase is MotionPhase.CLOSE_RUN:
         if status is None:
+            blindRunTooLong(roofInstance, now, half, log, event)
             return
+        roofMotion.blindSince = None
         if roofInstance.halfPosition(half, status=status) is roof.RoofState.CLOSED:
             # Keep pulling. The board's switches are informational and the motor has its
             # own internal end stop, so overrunning them is what seats the half tight.
