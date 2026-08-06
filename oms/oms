@@ -62,9 +62,11 @@ settingBounds = {
         "weather_plot_refresh": (10, 600),
         "weather_environment_timeout": (2, 5),
         "roof_timeout": (0.1, 2),
-        # Motion budgets. roof_travel_timeout covers one half's whole motion in either
-        # direction -- kick, rod push and run for an open, run and tighten for a close --
-        # so it has to sit above the measured ~30 s of travel plus a worst-case rod phase.
+        # Motion budgets. roof_travel_timeout covers the part of one half's motion that is
+        # actually travel -- OPEN_RUN, and CLOSE_RUN -- so it only has to sit above the
+        # measured ~30 s of travel. Not the rod phases: those are firmware waits bounded by
+        # roof_rod_timeout and roofRodClearBudget, and charging them here made the rod
+        # timeout unreachable at these bounds (60 floor, 60 ceiling).
         "roof_travel_timeout": (60, 120),
         # Never zero, and never short. The kick has to carry the half far enough from its
         # closed position that the rod is not pushing against a half still hard on its
@@ -1681,6 +1683,31 @@ class MotionPhase(Enum):
 # through.
 roofRodClearBudget = 45
 
+def roofOpenPrepBudget():
+    """The outer bound on an open before gravity gets its run.
+
+    Everything from picking the half up to entering OPEN_RUN: the dead time drive() may
+    refuse for, the kick, and the rod's whole stroke. Derived from the phases it actually
+    contains rather than taken out of roof_travel_timeout, because that number means "how
+    long a half takes to travel" and a rod stroke is not travel -- the same reasoning
+    CLOSE_RODCLEAR already runs on. Sharing the travel budget made roof_rod_timeout
+    unreachable: with travel at its 60 floor and the rod at its 60 ceiling the outer
+    deadline fires mid-stroke, and the failure blames travel for a rod that was never
+    given its time.
+
+    Each phase inside it ends on the first tick *past* its own deadline, so a poll period
+    is added for each, plus one more as slack. A budget that expires before the phases it
+    contains can finish is the whole bug this exists to remove.
+
+    Set rather than left None, unlike CLOSE_RODCLEAR: the kick energizes a relay, and
+    enforceRoofStopWithoutLock() is armed by this deadline being set. It is the only thing
+    that can drop that relay while the worker is wedged holding roofLock.
+    """
+    return (roof.Roof.REVERSE_DEAD_TIME
+            + numericSetting("roof_kick_time", 2)
+            + numericSetting("roof_rod_timeout", 30)
+            + 4 * roofPollPeriod)
+
 # How old a queued open or close may be when the worker finally reaches it. A command
 # normally waits one poll period; the honest worst case is a poll that failed plus the
 # backoff that follows it (roofPollPeriod * roofPollBackoffMax, ~5 s) plus a roofLock hold
@@ -1707,10 +1734,17 @@ class RoofMotion:
         self.action = None
         self.half = None
         self.queue = []
-        # The whole-half travel budget, and the current phase's own. Both are
+        # The outer budget for where the half is now, and the current phase's own. Both are
         # time.monotonic() stamps; None means "not started yet", which is how an
         # energizing phase tells the difference between "waiting for the dead time to
         # elapse" and "running".
+        #
+        # `deadline` is re-based as the motion changes what it is waiting on, because one
+        # number cannot honestly bound a rod stroke and a gravity run at once:
+        # roofOpenPrepBudget() up to OPEN_RUN, roof_travel_timeout for the run phases,
+        # roof_close_overrun for the tighten, and None only in CLOSE_RODCLEAR, where both
+        # relays are off. Whatever it holds, the phase-to-budget mapping is single-valued,
+        # which is what lets advanceRoofMotion() name the right one when it expires.
         self.deadline = None
         self.phaseDeadline = None
         # Whether the board has acknowledged this half's extend -- not merely that one was
@@ -1827,7 +1861,6 @@ def startRoofMotionHalf(now, log, event):
         event("roofMotionDone", action)
         return action
     roofMotion.half = roofMotion.queue.pop(0)
-    roofMotion.deadline = now + numericSetting("roof_travel_timeout", 90)
     roofMotion.phaseDeadline = None
     # Per half, not per motion: the second half gets its own rod push, and its own
     # "now running" line.
@@ -1838,6 +1871,10 @@ def startRoofMotionHalf(now, log, event):
         # has a floor of 1.5 s precisely because a rod pushing a half that is still hard on
         # its seat breaks off, so "open without kicking first" is not a thing to offer.
         roofMotion.phase = MotionPhase.OPEN_KICK
+        # Neither the kick nor the rod stroke is travel, so neither is charged to the
+        # travel budget; that starts when OPEN_RUN does. They get a budget sized against
+        # themselves instead, so roof_rod_timeout is reachable at every setting.
+        roofMotion.deadline = now + roofOpenPrepBudget()
     else:
         roofMotion.phase = MotionPhase.CLOSE_RODCLEAR
         # The rod wait is not motion, so it runs outside the travel budget. The budget is
@@ -1880,9 +1917,22 @@ def advanceRoofMotion(roofInstance, status, log, event):
     # Checked before any phase: a phase that cannot make progress -- a board that stopped
     # answering, a half that is not moving -- has to end here rather than run on.
     if roofMotion.deadline is not None and now > roofMotion.deadline:
-        failRoofMotion(roofInstance, "{} half did not finish its {} within {:.0f}s".format(
-            half.value.lower(), roofMotion.action,
-            numericSetting("roof_travel_timeout", 90)), log, event)
+        # Which budget just ran out depends on the phase, and each phase belongs to exactly
+        # one: an open before OPEN_RUN is on roofOpenPrepBudget(), a tighten is on its own
+        # re-based one, and only the run phases are on roof_travel_timeout. Naming the wrong
+        # number here is how this hid -- an open faulting mid-rod-stroke reported "did not
+        # finish its open within 60s" and read like a roof that would not move.
+        if roofMotion.phase in (MotionPhase.OPEN_KICK, MotionPhase.OPEN_SETTLE):
+            reason = "{} half did not get off its seat within {:.0f}s".format(
+                    half.value.lower(), roofOpenPrepBudget())
+        elif roofMotion.phase is MotionPhase.CLOSE_TIGHTEN:
+            reason = "{} half did not finish seating within {:.0f}s".format(
+                    half.value.lower(), numericSetting("roof_close_overrun", 2))
+        else:
+            reason = "{} half did not finish its {} within {:.0f}s".format(
+                    half.value.lower(), roofMotion.action,
+                    numericSetting("roof_travel_timeout", 90))
+        failRoofMotion(roofInstance, reason, log, event)
         return
 
     phase = roofMotion.phase
@@ -2021,9 +2071,15 @@ def advanceRoofMotion(roofInstance, status, log, event):
                     "{} half still reports closed after a full rod stroke".format(
                         half.value.lower()), log, event)
             return
+        # Gravity's run gets the whole travel budget, exactly as CLOSE_RUN does. Everything
+        # up to here was on the prep budget, so how long the kick and the stroke took
+        # cannot shorten the run -- which it silently did, leaving as little as half of
+        # roof_travel_timeout for the only phase that is actually travel.
+        roofMotion.deadline = now + numericSetting("roof_travel_timeout", 90)
         roofMotion.phaseDeadline = None
         enterMotionPhase(MotionPhase.OPEN_RUN, log,
-                         "rod stroke complete and the half is off its seat")
+                         "rod stroke complete and the half is off its seat, "
+                         "travel budget starts")
         return
 
     if phase is MotionPhase.OPEN_RUN:
@@ -2073,10 +2129,18 @@ def advanceRoofMotion(roofInstance, status, log, event):
         if roofInstance.halfPosition(half, status=status) is roof.RoofState.CLOSED:
             # Keep pulling. The board's switches are informational and the motor has its
             # own internal end stop, so overrunning them is what seats the half tight.
-            roofMotion.phaseDeadline = now + numericSetting("roof_close_overrun", 2)
+            overrun = numericSetting("roof_close_overrun", 2)
+            roofMotion.phaseDeadline = now + overrun
+            # Re-based on what is left to do rather than on whatever remained of the travel
+            # budget. A close that spent nearly all of it getting here would otherwise be
+            # failed for a deliberate two-second overrun -- a fault reporting a close that
+            # worked, on a half already on its switches, and the reset means the second half
+            # never runs at all. It cannot extend an expired budget: the check above runs
+            # first, so this transition is only reached on a tick that had time left.
+            roofMotion.deadline = now + overrun + 2 * roofPollPeriod
             enterMotionPhase(MotionPhase.CLOSE_TIGHTEN, log,
                              "closed switches engaged, pulling {:.1f}s past them".format(
-                                 numericSetting("roof_close_overrun", 2)))
+                                 overrun))
             return
         if roofMotion.phaseDeadline is not None and now > roofMotion.phaseDeadline:
             # The half never left its open position: the belt is slipping, the motor is
@@ -2313,8 +2377,10 @@ def enforceRoofStopWithoutLock(roofInstance):
     rather than through the deferred collectors.
     """
     stopped = takeRoofStop()
-    # A phase with no travel budget has both relays off -- CLOSE_RODCLEAR waiting on the
-    # rod is the only one -- so there is nothing there to time out.
+    # A phase with no outer budget has both relays off -- CLOSE_RODCLEAR waiting on the rod
+    # is still the only one -- so there is nothing there to time out. The open path holds a
+    # budget throughout for exactly this reason: OPEN_KICK energizes a relay, and this is
+    # the only thing that can drop it while the lock is held elsewhere.
     expired = (roofMotion.running and roofMotion.deadline is not None
                and time.monotonic() > roofMotion.deadline)
     if not stopped and not expired:

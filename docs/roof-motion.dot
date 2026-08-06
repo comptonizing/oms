@@ -26,7 +26,7 @@ digraph RoofMotion {
     // Both relays off.
     node [fillcolor="#eceff1", color="#90a4ae"];
     IDLE            [label="IDLE", fillcolor="#cfd8dc", color="#607d8b"];
-    OPEN_SETTLE     [label="OPEN_SETTLE\nrelays off, rod running its stroke"];
+    OPEN_SETTLE     [label="OPEN_SETTLE\nrelays off, rod running its stroke\noutside the travel budget"];
     CLOSE_RODCLEAR  [label="CLOSE_RODCLEAR\nwaiting on the rod"];
 
     // A relay is energized.
@@ -59,7 +59,7 @@ digraph RoofMotion {
     // phase is OPEN_KICK with the belt still taut.
 
     OPEN_KICK -> OPEN_SETTLE [label="  roof_kick_time elapsed\l  → stopHalf()\l"];
-    OPEN_SETTLE -> OPEN_RUN  [label="  rod stroke complete (REQ cleared)\l  and the closed switches are clear\l"];
+    OPEN_SETTLE -> OPEN_RUN  [label="  rod stroke complete (REQ cleared)\l  and the closed switches are clear\l  travel budget starts here\l"];
     OPEN_RUN -> OPEN_KICK    [label="  half fully open → stopHalf()\l  next half\l",
                               color="#1565c0", fontcolor="#1565c0", constraint=false];
 
@@ -74,7 +74,7 @@ digraph RoofMotion {
     IDLE -> CLOSE_RODCLEAR [label="  command \"close\"\l", color="#4527a0"];
 
     CLOSE_RODCLEAR -> CLOSE_RUN [label="  rod confirmed retracted\l  travel budget starts here\l"];
-    CLOSE_RUN -> CLOSE_TIGHTEN  [label="  both closed switches engaged\l"];
+    CLOSE_RUN -> CLOSE_TIGHTEN  [label="  both closed switches engaged\l  re-based onto roof_close_overrun\l"];
     CLOSE_TIGHTEN -> CLOSE_RODCLEAR [label="  roof_close_overrun elapsed\l  → stopHalf(), next half\l",
                                      color="#1565c0", fontcolor="#1565c0", constraint=false];
 
@@ -93,8 +93,9 @@ digraph RoofMotion {
 
     // ---- the faults that apply to every running phase ------------------------------
     ANY [label=<<b>from any running phase</b><br align="left"/>
-                <font point-size="10">
-                · roof_travel_timeout for this half exceeded<br align="left"/>
+                <font point-size="10">· this phase's outer budget ran out, and each phase has exactly one:<br align="left"/>
+                roofOpenPrepBudget() up to OPEN_RUN, roof_travel_timeout for the<br align="left"/>
+                two run phases, roof_close_overrun for the tighten<br align="left"/>
                 · a Roof consistency check latched (any status read)<br align="left"/>
                 · a relay write raised<br align="left"/>
                 · the board refused a command (CMDUNKN) past writeCmd()'s retries<br align="left"/>
