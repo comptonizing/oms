@@ -1627,6 +1627,34 @@ def clearRoofCommands():
     with roofCommandLock:
         roofCommands = {}
 
+def postRoofStop():
+    """Posts a stop, and drops any open or close already waiting behind it.
+
+    A stop gets its own key rather than sharing "motion" with the motions it supersedes.
+    Latest-wins is the right rule *within* one kind of command and the wrong one *between*
+    two: a newer open supersedes an older open, but a newer open must never supersede a
+    stop. Sharing the key meant exactly that happened -- an operator who pressed Stop and
+    then Close had their stop silently overwritten, takeRoofStop() found a close, the
+    sequence was never dropped, and the motion that had just been stopped resumed as soon
+    as REVERSE_DEAD_TIME elapsed, while the close was refused as "already in progress".
+    requestRoofMotion()'s direct de-energize is untouched by any of this, but on its own it
+    only buys those two seconds.
+
+    Clearing "motion" is the other half of the same rule, done here under the one lock so
+    nothing can slip in between. An open or close already in the mailbox was asked for
+    *before* the stop, so the stop supersedes it; leaving it would have the worker carry out
+    the stop and then start, on that very same tick, the motion it was meant to cancel. A
+    motion posted *after* the stop is a new instruction and is deliberately kept -- that is
+    the Stop-then-Close an operator actually means, and it works on one tick, because
+    serviceRoofOnce() runs the stop before the mailbox and stopRoofMotion() has reset the
+    sequence by the time executeMotionCommand() looks at it. The interlock is not weakened
+    by that: stopMotion() has just stamped both halves' dead time, so drive() refuses for
+    REVERSE_DEAD_TIME, and CLOSE_RODCLEAR, which energizes nothing, is where it is spent.
+    """
+    with roofCommandLock:
+        roofCommands.pop("motion", None)
+        roofCommands["stop"] = True
+
 def takeRoofStop():
     """Removes a pending stop from the mailbox, leaving everything else in it.
 
@@ -1636,13 +1664,12 @@ def takeRoofStop():
     energized with the board no longer answering. Every other command is judged against a
     fresh reading and waits in the mailbox until there is one, which is a property the
     fans rely on and must not lose.
+
+    Carries no stamp, unlike an open or a close: a stop is never the wrong thing to do,
+    however old it is, so there is nothing to expire it against.
     """
     with roofCommandLock:
-        pending = roofCommands.get("motion")
-        if pending is not None and pending[0] == "stop":
-            del roofCommands["motion"]
-            return True
-        return False
+        return roofCommands.pop("stop", None) is not None
 
 # One poll is a 3-byte exchange at 9600 baud plus up to the 10 ms the board spends in its
 # own delay(), so ~13 ms of work. 0.05 dates from when a command had to wait for the next
@@ -1716,8 +1743,8 @@ def roofOpenPrepBudget():
 # somebody asked it to -- which is what a board that went away for a while used to
 # produce, because the mailbox holds a command until there is a status to judge it
 # against. A constant rather than a setting: it is arithmetic on the poll rate, not a
-# property of the site. A stop is never expired, and never reaches the check: takeRoofStop()
-# has already taken it, and a stop is never the wrong thing to do however old it is.
+# property of the site. A stop is never expired and never reaches the check: it carries no
+# stamp at all, because a stop is never the wrong thing to do however old it is.
 roofMotionCommandMaxAge = 30.0
 
 class RoofMotion:
@@ -2209,8 +2236,9 @@ def stopRoofMotion(roofInstance, status, log, event):
 def executeMotionCommand(roofInstance, status, action, postedAt, log, event):
     """Starts a roof motion. Runs with roofLock held on the worker thread.
 
-    Opens and closes only. A stop never arrives here: takeRoofStop() takes it out of the
-    mailbox before the status is even examined, and stopRoofMotion() carries it out.
+    Opens and closes only. A stop cannot arrive here at all: it lives under its own mailbox
+    key, which takeRoofCommands() does not hand out, and stopRoofMotion() carries it out
+    from takeRoofStop() before the status is even examined.
     """
     age = time.monotonic() - postedAt
     if age > roofMotionCommandMaxAge:
@@ -2306,7 +2334,11 @@ def requestRoofMotion(action):
         # the dead time and drive() refuses for REVERSE_DEAD_TIME, which is four poll
         # periods. takeRoofStop() runs before the machine on every tick, so the stop is
         # always taken first and the half never comes back on.
-        postRoofCommand("motion", (action, time.monotonic()))
+        #
+        # Through postRoofStop() rather than the "motion" key this used to share with an
+        # open or a close: sharing it let a motion requested a moment later overwrite the
+        # stop outright, and the half came back on when the dead time ran out. See there.
+        postRoofStop()
         return
     reason = roofUnavailableReason()
     if reason is not None:
@@ -2500,7 +2532,8 @@ def serviceRoofOnce(roofInstance, generation):
                     log(logging.ERROR, f"Error switching fans {mode}: {e}")
                     event("fanError", mode, str(e))
             if "motion" in commands:
-                # Only ever an open or a close by now; takeRoofStop() took any stop above.
+                # Only ever an open or a close: a stop is posted under its own key, so this
+                # one cannot hold one however the two were interleaved.
                 action, postedAt = commands["motion"]
                 try:
                     executeMotionCommand(roofInstance, status, action, postedAt, log, event)
