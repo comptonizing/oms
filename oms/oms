@@ -2486,7 +2486,8 @@ def enforceRoofStopWithoutLock(roofInstance):
       advanceRoofMotion(), which runs under the lock, so while the lock is held by
       something else -- an abandoned worker wedged in a serial read is the case that
       actually happens -- a half stays energized with nothing checking how long it has
-      been there.
+      been there. That one latches a motion fault as well as stopping, for the reasons
+      given where it does it.
 
     Deliberately without the lock, on the reasoning stopRoof() already uses for its own
     timeout path: roofLock serializes the board and the relays, but stopMotion() is a local
@@ -2507,9 +2508,6 @@ def enforceRoofStopWithoutLock(roofInstance):
         return
     if stopped:
         logger.warning("Roof stop carried out without the roof lock")
-    else:
-        logger.error("Roof {} exceeded its travel budget while the roof lock was "
-                     "unavailable".format(roofMotion.action))
     try:
         roofInstance.stopMotion()
     except Exception as e:
@@ -2517,18 +2515,42 @@ def enforceRoofStopWithoutLock(roofInstance):
         # on the in-lock path. faultMotion() tries every relay again and never raises.
         logger.error("Error de-energizing the roof without the lock: {}".format(e))
         roofInstance.faultMotion("could not de-energize the roof without the lock: {}".format(e))
+    if expired and not stopped:
+        # Latched, not merely stopped. advanceRoofMotion() puts this same condition through
+        # failRoofMotion() and refuses further motion afterwards; this path used to end in a
+        # plain reset, so the *milder* failure -- worker healthy, budget blown -- latched
+        # while the worse one did not. A budget running out here means a half stayed
+        # energized for its whole travel while the lock was held by something else (an
+        # abandoned worker wedged in a serial read is the case that happens), so the roof's
+        # position is not known and the board is not answering: precisely the state that
+        # must not take another command. Unlatched it could re-arm indefinitely, each pass
+        # costing another full travel budget of pulling on a half that may already be sat
+        # on its end stop, with nothing but drive()'s REVERSE_DEAD_TIME in between.
+        #
+        # Only when no stop is pending. A stop has already de-energized the relays on the
+        # caller's thread, and it cannot clear this deadline from there -- the sequence is
+        # worker state -- so a stop landing just after the budget lapsed would otherwise
+        # fault a roof the operator had correctly stopped. The stop is the better account
+        # of that tick, and it is the one that keeps the roof usable.
+        #
+        # failRoofMotion() resets the sequence, requests the rod retract and raises the
+        # event itself; it only wants collectors that fire now rather than after a lock
+        # release, and logger.log and triggerEvent take exactly what the deferred ones do.
+        failRoofMotion(roofInstance, "{} half did not finish its {}: the budget ran out "
+                       "while the roof lock was unavailable".format(
+                           roofMotion.half.value.lower(), roofMotion.action),
+                       logger.log, triggerEvent)
+        # Published from here too: this path returns before serviceRoofOnce() gets to do it.
+        publishRoofDrive(roofInstance)
+        return
     # Dropped here rather than left for a tick that may never come. The relays are off;
     # leaving the sequence standing would only let it energize them again.
     if roofMotion.running:
         roofMotion.reset()
-    # Published from here too: this path returns before serviceRoofOnce() gets to do it.
     publishRoofDrive(roofInstance)
     # No lock here either, so the rods go back on the mailbox rather than to the port.
     requestRodRetract()
-    if stopped:
-        triggerEvent("roofMotionStopped")
-    else:
-        triggerEvent("roofMotionError", "Roof motion timed out while the roof lock was unavailable")
+    triggerEvent("roofMotionStopped")
 
 def serviceRoofOnce(roofInstance, generation):
     """One status poll plus whatever commands are pending, in a single lock hold.
