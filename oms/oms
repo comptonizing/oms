@@ -189,6 +189,46 @@ def spawn(coro):
 # to drift away from it.
 rtspGrabTimeout = 10
 
+# The widest a CCTV frame is allowed to reach the rest of the program. Cameras here are
+# 1080p or better, and every stage downstream of the grab is paid per pixel: the colour
+# conversion and the PIL wrap in grabRTSP, then the JPEG encode and the base64 in
+# encodeImage, and finally the string itself down one websocket per connected client every
+# stream_refresh seconds. Full-resolution q80 runs a few hundred kB, which base64 inflates
+# by a third; at 960 wide it is a fraction of that, for a picture nobody inspects pixel by
+# pixel -- the frame answers "is the roof where I left it", not "which star is that".
+#
+# 960 rather than a 16:9 480p width because the common inputs divide into it exactly (1920
+# halves, 3840 quarters), and an integer reduction is the case cv2.resize's INTER_AREA has
+# a fast path for. A camera that does not divide evenly still works, just by the general
+# path. A module constant and not a setting on purpose: it is a pipeline property with one
+# sensible value, like rtspGrabTimeout above, and nothing about it is per-installation.
+streamMaxWidth = 960
+
+def downscaleFrame(frame, maxWidth=streamMaxWidth):
+    """Shrinks a decoded frame to at most maxWidth, keeping its aspect ratio.
+
+    Done here, on the raw array, rather than on the PIL image grabRTSP returns: the caller
+    that matters converts colour and wraps the buffer immediately afterwards, so resizing
+    first makes those two cheaper as well, and cv2's reduction is faster than PIL's on the
+    Pi. Net effect is less work than not resizing at all -- the resize costs far less than
+    the JPEG encode it shrinks by the same factor.
+
+    INTER_AREA because this only ever reduces: it averages the pixels that fall into each
+    output cell, where the interpolating filters sample a few of them and alias whatever is
+    finer than the new grid -- exactly the fence and gravel detail a CCTV frame is full of.
+
+    A frame already at or below maxWidth is returned untouched. Never enlarges: there is no
+    detail to recover, and it would cost every stage downstream to invent pixels.
+    """
+    height, width = frame.shape[:2]
+    if width <= maxWidth:
+        return frame
+    # max(1, ...) so an implausibly wide, short frame cannot ask for a zero-height image,
+    # which cv2 rejects outright.
+    return cv2.resize(frame, (maxWidth, max(1, round(height * maxWidth / width))),
+                      interpolation=cv2.INTER_AREA)
+
+
 def grabRTSP(url: str, timeout=rtspGrabTimeout):
     logger.debug("Grabbing frame from {}".format(url))
     logger.debug("Opening capture")
@@ -211,7 +251,9 @@ def grabRTSP(url: str, timeout=rtspGrabTimeout):
             raise Exception("Failed to read frame from stream at {}".format(url))
         if frame is None:
             raise Exception("Received empty frame from {}".format(url))
-        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        # Downscaled before the conversion and the wrap, not after: both are per-pixel, and
+        # so is everything the caller does with the result.
+        return Image.fromarray(cv2.cvtColor(downscaleFrame(frame), cv2.COLOR_BGR2RGB))
     finally:
         cap.release()
 
