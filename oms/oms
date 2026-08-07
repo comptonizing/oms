@@ -4286,6 +4286,20 @@ def main():
         if thing[0] == "roofUpdate":
             updateRoofIcons(thing[1])
             return
+        if thing[0] == "roofMotionDone":
+            ui.notify(f"Roof {thing[1]} complete", type="positive")
+            return
+        if thing[0] == "roofMotionError":
+            # The only place a motion failure reaches the operator. failRoofMotion() composes
+            # the reason and stamps it on motionFaultReason, but nothing on the page shows
+            # that field, so without this a latched roof looks exactly like an idle one --
+            # the icons simply stop moving.
+            ui.notify(f"Roof motion failed: {thing[1]}", type="negative")
+            return
+        if thing[0] == "roofMotionStopped":
+            # Fired with no payload, unlike the two above, so do not index thing[1].
+            ui.notify("Roof stopped", type="warning")
+            return
         if thing[0] == "fanUpdate":
             ui.notify(f"Fans set to {thing[1]} ({"auto" if thing[2] else "manual"})")
             return
@@ -4299,7 +4313,7 @@ def main():
             ui.notify(f"Warning: {thing[1]}", type="warning")
             return
         if thing[0] == "error":
-            ui.notify(f"Error: {thing[1]}", type="warning")
+            ui.notify(f"Error: {thing[1]}", type="negative")
             return
         logger.error(f"Unknown update event, ignoring: {thing}")
 
