@@ -1741,6 +1741,13 @@ def roofOpenPrepBudget():
     is added for each, plus one more as slack. A budget that expires before the phases it
     contains can finish is the whole bug this exists to remove.
 
+    That slack is thin -- one poll period at the setting floors -- and a poll period is not
+    what a tick costs when the port is retrying, so OPEN_SETTLE re-bases the outer deadline
+    onto the rod's own number when the kick hands over to it. What is left standing here is
+    therefore the bound the kick runs on; it is over-generous for that by a whole rod
+    stroke, which costs nothing while the worker is healthy and is only visible as how long
+    the kick's relay may stay up if one wedges.
+
     Set rather than left None, unlike CLOSE_RODCLEAR: the kick energizes a relay, and
     enforceRoofStopWithoutLock() is armed by this deadline being set. It is the only thing
     that can drop that relay while the worker is wedged holding roofLock.
@@ -2033,9 +2040,17 @@ def advanceRoofMotion(roofInstance, status, log, event):
         # re-based one, and only the run phases are on roof_travel_timeout. Naming the wrong
         # number here is how this hid -- an open faulting mid-rod-stroke reported "did not
         # finish its open within 60s" and read like a roof that would not move.
-        if roofMotion.phase in (MotionPhase.OPEN_KICK, MotionPhase.OPEN_SETTLE):
+        if roofMotion.phase is MotionPhase.OPEN_KICK:
             reason = "{} half did not get off its seat within {:.0f}s".format(
                     half.value.lower(), roofOpenPrepBudget())
+        elif roofMotion.phase is MotionPhase.OPEN_SETTLE:
+            # Re-based on entry, so this is the rod's number and not the prep sum. Reaching
+            # it at all means the phase's own deadline -- two poll periods shorter -- did not
+            # get a tick to fire on, so the honest reading is a starved worker rather than a
+            # slow rod; naming the rod's budget still points at the right stretch of time.
+            reason = "{} rod did not finish its stroke within {:.0f}s".format(
+                    half.value.lower(),
+                    numericSetting("roof_rod_timeout", 30) + 2 * roofPollPeriod)
         elif roofMotion.phase is MotionPhase.CLOSE_TIGHTEN:
             reason = "{} half did not finish seating within {:.0f}s".format(
                     half.value.lower(), numericSetting("roof_close_overrun", 2))
@@ -2130,7 +2145,23 @@ def advanceRoofMotion(roofInstance, status, log, event):
         # From here the phase is bounded by the rod, not by the dead time. drive() enforces
         # REVERSE_DEAD_TIME by itself when OPEN_RUN comes to energize the relay again, and
         # a rod stroke is an order of magnitude longer than it anyway.
-        roofMotion.phaseDeadline = now + numericSetting("roof_rod_timeout", 30)
+        rodTimeout = numericSetting("roof_rod_timeout", 30)
+        roofMotion.phaseDeadline = now + rodTimeout
+        # Re-based on what is left to do, exactly as CLOSE_TIGHTEN is and for the same
+        # reason. roofOpenPrepBudget() is a sum of everything before OPEN_RUN with one poll
+        # period of margin, and a poll period is not what a tick costs: a tick that has to
+        # retry the port spends 2 * (WRITE_RETRIES + 1) * roof_timeout inside itself, which
+        # is 0.8s at roof_timeout 0.2 and 8s at its ceiling. Two of those and the prep budget
+        # runs out mid-stroke, on a rod still well inside its own deadline, and the fault
+        # blames the half for not getting off its seat. Nothing unsafe -- both relays are off
+        # here -- but a flaky board turning a working open into a latched fault is the same
+        # kind of wrong answer that made the prep budget necessary in the first place.
+        #
+        # Set rather than cleared: it is what arms enforceRoofStopWithoutLock(), which is the
+        # only thing that can end this sequence while the worker is wedged holding roofLock.
+        # Two poll periods, so the phase's own deadline above is always the one that fires on
+        # a healthy worker and the accurate message is the one the operator sees.
+        roofMotion.deadline = now + rodTimeout + 2 * roofPollPeriod
         enterMotionPhase(MotionPhase.OPEN_SETTLE, log,
                          "kick done, relays off, holding for the rod stroke")
         return
