@@ -2495,10 +2495,24 @@ def requestRoofMotion(action):
         triggerEvent("roofMotionError", "Unknown roof motion")
         return
     if action == "stop":
-        if not roof.Roof.isInitialized():
+        # Fetched once, into a local, rather than asked for at each of the three points
+        # below. isInitialized() followed by get() is a check then a use, and what runs in
+        # between is makeRoof() on the settings thread: Roof.reset() clears _instance
+        # *first* (deliberately -- see there) and only then closes the port and builds a
+        # replacement, so the window is a serial close and a serial open wide. Landing in
+        # it used to make get() raise "No roof instance initialized" inside the try, which
+        # the handler below reported as a relay that would not come off -- it had, reset()
+        # de-energizes on its way out -- and then re-raised out of the stop button from the
+        # except itself, where nothing catches it. The one control that has to work when
+        # everything else is broken must not be the one that crashes.
+        try:
+            roofInstance = roof.Roof.get()
+        except Exception as e:
             # Nothing to de-energize: Roof.reset() drives all four pins off as it drops
-            # the instance, so there is no roof left holding a relay closed.
-            logger.warning("Roof stop requested with no roof initialized, nothing to de-energize")
+            # the instance, so there is no roof left holding a relay closed. True both for
+            # a roof that was never configured and for one being replaced right now.
+            logger.warning("Roof stop requested with no roof initialized ({}), "
+                           "nothing to de-energize".format(e))
             triggerEvent("roofMotionError", "Roof not initialized")
             return
         try:
@@ -2506,19 +2520,21 @@ def requestRoofMotion(action):
             # but a motion relay left energized is a roof still moving with nothing left to
             # stop it, and this call cannot hang and only ever drives pins to OFF -- the
             # worst a race with the worker can do is stop the roof twice. The same
-            # reasoning stopRoof() already uses on its own lock-timeout path.
-            roof.Roof.get().stopMotion()
+            # reasoning stopRoof() already uses on its own lock-timeout path. That covers
+            # the losing side of the race above too: if this is an instance reset() has
+            # already discarded, every write here is a pin driven to OFF a second time.
+            roofInstance.stopMotion()
             logger.warning("Roof stopped on request, motion relays de-energized")
         except Exception as e:
             # Every relay was attempted before this raised; stopMotion() collects the
             # failures rather than giving up on the first. A relay that would not come off
             # must refuse further motion, so this latches as well as reporting.
             logger.error("Error de-energizing the roof on a stop request: {}".format(e))
-            roof.Roof.get().faultMotion("could not de-energize on a stop request: {}".format(e))
+            roofInstance.faultMotion("could not de-energize on a stop request: {}".format(e))
             triggerEvent("roofMotionError", "Could not de-energize the roof: {}".format(e))
         # The arrows come from the relays, and the worker may never run again to publish
         # this itself -- a wedged or dead worker is exactly why a stop comes through here.
-        publishRoofDrive(roof.Roof.get())
+        publishRoofDrive(roofInstance)
         # The rods are the other half of stopping, and they are the part this thread may
         # not do: they live on the board, behind the port, behind the lock. Left for the
         # worker. If it never runs again the firmware retracts them on its own timer.
