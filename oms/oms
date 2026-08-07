@@ -1742,15 +1742,19 @@ def roofOpenPrepBudget():
     contains can finish is the whole bug this exists to remove.
 
     That slack is thin -- one poll period at the setting floors -- and a poll period is not
-    what a tick costs when the port is retrying, so OPEN_SETTLE re-bases the outer deadline
-    onto the rod's own number when the kick hands over to it. What is left standing here is
-    therefore the bound the kick runs on; it is over-generous for that by a whole rod
-    stroke, which costs nothing while the worker is healthy and is only visible as how long
-    the kick's relay may stay up if one wedges.
+    what a tick costs when the port is retrying, so both phases that follow re-base the
+    outer deadline onto their own number: OPEN_SETTLE onto the rod's when the kick hands
+    over, and OPEN_KICK onto the kick's the moment its relay closes. What is left standing
+    here is therefore only the window before anything is energized -- the sequence waiting
+    out REVERSE_DEAD_TIME for drive() to be accepted. Being over-generous for that by a
+    whole rod stroke is deliberate: it is the one stretch whose length cannot be predicted
+    (a tick retrying the port costs up to 8s), and with both relays off there is nothing to
+    be urgent about.
 
-    Set rather than left None, unlike CLOSE_RODCLEAR: the kick energizes a relay, and
-    enforceRoofStopWithoutLock() is armed by this deadline being set. It is the only thing
-    that can drop that relay while the worker is wedged holding roofLock.
+    Set rather than left None, unlike CLOSE_RODCLEAR: enforceRoofStopWithoutLock() is armed
+    by this deadline being set, and it must already be armed when the kick's relay closes.
+    From that instant the re-based value is what bounds the contactor, and this path is the
+    only thing that can drop it while the worker is wedged holding roofLock.
     """
     return (roof.Roof.REVERSE_DEAD_TIME
             + numericSetting("roof_kick_time", 2)
@@ -1781,6 +1785,11 @@ def roofBlindDriveBudget():
     because it is also what arms enforceRoofStopWithoutLock(), which is the only thing that
     can drop these relays when the worker is wedged holding roofLock. This bounds the other
     failure -- worker healthy, board gone -- and the two need separate numbers.
+
+    OPEN_KICK does add this to its outer deadline, which is not that contradiction: the kick
+    is short enough that its whole relay time is inside the window this describes, so the
+    same allowance that lets a run phase keep pulling through a few dead ticks is exactly
+    the margin the kick's deadline needs to not fire before the kick's own clock does.
     """
     attempts = roof.Roof.WRITE_RETRIES + 1
     return 3 * (attempts * numericSetting("roof_timeout", 0.2) + roofPollPeriod)
@@ -2041,8 +2050,21 @@ def advanceRoofMotion(roofInstance, status, log, event):
         # number here is how this hid -- an open faulting mid-rod-stroke reported "did not
         # finish its open within 60s" and read like a roof that would not move.
         if roofMotion.phase is MotionPhase.OPEN_KICK:
-            reason = "{} half did not get off its seat within {:.0f}s".format(
-                    half.value.lower(), roofOpenPrepBudget())
+            # Two different failures share this phase, and they are on different budgets
+            # since the kick re-bases this deadline the moment its relay closes. No phase
+            # deadline means the relay never closed at all -- drive() refused for the whole
+            # window, or no tick got a status to try on -- and nothing was ever energized.
+            # One set means it closed and the kick did not end on time, which only happens
+            # when the worker stopped running the phase, and that is the case where this
+            # deadline is the thing dropping the contactor. Neither is "the half did not get
+            # off its seat": whether it left is decided in OPEN_SETTLE, by the switches.
+            if roofMotion.phaseDeadline is None:
+                reason = "{} half never started its kick within {:.0f}s".format(
+                        half.value.lower(), roofOpenPrepBudget())
+            else:
+                reason = "{} kick relay stayed up {:.1f}s past its {:.1f}s kick".format(
+                        half.value.lower(), roofBlindDriveBudget(),
+                        numericSetting("roof_kick_time", 2))
         elif roofMotion.phase is MotionPhase.OPEN_SETTLE:
             # Re-based on entry, so this is the rod's number and not the prep sum. Reaching
             # it at all means the phase's own deadline -- two poll periods shorter -- did not
@@ -2136,6 +2158,38 @@ def advanceRoofMotion(roofInstance, status, log, event):
             if status is not None and roofInstance.drive(half, roof.Direction.OPEN):
                 kick = numericSetting("roof_kick_time", 2)
                 roofMotion.phaseDeadline = now + kick
+                # The relay is up as of the line above, and from here until stopHalf() this
+                # deadline is the only thing that can drop it: it is what arms
+                # enforceRoofStopWithoutLock(), and a worker wedged in a serial read runs
+                # none of the timers below. What it carried in from startRoofMotionHalf()
+                # was roofOpenPrepBudget(), which includes the whole rod stroke -- a stroke
+                # that happens in OPEN_SETTLE with both relays off. That left the one phase
+                # holding a contactor bounded at ~30s when the kick is over in ~2, long
+                # enough to run the half fully open and stall it on its end stop.
+                #
+                # Re-based here rather than on entry because only here is what remains known
+                # exactly: the kick, then one tick to notice it expired. Before the relay
+                # closes it is however many ticks REVERSE_DEAD_TIME takes, and a tick that
+                # has to retry the port is not a poll period -- it is up to 8s at
+                # roof_timeout's ceiling. Guessing that window is how OPEN_SETTLE's budget
+                # came to fire mid-stroke on a healthy open, and there is no need to guess
+                # it: nothing is energized until this line, so the generous entry budget
+                # bounds the right thing there.
+                #
+                # The kick plus roofBlindDriveBudget(), not the two poll periods the other
+                # re-bases use, because this deadline is checked before the phase body and
+                # would otherwise pre-empt it. A tick that has to retry the port arrives
+                # seconds late; it then finds the kick clock expired and calls stopHalf() in
+                # that same tick, so the relay comes off at the same instant either way --
+                # the only difference a tighter bound makes is that the motion latches a
+                # fault instead of going on to the rod. That is a spurious latch bought for
+                # nothing, and at roof_timeout's ceiling one slow tick is 8s, so it would be
+                # the normal outcome rather than an edge case. roofBlindDriveBudget() is
+                # already the answer to "how long may a contactor stay closed while ticks
+                # and status are not landing" -- the run phases hold their relays on it --
+                # and it is derived from the poll, so a site configured slow is not punished.
+                # 4.2s at the setting floors, against the 30.5s this used to carry.
+                roofMotion.deadline = now + kick + roofBlindDriveBudget()
                 log(logging.INFO, "Roof open [{}]: driving OPEN for a {:.1f}s kick".format(
                     half.value.lower(), kick))
             return
