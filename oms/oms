@@ -1444,12 +1444,27 @@ def readRoofConfig():
     # A motor pin outside the header's range cannot be driven at all, so this is fatal in
     # the way the timeout is not. It already failed, later and less clearly, when
     # roof.Roof() handed the number to RPi.GPIO.
+    #
+    # Two of them on one pin is one contactor answering to two commands, and neither
+    # protection that exists covers it: initSwitches() refuses a contested pin but only
+    # among the device switches, and pinUsedForRoof() asks whether a pin is one of these
+    # four, which a duplicate inside the four passes. Nothing downstream notices either --
+    # drive()'s interlock is computed from Roof.__driving, which a shared pin desynchronizes
+    # from the hardware by construction. Fatal for the same reason the range is: there is no
+    # way to guess which relay the operator meant, and refusing is what initSwitches()
+    # already does with a pin two switches want.
     floor, ceiling = settingBounds["roof_pins_west_open"]
+    seen = {}
     for key in ("pinWestOpen", "pinWestClose", "pinEastOpen", "pinEastClose"):
         if not floor <= config[key] <= ceiling:
             logger.error("Roof {} is {}, outside the usable GPIO range {} to {}".format(
                 key, config[key], floor, ceiling))
             return None
+        if config[key] in seen:
+            logger.error("Roof {} and {} are both pin {}; each motion relay needs its own "
+                "pin, roof unusable".format(seen[config[key]], key, config[key]))
+            return None
+        seen[config[key]] = key
     return config
 
 class OwnerTrackingLock:
