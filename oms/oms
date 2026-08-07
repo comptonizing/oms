@@ -2235,8 +2235,30 @@ def advanceRoofMotion(roofInstance, status, log, event):
                 half.value.lower()))
             startRoofMotionHalf(now, log, event)
             return
-        if roofInstance.drive(half, roof.Direction.OPEN) and not roofMotion.runLogged:
+        if roofMotion.phaseDeadline is not None and now > roofMotion.phaseDeadline and any(
+                status[sw.bit] for sw in half.closedSwitches):
+            # Back on its seat. OPEN_SETTLE proved this half off its closed switches before
+            # promoting, so a switch reading engaged again means the drive has let go and
+            # gravity has taken the half home. There is no counterpart to CLOSE_RUN's start
+            # check here -- departure is a precondition of this phase, so a copy of it would
+            # find the seat switches already clear on the first tick and retire itself --
+            # but this reading exists only on the open side and is the same hazard: a motor
+            # energized for the rest of roof_travel_timeout against a half going nowhere.
+            failRoofMotion(roofInstance,
+                    "{} half is back on its closed switches during the open run".format(
+                        half.value.lower()), log, event)
+            return
+        started = roofInstance.drive(half, roof.Direction.OPEN)
+        if started and not roofMotion.runLogged:
             roofMotion.runLogged = True
+            # Grace before the check above arms. Right after the rod stroke the half is
+            # barely clear of its seat, and a switch flickering back as it settles must not
+            # fail a working open. roof_close_start_timeout is borrowed rather than given a
+            # sibling setting: it already means "how long a half may take to be visibly
+            # under way", which is the same question. Unlike CLOSE_RUN's use of it, this
+            # deadline is never retired -- sliding back is what happens *after* the half
+            # was moving.
+            roofMotion.phaseDeadline = now + numericSetting("roof_close_start_timeout", 10)
             log(logging.INFO, "Roof open [{}]: driving OPEN, gravity has it".format(
                 half.value.lower()))
         return
