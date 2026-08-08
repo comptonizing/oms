@@ -92,11 +92,21 @@ class Roof():
     # a belt drive reversed while the motor is still turning fights its own inertia, and
     # both relays are switching mains-side contactors.
     REVERSE_DEAD_TIME = 2.0
-    # Consecutive polls that must agree before "both halves adrift" is believed. Checks 1
-    # and 2 below need a switch to spuriously *engage*, which does not happen; this one
-    # fires on a switch spuriously *disengaging*, which a dirty contact or vibration on the
-    # parked half can do for a single sample. Counted in polls rather than seconds because
-    # it is tied to oms/oms's roofPollPeriod, not to the site.
+    # Consecutive board replies that must agree before "both halves adrift" is believed.
+    # Checks 1 and 2 below need a switch to spuriously *engage*, which does not happen; this
+    # one fires on a switch spuriously *disengaging*, which a dirty contact or vibration on
+    # the parked half can do for a single sample.
+    #
+    # Replies, not polls. __decodeAndCheck() runs these checks over every status word the
+    # board sends back and a poll is only one of them, so a tick that also extends a rod,
+    # retracts one or switches the fans contributes two strikes rather than one. Three
+    # strikes is therefore three readings, which is three ticks only while nothing else is
+    # being commanded -- it used to say polls, and that was never what it counted.
+    #
+    # Readings rather than seconds either way, because what it debounces is a bad sample and
+    # not a condition that lasts: it is tied to how often the board is asked, not to the
+    # site. Nothing has to be sized against the shortening -- no legal point of either
+    # sequence reaches this check, since only one half is ever off an end position at a time.
     ABSENCE_STRIKES = 3
 
     def __new__(cls, *args, **kwargs):
