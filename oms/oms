@@ -1543,19 +1543,47 @@ roofLock = OwnerTrackingLock()
 # the lifecycle paths join the worker first, so it is contended only in the window
 # where that join timed out.
 #
-# On top of the worst a hold can run: serviceRoofOnce can make two writeCmd() calls in one
-# lock hold -- the status poll, and a fan command taken from the mailbox -- and each one
-# retries once, so the hold is bounded by two calls' worth of (WRITE_RETRIES + 1) attempts,
-# each up to roof_timeout. Derived rather than hardcoded for the same reason
-# environmentStopBudget() is: the flat 5s this used to be was sized against a 0.2s default
-# and only had a ~1s margin over the measured 4.00s hold at roof_timeout=2 -- a second
-# retry, a higher ceiling, or a real (non-pty) wedged bridge converts that silently into
-# abandoned workers and "fans and motion may still be on" at shutdown.
 roofStopGrace = 3
 
+# The most serial exchanges one serviceRoofOnce() can make inside a single roofLock hold.
+# Named and enumerated rather than written into roofStopBudget() as a literal, so that
+# adding a serial call to the tick has one obvious place to be accounted for -- the job
+# Roof.WRITE_RETRIES already does for the retry count. It carried the value 2 for a long
+# time after it had stopped being true, describing a tick that only ever polled the status
+# and switched the fans; the motion machine added the rest and nothing pointed back here.
+#
+# Where the five come from, in the order serviceRoofOnce() makes them:
+#   1  the status poll
+#   2  retractRoofRods(), which is one exchange per half and there are two rods
+#   1  a fan command taken from the mailbox
+#   1  the motion machine's own: extendRod() in OPEN_KICK, or retractRod() in
+#      CLOSE_RODCLEAR. Never both -- they are different phases, and the "already there"
+#      short-circuit returns before any phase body runs.
+#
+# The count has to be a fixed number rather than a worst case over branches, which is why
+# the rods have exactly one call site per tick: while a stop retracted them and the "rods"
+# handler could retract them again, the ceiling was 5 on a good tick and 7 on one where the
+# first attempt failed -- and that is precisely the tick where every exchange also costs its
+# full timeout, so the number was largest exactly when it was least trustworthy.
+roofMaxExchangesPerTick = 5
+
 def roofStopBudget():
+    """The longest one roofLock hold can run, and so how long to wait for it.
+
+    Derived rather than hardcoded for the same reason environmentStopBudget() and
+    captureStopBudget() are: the flat 5s this used to be was sized against a 0.2s default
+    and only had a ~1s margin over the measured 4.00s hold at roof_timeout=2 -- a second
+    retry, a higher ceiling, or a real (non-pty) wedged bridge converts that silently into
+    abandoned workers and "fans and motion may still be on" at shutdown.
+
+    Being too short does not merely make a wait shorter, it changes the outcome: stopRoof()
+    uses this as its worker join timeout and then as its lock timeout, so a budget under the
+    real hold abandons a worker that was working fine, reports "the serial port is most
+    likely wedged" when it is not, and leaves makeRoof() unable to bring the roof back until
+    the next successful save.
+    """
     attempts = roof.Roof.WRITE_RETRIES + 1
-    return 2 * attempts * numericSetting("roof_timeout", 0.2) + roofStopGrace
+    return roofMaxExchangesPerTick * attempts * numericSetting("roof_timeout", 0.2) + roofStopGrace
 roofThread = None
 # The current roof worker's stop event, and only that. makeRoof() replaces it for each new
 # worker rather than clearing it, and the worker itself holds its own reference, so
@@ -1671,21 +1699,6 @@ roofCommands = {}
 def postRoofCommand(key, value):
     with roofCommandLock:
         roofCommands[key] = value
-
-def dropRoofCommand(key):
-    """Removes one key, for work another path has just carried out.
-
-    Only "rods" needs this, and only from stopRoofMotion(). requestRoofMotion()'s stop
-    posts a rod retract *and* a stop, and serviceRoofOnce() runs the stop before it takes
-    the mailbox -- so the retracts the stop has just sent would be sent a second time by
-    the "rods" handler a few lines later, against the same status, read before those
-    retracts went out and so still reporting both rods extended.
-
-    Silent about a key that was never there, and it does not ask who posted it: a stop that
-    has retracted the rods satisfies the request whether it was its own or an older one.
-    """
-    with roofCommandLock:
-        roofCommands.pop(key, None)
 
 def takeRoofCommands():
     global roofCommands
@@ -1851,17 +1864,32 @@ def roofBlindDriveBudget():
     attempts = roof.Roof.WRITE_RETRIES + 1
     return 3 * (attempts * numericSetting("roof_timeout", 0.2) + roofPollPeriod)
 
-# How old a queued open or close may be when the worker finally reaches it. A command
-# normally waits one poll period; the honest worst case is a poll that failed plus the
-# backoff that follows it (roofPollPeriod * roofPollBackoffMax, ~5 s) plus a roofLock hold
-# of up to roofStopBudget(). Thirty seconds is several times that, so nothing legitimate
-# ever expires, and it is short enough that the roof cannot start moving minutes after
-# somebody asked it to -- which is what a board that went away for a while used to
-# produce, because the mailbox holds a command until there is a status to judge it
-# against. A constant rather than a setting: it is arithmetic on the poll rate, not a
-# property of the site. A stop is never expired and never reaches the check: it carries no
-# stamp at all, because a stop is never the wrong thing to do however old it is.
-roofMotionCommandMaxAge = 30.0
+def roofMotionCommandMaxAge():
+    """How old a queued open or close may be when the worker finally reaches it.
+
+    A command normally waits one poll period. The honest worst case is a poll that failed
+    plus the backoff that follows it (roofPollPeriod * roofPollBackoffMax, ~5 s) plus a
+    roofLock hold of up to roofStopBudget() -- and this has to sit comfortably above that
+    sum, or a command that was merely waiting its turn is thrown away as stale.
+
+    Twice the sum, floored at the 30 s this was for a long time. It was a flat 30 back when
+    the budget could not exceed 11, where 30 was several times the worst wait; once the
+    budget is derived from the real exchange count it reaches 23 at roof_timeout's ceiling,
+    and 5 + 23 = 28 against a flat 30 is no margin at all. Derived, so the relationship holds
+    at every setting instead of at the one it was written for.
+
+    The floor is what keeps the common case unchanged: at the shipped roof_timeout of 0.2
+    the sum is 10 s and twice it is 20, so 30 stands exactly as before. Only a site that has
+    turned the board timeout up pays for it, and there it buys 56 s -- still short enough
+    that the roof cannot start moving minutes after somebody asked it to, which is what a
+    board that went away for a while used to produce, because the mailbox holds a command
+    until there is a status to judge it against.
+
+    A function rather than a setting: it is arithmetic on the poll rate and the lock hold,
+    not a property of the site. A stop is never expired and never reaches the check -- it
+    carries no stamp at all, because a stop is never the wrong thing to do however old it is.
+    """
+    return max(30.0, 2 * (roofPollPeriod * roofPollBackoffMax + roofStopBudget()))
 
 class RoofMotion:
     """Where the roof sequence has got to. Owned by the roof worker thread.
@@ -2080,9 +2108,11 @@ def advanceRoofMotion(roofInstance, status, log, event):
     roofBlindDriveBudget(); see blindRunTooLong().
 
     Never blocks and never sleeps. Each call does at most one relay write and one serial
-    command, so the lock hold stays in milliseconds and roofStopBudget() stays honest --
-    which is the whole reason the sequence is a state machine rather than a function that
-    drives the roof and waits for it.
+    command -- which is the whole reason the sequence is a state machine rather than a
+    function that drives the roof and waits for it, and it is the last of the five terms
+    roofMaxExchangesPerTick counts. The lock hold is not milliseconds, though: it is this
+    one exchange plus the rest of the tick's, and roofStopBudget() is derived from all of
+    them together rather than from this line alone.
     """
     if not roofMotion.running:
         return
@@ -2459,14 +2489,12 @@ def advanceRoofMotion(roofInstance, status, log, event):
         startRoofMotionHalf(now, log, event)
         return
 
-def stopRoofMotion(roofInstance, status, log, event):
-    """Drops every motion relay and abandons the sequence. Needs no status.
+def stopRoofMotion(roofInstance, log, event):
+    """Drops every motion relay and abandons the sequence. Needs no status, and no port.
 
     Which is why it is a function of its own rather than a branch of
     executeMotionCommand(): it has to work on a tick whose poll failed, and that is
-    precisely the tick on which a half may be energized with nothing left to notice. The
-    status is taken only so the rods can be retracted when there happens to be one; the
-    stop itself does not depend on it.
+    precisely the tick on which a half may be energized with nothing left to notice.
 
     The de-energize is unconditional. A stop is a panic button, not a phase transition, so
     it does not first ask what the sequence thinks it is doing -- stopMotion() drives all
@@ -2474,6 +2502,15 @@ def stopRoofMotion(roofInstance, status, log, event):
     contactor is closed is exactly the state a stop exists to end. Only the bookkeeping is
     conditional: a FAULT phase is left standing as the record of how the last motion
     ended, because clearing that is Roof.clearMotionFault() and an operator's decision.
+
+    The rods used to be retracted from here and are now serviceRoofOnce()'s, which is the
+    only thing that knows whether the "rods" mailbox key is also asking for them. Two call
+    sites in one tick meant the same rod was retracted twice -- and, when the first attempt
+    failed, the re-post was consumed by the very tick that made it. One site per tick makes
+    the count of serial exchanges in a lock hold a fixed number rather than one that depends
+    on which branch failed, which is what roofMaxExchangesPerTick has to be able to state.
+    Nothing is lost here: the relays are the part of a stop that must not wait, and they
+    come off above with four local GPIO writes that need neither the board nor the port.
     """
     running = roofMotion.running
     if running:
@@ -2482,20 +2519,6 @@ def stopRoofMotion(roofInstance, status, log, event):
     else:
         log(logging.INFO, "Roof stop requested with no motion running; de-energizing anyway")
     roofInstance.stopMotion()
-    # The relays are off; the rods still need the port. Done inline when there is a status
-    # to say which of them are actually out, and left to a later tick when there is not --
-    # this is the one path that runs with the board possibly gone.
-    if status is None or not retractRoofRods(roofInstance, status, log):
-        requestRodRetract()
-    else:
-        # Sent, so the request comes out of the mailbox rather than being left for the
-        # "rods" handler serviceRoofOnce() reaches a few lines after this call. Leaving it
-        # had that handler retract every rod a second time on this very tick, off the same
-        # status -- read before these retracts went out, so its REQ bits still said
-        # extended. That is exactly the double send retractRoofRods() and CLOSE_RODCLEAR
-        # both take care to avoid: a retract on a rod already coming back restarts the
-        # firmware's 20 s isRetracted() clock, which the next close then waits out.
-        dropRoofCommand("rods")
     if running:
         roofMotion.reset()
         event("roofMotionStopped")
@@ -2508,7 +2531,7 @@ def executeMotionCommand(roofInstance, status, action, postedAt, log, event):
     from takeRoofStop() before the status is even examined.
     """
     age = time.monotonic() - postedAt
-    if age > roofMotionCommandMaxAge:
+    if age > roofMotionCommandMaxAge():
         # Queued while the board was not answering: the mailbox holds a command until
         # there is a status to judge it against, and that wait is unbounded. The roof may
         # have been moved by hand since, and one that starts moving a minute after it was
@@ -2805,14 +2828,22 @@ def serviceRoofOnce(roofInstance, generation):
         # Before the status, because a stop needs none and the tick whose poll just failed
         # is the one an operator most wants it to work on. Before the machine, because
         # otherwise a phase could energize a half on the very tick the stop arrived.
-        if takeRoofStop():
+        stopped = takeRoofStop()
+        if stopped:
             try:
-                stopRoofMotion(roofInstance, status, log, event)
+                stopRoofMotion(roofInstance, log, event)
             except Exception as e:
                 # A relay write failed while stopping. That is the one failure that has to
                 # latch: faultMotion() tries every relay again and refuses further motion
                 # until an operator has looked at it.
                 failRoofMotion(roofInstance, f"could not stop roof motion: {e}", log, event)
+        if stopped and status is None:
+            # The relays are off, but the rods live on the board and this tick has no
+            # reading to say which of them are out. Left for one that has: the firmware
+            # retracts each by itself after MAX_EXTENDED regardless, so this only makes it
+            # prompt. Posted here rather than below because the mailbox is not taken at all
+            # on a tick without a status.
+            requestRodRetract()
         # Taken after the poll, so that a command posted while it was in flight is
         # picked up now, and so a failed poll leaves the mailbox untouched for the
         # next attempt. A command that fails once it has been taken is reported and
@@ -2823,12 +2854,21 @@ def serviceRoofOnce(roofInstance, generation):
         # unknown roof.
         if status is not None:
             commands = takeRoofCommands()
-            if "rods" in commands:
-                # Left by a stop that could not reach the board itself. Attempted once and
-                # then dropped rather than retried forever: the firmware retracts each rod
-                # by itself after MAX_EXTENDED, so a second failure is not worth a warning
-                # every poll for as long as the roof stays up.
-                retractRoofRods(roofInstance, status, log)
+            if stopped or "rods" in commands:
+                # The one place rods are retracted, whether this tick's stop wants it or a
+                # "rods" key left by a path that could not reach the board itself --
+                # requestRoofMotion()'s stop posts both, so the two used to fire in the same
+                # tick and retract every rod twice, the second time off a status read before
+                # the first had gone out.
+                #
+                # A failure re-posts rather than retrying here, and it matters that this sits
+                # *after* takeRoofCommands(): posting before it would have the same tick
+                # consume the request it had just made, which is the immediate retry the
+                # "left for a tick that can" rule exists to avoid. It is still attempted only
+                # once per tick and never chased forever -- the firmware retracts each rod by
+                # itself after MAX_EXTENDED, so this only ever makes it prompt.
+                if not retractRoofRods(roofInstance, status, log):
+                    requestRodRetract()
             if "fans" in commands:
                 mode, auto = commands["fans"]
                 try:
