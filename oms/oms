@@ -1969,8 +1969,23 @@ def retractRoofRods(roofInstance, status, log):
     other half's rod out because it was not the one being driven would be an odd exception
     to make -- and in practice only one is ever out, so the loop costs nothing.
 
-    Returns False if anything could not be sent, so the caller can leave it for a tick that
-    can.
+    Returns (ok, status). ok is False if anything could not be sent, so the caller can
+    leave it for a tick that can. status is the newest word the board returned, which the
+    caller has to carry forward for the rest of the tick: a retract's reply is a status
+    like any other, and the reading the tick was working from is stale by one exchange the
+    moment the first retract goes out. executeFanCommand() hands its reply back for exactly
+    this reason.
+
+    It is not a nicety. Everything after this in a tick judges the roof against `status`,
+    and the one that matters is CLOSE_RODCLEAR: reading the pre-retract word it still sees
+    REQ set, so it sends a second retract to a rod that has just been told to go back --
+    the very double send this function and that phase both take care to avoid. Reachable
+    whenever a "rods" key survives a status-less tick and a close arrives before the next
+    good one, which puts both in the same tick.
+
+    The loop reads the freshest word it has for each half rather than the one it was
+    handed, which is strictly better: a rod the firmware has retracted by itself in the
+    meantime is then skipped rather than commanded again.
     """
     ok = True
     for half in roof.RoofHalf:
@@ -1978,12 +1993,12 @@ def retractRoofRods(roofInstance, status, log):
             if not roofInstance.rodExtendRequested(half, status=status):
                 continue
             log(logging.INFO, "Roof stop: retracting the {} rod".format(half.value.lower()))
-            roofInstance.retractRod(half)
+            status = roofInstance.retractRod(half)
         except Exception as e:
             log(logging.WARNING, "Could not retract the {} rod: {}".format(
                 half.value.lower(), e))
             ok = False
-    return ok
+    return ok, status
 
 def requestRodRetract():
     """Leaves a rod retract for the worker, for stop paths that cannot do it themselves.
@@ -2922,7 +2937,11 @@ def serviceRoofOnce(roofInstance, generation):
                 # "left for a tick that can" rule exists to avoid. It is still attempted only
                 # once per tick and never chased forever -- the firmware retracts each rod by
                 # itself after MAX_EXTENDED, so this only ever makes it prompt.
-                if not retractRoofRods(roofInstance, status, log):
+                #
+                # The status comes back because the retracts have just invalidated the one
+                # this tick polled, and the phase machine below reads it. See there.
+                ok, status = retractRoofRods(roofInstance, status, log)
+                if not ok:
                     requestRodRetract()
             if "fans" in commands:
                 mode, auto = commands["fans"]
