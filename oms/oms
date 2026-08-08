@@ -1672,6 +1672,21 @@ def postRoofCommand(key, value):
     with roofCommandLock:
         roofCommands[key] = value
 
+def dropRoofCommand(key):
+    """Removes one key, for work another path has just carried out.
+
+    Only "rods" needs this, and only from stopRoofMotion(). requestRoofMotion()'s stop
+    posts a rod retract *and* a stop, and serviceRoofOnce() runs the stop before it takes
+    the mailbox -- so the retracts the stop has just sent would be sent a second time by
+    the "rods" handler a few lines later, against the same status, read before those
+    retracts went out and so still reporting both rods extended.
+
+    Silent about a key that was never there, and it does not ask who posted it: a stop that
+    has retracted the rods satisfies the request whether it was its own or an older one.
+    """
+    with roofCommandLock:
+        roofCommands.pop(key, None)
+
 def takeRoofCommands():
     global roofCommands
     with roofCommandLock:
@@ -2472,6 +2487,15 @@ def stopRoofMotion(roofInstance, status, log, event):
     # this is the one path that runs with the board possibly gone.
     if status is None or not retractRoofRods(roofInstance, status, log):
         requestRodRetract()
+    else:
+        # Sent, so the request comes out of the mailbox rather than being left for the
+        # "rods" handler serviceRoofOnce() reaches a few lines after this call. Leaving it
+        # had that handler retract every rod a second time on this very tick, off the same
+        # status -- read before these retracts went out, so its REQ bits still said
+        # extended. That is exactly the double send retractRoofRods() and CLOSE_RODCLEAR
+        # both take care to avoid: a retract on a rod already coming back restarts the
+        # firmware's 20 s isRetracted() clock, which the next close then waits out.
+        dropRoofCommand("rods")
     if running:
         roofMotion.reset()
         event("roofMotionStopped")
