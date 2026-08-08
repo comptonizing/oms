@@ -2816,8 +2816,9 @@ def serviceRoofOnce(roofInstance, generation):
     singleton can be replaced under a worker that outlived its stopRoof(), and such a
     worker must not end up driving the roof that replaced it.
 
-    Returns False when the lock could not be taken, True otherwise. That return is what
-    lets roofLoop() count a timeout as a failure: it used to return None here and the
+    Returns False when the lock could not be taken and this worker is still the live one,
+    True otherwise -- including a superseded worker that could not take it. That return is
+    what lets roofLoop() count a timeout as a failure: it used to return None here and the
     loop read that as success, reset its failure count and never backed off -- so an
     abandoned worker holding the lock cost a blocking acquire and a log record every
     roofStopBudget() seconds, indefinitely. Being superseded returns True on purpose: the
@@ -2828,8 +2829,31 @@ def serviceRoofOnce(roofInstance, generation):
     log = DeferredLog()
     event = DeferredEvents()
     if not roofLock.acquire(timeout=roofStopBudget()):
+        if generation != roofGeneration:
+            # Superseded, and this is the one action in a tick that was not gated on that.
+            # Everything below it is -- the mailbox, the machine, the publish -- and this
+            # needs it for the same reason and one more.
+            #
+            # The same reason: roofInstance is the Roof *this* worker was started for, and
+            # a superseded worker is one stopRoof() has already retired. Its stopMotion()
+            # therefore drives four pins that may no longer be the roof's at all.
+            # Roof.reset() calls releaseMotionRelays(), which clears the on-destroy intent
+            # but leaves the Switch objects able to write, so a save that moved a motion pin
+            # to a device switch leaves this path de-energizing that device instead. That is
+            # precisely the failure releaseMotionRelays() exists to prevent at collection
+            # time, and this was a live path around it.
+            #
+            # The one more: takeRoofStop() *consumes*. A stop taken here is a stop the live
+            # worker never sees, carried out against a roof that no longer exists -- and the
+            # expired branch below is worse still, latching a fault on the retired instance
+            # while resetting the sequence the live one is running. Leaving the stop in the
+            # mailbox costs it nothing: requestRoofMotion() de-energized on the caller's own
+            # thread before ever posting, so the relays are already off, and the mailbox
+            # holds a stop until a worker that can act on it does.
+            return True
         # A pending stop and an expired travel budget both have to be acted on even here,
         # where the machine cannot run at all. Without the lock, deliberately -- see there.
+        # Only the live worker gets this far, which is the only one it can be right for.
         enforceRoofStopWithoutLock(roofInstance)
         # Reported by the caller, not here: this is the failure that repeats every poll
         # for as long as the lock is held, and it has to go through the same rate limit
