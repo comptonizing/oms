@@ -3108,9 +3108,6 @@ def stopRoof():
     # are about to be switched off regardless.
     clearRoofCommands()
     lastRoofStateTime = 0.0
-    # The sequence belonged to the roof that is going away. Dropped here rather than left
-    # to the worker, which may be the thing that could not be joined below.
-    roofMotion.reset()
     lastRoofDrive = {half: None for half in roof.RoofHalf}
     # Before the join, not after: from here on any worker still running is superseded,
     # whether it manages to stop or not, and must not publish or execute anything more.
@@ -3143,6 +3140,14 @@ def stopRoof():
     log = DeferredLog()
     if roofLock.acquire(timeout=roofStopBudget()):
         try:
+            # The sequence belonged to the roof that is going away, and it is dropped here
+            # rather than at the top of this function, where it used to be written with no
+            # lock at all. The worker reads the sequence for its whole tick inside this same
+            # lock -- deadline, then phase, then that phase's own deadline -- so an
+            # unsynchronized reset could land between two of those reads and leave it
+            # comparing a time against None. makeRoof() resets it again before it starts a
+            # worker, which is what covers the branch below where this lock was not granted.
+            roofMotion.reset()
             if roof.Roof.isInitialized():
                 # Motion first: it is a local GPIO write that cannot hang, while
                 # fansOff() talks to a board that may be wedged. Guarded separately so
@@ -3204,6 +3209,10 @@ def makeRoof():
         # unusable: stopRoof() has already joined the worker, so keeping the instance
         # would leave a roof that reports itself initialized with nothing polling it.
         roof.Roof.reset()
+        # Belt and braces for stopRoof()'s lock-timeout branch, which skips its own reset:
+        # a worker wedged in a serial read can still write the sequence after that branch
+        # gives up, and this is the last moment before a new worker exists to read it.
+        roofMotion.reset()
         if config is None:
             event("roofUpdate", None)
             return False
