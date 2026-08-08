@@ -2016,6 +2016,23 @@ def failRoofMotion(roofInstance, reason, log, event):
     # status may be stale or absent, and one of them is a serial exchange that just failed.
     requestRodRetract()
 
+def abandonFaultedMotion(roofInstance, log, event):
+    """Ends the sequence for a fault the Roof has already latched by itself.
+
+    Distinct from failRoofMotion(), and the difference is who decided. failRoofMotion() is
+    for a failure the sequence itself found -- a budget that ran out, a half that will not
+    move -- so it composes a reason and latches it. This one is for a fault a consistency
+    check inside Roof latched first, where the reason already exists and everything is
+    already de-energized; all that is left is to stop the sequence and say which phase it
+    was in. Reporting it through failRoofMotion() instead would wrap the Roof's own reason
+    in a second one of ours and name the wrong cause.
+    """
+    log(logging.ERROR, "Roof motion abandoned in {}: {}".format(
+        roofMotion.phase.name, roofInstance.motionFaultReason))
+    event("roofMotionError", roofInstance.motionFaultReason)
+    roofMotion.reset()
+    roofMotion.phase = MotionPhase.FAULT
+
 def blindRunTooLong(roofInstance, now, half, log, event):
     """Whether a run phase has held its contactor blind for longer than it may.
 
@@ -2119,11 +2136,7 @@ def advanceRoofMotion(roofInstance, status, log, event):
     if not roofInstance.motionReady:
         # Faulted underneath us, almost certainly by a consistency check inside the
         # getStatus() a few lines up the call stack. Everything is already de-energized.
-        log(logging.ERROR, "Roof motion abandoned in {}: {}".format(
-            roofMotion.phase.name, roofInstance.motionFaultReason))
-        event("roofMotionError", roofInstance.motionFaultReason)
-        roofMotion.reset()
-        roofMotion.phase = MotionPhase.FAULT
+        abandonFaultedMotion(roofInstance, log, event)
         return
 
     now = time.monotonic()
@@ -2232,7 +2245,8 @@ def advanceRoofMotion(roofInstance, status, log, event):
         #
         # Nothing in this block returns, so a rod that will not go out never stalls the
         # phase machine: the kick still ends on its own deadline, with its relay coming
-        # off on time, and OPEN_SETTLE is where the failure is decided.
+        # off on time, and OPEN_SETTLE is where the failure is decided. The one way out is
+        # the fault guard below, which is not this block's business.
         replied = roofInstance.extendRod(half)
         if roofInstance.rodExtendRequested(half, status=replied):
             roofMotion.rodSent = True
@@ -2241,6 +2255,23 @@ def advanceRoofMotion(roofInstance, status, log, event):
         else:
             log(logging.WARNING, "The {} rod did not take its extend command".format(
                 half.value.lower()))
+
+    # Re-checked, because the send above is the second place a fault can land inside one
+    # tick. That reply is a status word like any other and __decodeAndCheck() runs the
+    # consistency checks over it, so a broken switch can latch a fault here, after the guard
+    # at the top of this function has already passed.
+    #
+    # Without it the tick carried straight on into the phase body and ran a step of the
+    # sequence -- ending the kick, dropping the relay, entering OPEN_SETTLE -- on a roof whose
+    # motion was already latched faulted, and nothing said so until the next tick's guard
+    # noticed. Nothing was at risk either way: faultMotion() de-energizes before it returns,
+    # so the relay was already off, and every phase that could energize one refuses on a
+    # faulted roof. What this buys is that the sequence stops at the fault instead of one step
+    # past it, and the operator is told inside the same tick, naming the phase it was really
+    # in rather than the one it had already moved on to.
+    if not roofInstance.motionReady:
+        abandonFaultedMotion(roofInstance, log, event)
+        return
 
     if phase is MotionPhase.OPEN_KICK:
         if roofMotion.phaseDeadline is None:
