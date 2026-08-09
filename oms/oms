@@ -3225,6 +3225,16 @@ def stopRoof():
     # repainting off that event reads the cleared state rather than the one being cleared.
     lastRoofStateTime = 0.0
     lastRoofDrive = {half: None for half in roof.RoofHalf}
+    # Read here for the same reason the two clears above are, and it is the same window:
+    # advanceRoofMotion() runs before serviceRoofOnce()'s last generation check, so a worker
+    # that was mid-tick when the bump landed can still move the sequence on afterwards. Read
+    # before the join and this would be a phase the roof has already left. The residue that
+    # leaves is immaterial to what it is for -- the worst an abandoned worker can cost is a
+    # message naming the phase the motion was in one tick ago, and it is reported either way.
+    #
+    # Only what is needed to describe the motion, not the RoofMotion itself, which the reset
+    # below is about to empty.
+    abortedMotion = (roofMotion.action, roofMotion.phase) if roofMotion.running else None
     log = DeferredLog()
     if roofLock.acquire(timeout=roofStopBudget()):
         try:
@@ -3270,6 +3280,36 @@ def stopRoof():
             except Exception as e:
                 logger.error("Error stopping roof motion without the lock: {}".format(e))
     triggerEvent("roofUpdate", None)
+    if abortedMotion is not None:
+        # This was the one way a motion could end having raised no event at all.
+        # stopRoofMotion() fires roofMotionStopped, failRoofMotion() and
+        # abandonFaultedMotion() fire roofMotionError, startRoofMotionHalf() fires
+        # roofMotionDone -- but a roof torn down under a running sequence simply went quiet.
+        # Every settings save does exactly this, whether or not the roof was moving, and
+        # makeRoof() gives no sign either: the operator saw "Applying settings ...", then a
+        # green "Settings applied", with a half stopped mid-travel. Nothing survived it,
+        # because the reset leaves the sequence IDLE rather than FAULT, so not even a latch
+        # remained to be found afterwards.
+        #
+        # Fired from here rather than beside the reset, because the reset is in two places:
+        # the lock branch does it, and the lock-timeout branch deliberately leaves it to
+        # makeRoof(). The motion is over on both -- the worker is retired by the generation
+        # bump above and the relays are de-energized on either branch -- so the report
+        # belongs where it is true of both, which is here.
+        #
+        # roofMotionError rather than roofMotionStopped because only that one carries a
+        # payload, and the phase is the whole of what makes this readable after the fact. A
+        # negative notification is the right weight too: nothing is unsafe, the relays are
+        # off, but the roof has been left somewhere nobody asked for it to be.
+        #
+        # Worded without a cause. stopRoof() has two callers -- makeRoof() on a settings save
+        # and shutdown() -- and naming the wrong one is worse than naming neither.
+        action, phase = abortedMotion
+        logger.warning("Roof {} aborted in {}: the roof was taken down while it was "
+                       "running; a half may be left part-way".format(action, phase.name))
+        triggerEvent("roofMotionError",
+                     "the {} was stopped in {} because the roof was taken down; a half may "
+                     "be left part-way".format(action, phase.name))
 
 
 def makeRoof():
