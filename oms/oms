@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import math
+import signal
 import logging
 import argparse
 import asyncio
@@ -1801,7 +1802,20 @@ def roofUnavailableReason():
 # unexecuted command that a newer one supersedes would only be undone again. Commands
 # stay in the mailbox until a poll succeeds, so one posted while the board is
 # unreachable is carried out when it comes back instead of being dropped.
-roofCommandLock = threading.Lock()
+# Reentrant, and only for the signal handler's sake. parkRoof() runs inside a signal
+# handler, which interrupts the main thread wherever it happens to be -- and the main thread
+# is a poster: every UI button reaches postRoofCommand() or postRoofStop() from the event
+# loop. A plain Lock would have the handler wait for a lock only the thread it interrupted
+# can release, which is a hang at exactly the moment the roof needs stopping.
+#
+# Reentrancy is safe here rather than merely convenient, because the main thread only ever
+# holds this across a single dict store. Interrupting one of those and running another leaves
+# both stores done, in some order: postRoofStop() nested inside a postRoofCommand("motion")
+# can leave a stop and a motion in the mailbox together, which serviceRoofOnce() already
+# handles -- it takes the stop first, and that is the documented Stop-then-Close. What it
+# cannot do is lose one. takeRoofCommands() *does* rebind the dict and could lose a store,
+# but only the roof worker calls it, and no signal handler runs on that thread.
+roofCommandLock = threading.RLock()
 roofCommands = {}
 
 def postRoofCommand(key, value):
@@ -2141,6 +2155,27 @@ def retractRoofRods(roofInstance, status, log):
                 half.value.lower(), e))
             ok = False
     return ok, status
+
+def parkRoofRods(roofInstance, log):
+    """Sends every extended rod back, reading the board for itself. Runs under roofLock.
+
+    retractRoofRods() works from a status its caller is already holding, because inside a
+    tick there always is one -- the poll at the top of serviceRoofOnce(). The teardown paths
+    have none: stopRoof() has just joined the worker, and parkRoof() may be running with no
+    worker left at all. So the poll belongs here, once, rather than at each of them.
+
+    Returns whether every rod that needed one got its retract. Best effort throughout: a
+    board that will not answer costs the promptness and nothing else, because the firmware
+    retracts each rod by itself after MAX_EXTENDED (20 s) regardless.
+    """
+    try:
+        status = roofInstance.getStatus()
+    except Exception as e:
+        log(logging.WARNING,
+            "Could not read the roof to see which rods are out: {}".format(e))
+        return False
+    ok, _ = retractRoofRods(roofInstance, status, log)
+    return ok
 
 def requestRodRetract():
     """Leaves a rod retract for the worker, for stop paths that cannot do it themselves.
@@ -3430,6 +3465,25 @@ def stopRoof():
                     roof.Roof.get().stopMotion()
                 except Exception as e:
                     log(logging.ERROR, f"Error stopping roof motion: {e}")
+                # The other half of stopping a motion, and the half every other stop path
+                # already asks for -- through the mailbox, because none of them may touch
+                # the port. This one has just joined the worker, so there is nobody left to
+                # drain a mailbox and the retract has to be sent from here or not at all.
+                #
+                # After the relays and before the fans: the relays are local GPIO writes
+                # that cannot hang, so they go first whatever else fails, while these two
+                # both talk to a board that may be wedged. Rods before fans because a rod
+                # left out is in the way of the next close -- CLOSE_RODCLEAR waits the
+                # firmware's whole 20 s clock out for it -- whereas fans left on are
+                # switched off by the next poll of a roof that comes back.
+                #
+                # The reset above means roofMotion.running is False, so retractRoofRods()
+                # applies no exception here and every extended rod comes back, which is
+                # what a teardown wants: the open this might have interrupted is over.
+                try:
+                    parkRoofRods(roof.Roof.get(), log)
+                except Exception as e:
+                    log(logging.WARNING, f"Error retracting the roof rods while stopping: {e}")
                 try:
                     roof.Roof.get().fansOff()
                 except Exception as e:
@@ -3484,6 +3538,150 @@ def stopRoof():
         triggerEvent("roofMotionError",
                      "the {} was stopped in {} because the roof was taken down; a half may "
                      "be left part-way".format(action, phase.name))
+
+
+# Held for the length of one parkRoof(). Taken without blocking, so a second signal
+# arriving while the first is still being handled goes straight on to the exit rather than
+# waiting behind a serial exchange -- a second Ctrl-C means "stop asking", and by then the
+# relays are already off anyway.
+roofParkLock = threading.Lock()
+
+def parkRoof(reason):
+    """Puts the roof in the state OMS must never leave it in any other.
+
+    Two things, and the order is the whole design. The motion relays come off first,
+    because RPi.GPIO leaves pin state exactly as it found it when the process dies: a half
+    that is being driven when OMS is killed keeps being driven, with nothing left running to
+    stop it at the far switch. Then the rods go back, which is a matter of not leaving the
+    next close to wait the firmware's clock out rather than a matter of safety.
+
+    Runs on whatever thread signalled -- the main one, inside a signal handler -- so nothing
+    here may block on a lock another thread holds indefinitely, and nothing may raise.
+    requestRoofMotion("stop") is already built to exactly that standard: it de-energizes
+    with four local GPIO writes on the caller's own thread, takes no lock to do it, and
+    posts the stop so a worker that is still alive abandons its sequence instead of
+    re-energizing the half on its next tick. This is the situation that path was written
+    for, so it is used rather than reimplemented.
+
+    The rods are the part that needs the port, and therefore the lock and a board that
+    answers. Bounded, and skipped when the lock cannot be had: parking must not become the
+    thing that stops the process exiting. requestRoofMotion() has already left a mailbox
+    request, so a live worker retracts them anyway, and the firmware retracts them after 20 s
+    whatever anybody manages here. This only makes it prompt in the case where no worker is
+    left, which is most of them.
+    """
+    if not roofParkLock.acquire(blocking=False):
+        logger.warning("Already parking the roof, ignoring: {}".format(reason))
+        return
+    try:
+        logger.warning("Parking the roof: {}".format(reason))
+        try:
+            requestRoofMotion("stop")
+        except Exception as e:
+            # requestRoofMotion() is written not to raise on its stop path, precisely
+            # because it is the control that has to work when everything else is broken.
+            # Guarded anyway: this one is called from a signal handler, where an exception
+            # would propagate into whatever the main thread was doing.
+            logger.error("Error stopping the roof while parking it: {}".format(e))
+        if not roof.Roof.isInitialized():
+            return
+        try:
+            roofInstance = roof.Roof.get()
+        except Exception as e:
+            # The same check-then-use window requestRoofMotion() documents: makeRoof() can
+            # clear the singleton in between. Nothing is left holding a relay if so --
+            # Roof.reset() de-energizes on its way out -- so there is nothing to park.
+            logger.warning("No roof to retract the rods of while parking ({})".format(e))
+            return
+        budget = roofStopBudget()
+        try:
+            acquired = roofLock.acquire(timeout=budget)
+        except Exception as e:
+            # OwnerTrackingLock raises on a reentrant acquire. The main thread does not take
+            # roofLock -- the worker and the makeRoof()/stopRoof() lifecycle do, and the
+            # lifecycle runs in a thread -- so this is unreachable rather than merely
+            # unlikely, and it is caught because a signal handler is the wrong place to
+            # find out it was reachable after all.
+            logger.error("Could not take the roof lock to retract the rods: {}".format(e))
+            return
+        if not acquired:
+            logger.error(
+                    "Timeout ({:.1f}s) taking the roof lock while parking; the rods were "
+                    "not retracted from here. A running worker still has the request, and "
+                    "the firmware retracts them on its own timer".format(budget))
+            return
+        log = DeferredLog()
+        try:
+            parkRoofRods(roofInstance, log)
+        except Exception as e:
+            log(logging.ERROR, "Error retracting the rods while parking: {}".format(e))
+        finally:
+            roofLock.release()
+            log.flush()
+    finally:
+        roofParkLock.release()
+
+# The signals that mean the process is going away, in the order of how likely they are to
+# be the one that arrives. SIGHUP is the reason this list is not just the two uvicorn
+# already handles: nothing installs a handler for it, so its default action terminates the
+# process outright -- no graceful shutdown, no on_shutdown, no teardown of any kind, and a
+# half left driving. getattr because SIGHUP does not exist everywhere, even though this
+# only ever runs on a Pi.
+exitSignals = tuple(sig for sig in (
+        getattr(signal, "SIGTERM", None),
+        getattr(signal, "SIGINT", None),
+        getattr(signal, "SIGHUP", None),
+        ) if sig is not None)
+
+def installExitSignalHandlers():
+    """Parks the roof on the way out, whatever the way out turns out to be.
+
+    Chained rather than replacing: uvicorn installs its own SIGINT and SIGTERM handlers
+    when it starts serving, and they are how a graceful shutdown begins at all. Ours runs
+    first, parks the roof, and then hands the signal to whatever was there before, so the
+    normal teardown -- shutdown(), which stops the workers and closes the ports -- happens
+    exactly as it did.
+
+    Which means this is not the only thing that stops the roof, and it is not meant to be.
+    stopRoof() does the same job on the graceful path and does it better, with the worker
+    joined first. This exists for the paths where that never runs: a SIGHUP, a second Ctrl-C
+    that sets uvicorn's force_exit, a graceful shutdown that wedges on something else. The
+    cost of it being redundant is one status poll; the cost of it being absent is a roof
+    left moving.
+
+    Installed from on_startup, which is late enough to see uvicorn's handlers and early
+    enough that the roof exists. signal.signal() only works on the main thread, which is
+    where on_startup runs.
+    """
+    for sig in exitSignals:
+        try:
+            previous = signal.getsignal(sig)
+            signal.signal(sig, makeExitSignalHandler(sig, previous))
+        except (ValueError, OSError) as e:
+            # Not fatal. A signal that cannot be hooked leaves the roof exactly as
+            # unprotected as it was before this function existed, and saying so in the log
+            # is worth more than refusing to start over it.
+            logger.error("Could not install a handler for {}: {}".format(
+                signal.Signals(sig).name, e))
+
+def makeExitSignalHandler(sig, previous):
+    def handler(signum, frame):
+        parkRoof("received {}".format(signal.Signals(signum).name))
+        if callable(previous):
+            # uvicorn's handle_exit, or Python's default SIGINT handler, which raises
+            # KeyboardInterrupt from here. Either way the normal shutdown carries on.
+            previous(signum, frame)
+            return
+        if previous == signal.SIG_IGN:
+            # Somebody deliberately wanted this signal ignored. Parking the roof anyway is
+            # the safe reading of a signal that arrived; terminating over it is not.
+            return
+        # SIG_DFL, which for all three of these means terminate. Put it back and re-raise
+        # against ourselves, so the process dies the way it would have without this handler
+        # -- including the exit status, which a sys.exit() here would get wrong.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    return handler
 
 
 def makeRoof():
@@ -5165,6 +5363,10 @@ async def startup():
         initSwitches()
     spawn(updateWorker())
     await initStuff()
+    # Last, and after initStuff(): uvicorn's own handlers are in place by now, so there is
+    # something to chain to, and the roof this parks exists. A signal arriving before this
+    # line still gets the graceful shutdown uvicorn has always given it.
+    installExitSignalHandlers()
 
 try:
     ui.run(dark=True, favicon="favicon.svg", port=args.port, reload=False)
