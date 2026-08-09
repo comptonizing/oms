@@ -1588,6 +1588,22 @@ roofStopGrace = 3
 # full timeout, so the number was largest exactly when it was least trustworthy.
 roofMaxExchangesPerTick = 5
 
+# The blocking calls one writeCmd() attempt makes, each separately bounded by roof_timeout:
+# __transact() writes and then reads, and readRoofConfig() hands the one setting to pyserial
+# as both `timeout` and `write_timeout` (roof.py). So an attempt's worst case is twice the
+# setting, not once it, and an exchange's is four times.
+#
+# Named rather than written in as a 2, for exactly the reason roofMaxExchangesPerTick is: it
+# was an unwritten 1 for a long time, nothing pointed at the assumption, and the write half
+# of every attempt went uncharged.
+#
+# The expensive path is not the one it looks like. A write that *raises* is the cheap case --
+# writeCmd() catches it, disconnects, and the next attempt goes through connect(), whose
+# reset_output_buffer() flushes the stuck queue so the retry writes straight through. A write
+# that is merely slow and then succeeds leaves a short read instead, which does not
+# disconnect, so the retry reuses the same port and pays the same stall a second time.
+roofTimeoutsPerAttempt = 2
+
 def roofStopBudget():
     """The longest one roofLock hold can run, and so how long to wait for it.
 
@@ -1602,9 +1618,18 @@ def roofStopBudget():
     real hold abandons a worker that was working fine, reports "the serial port is most
     likely wedged" when it is not, and leaves makeRoof() unable to bring the roof back until
     the next successful save.
+
+    Three terms, and each one had to be found the hard way. How many exchanges a tick makes
+    (roofMaxExchangesPerTick, which carried 2 long after the motion machine made it 5), how
+    many attempts an exchange makes (Roof.WRITE_RETRIES), and how many timeouts an attempt
+    can spend (roofTimeoutsPerAttempt, which was an unwritten 1 while pyserial was being
+    handed the setting as both the read and the write bound). Getting any of them wrong is
+    the same bug, and it is silent every time: the budget stays plausible and only the
+    outcome changes.
     """
     attempts = roof.Roof.WRITE_RETRIES + 1
-    return roofMaxExchangesPerTick * attempts * numericSetting("roof_timeout", 0.2) + roofStopGrace
+    return (roofMaxExchangesPerTick * attempts * roofTimeoutsPerAttempt
+            * numericSetting("roof_timeout", 0.2) + roofStopGrace)
 roofThread = None
 # The current roof worker's stop event, and only that. makeRoof() replaces it for each new
 # worker rather than clearing it, and the worker itself holds its own reference, so
@@ -1872,7 +1897,16 @@ def roofBlindDriveBudget():
     is 2.7s at a roof_timeout of 0.2 and 3.3s at its ceiling of 0.3, either of which is a
     different order of thing from a full travel budget.
 
-    Deliberately not a re-based roofMotion.deadline: that one stays on roof_travel_timeout
+    Deliberately not multiplied by roofTimeoutsPerAttempt, unlike roofStopBudget(), and the
+    difference is intent rather than an oversight. That budget has to bound the worst hold
+    that can really happen, so under-counting it abandons healthy workers. This one is a
+    debounce on how long a contactor may keep pulling with nothing watching it, so counting
+    the write half as well would only make it longer -- 5.1s instead of 3.3s at the ceiling --
+    and a relay held blind for longer is the wrong direction to be corrected in. Three
+    ordinary failed polls is what it means, and a failed poll that also stalls on its write
+    is not the case it is debouncing.
+
+    Deliberately not a re-based roofMotion.deadline either: that one stays on roof_travel_timeout
     because it is also what arms enforceRoofStopWithoutLock(), which is the only thing that
     can drop these relays when the worker is wedged holding roofLock. This bounds the other
     failure -- worker healthy, board gone -- and the two need separate numbers.
@@ -1900,7 +1934,7 @@ def roofMotionCommandMaxAge():
     written for.
 
     Since roof_timeout's ceiling came down to 0.3 the floor is what governs everywhere: the
-    budget cannot exceed 6 s, so the sum cannot exceed 11 and twice it is 22. The derivation
+    budget cannot exceed 9 s, so the sum cannot exceed 14 and twice it is 28. The derivation
     is kept rather than collapsed back into a constant, because it is what makes 30 provably
     enough instead of merely traditional, and it is what would notice if the budget grew
     again. 30 s is short enough that the roof cannot start moving minutes after somebody
@@ -4681,10 +4715,16 @@ initLock = asyncio.Lock()
 shuttingDown = False
 
 # How long shutdown() waits for a settings save to finish applying before tearing down
-# underneath it. A full initStuff() is ten to fifteen seconds -- stopRoof alone can spend
-# five joining its worker and five more on roofLock -- so this has to be comfortably more
-# than that, and still bounded: a wedged serial port must not be able to hold the process
-# open against whatever grace period the service manager allows.
+# underneath it. A full initStuff() is fifteen to twenty seconds -- stopRoof alone can spend
+# roofStopBudget() joining its worker and another on roofLock, which is 7s each at the
+# shipped roof_timeout of 0.2 and 9s each at its 0.3 ceiling -- so this has to be comfortably
+# more than that, and still bounded: a wedged serial port must not be able to hold the
+# process open against whatever grace period the service manager allows.
+#
+# Marginal at the ceiling, and knowingly so. Expiring is not a failure here: the handler logs
+# it and tears down anyway, on the stated grounds that an exit which cannot complete is worse
+# than the race. Raising it trades that race against a slower exit, which is a service-manager
+# question rather than an arithmetic one.
 shutdownInitLockTimeout = 20
 
 async def initStuff():
