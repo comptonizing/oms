@@ -632,6 +632,38 @@ for thing in environmentParameterMap.values():
 # 0.0 still means "never read", since monotonic() is never 0 in practice.
 environmentLastData["timestamp"] = 0.0
 
+# How old an inside reading may be before nothing should be concluded from it. Named here
+# rather than written into each of the two places that judge it, which is what let the fan
+# logic and the display disagree about what "current" means -- the fans have refused to run
+# on anything older than this since long before there was anything on screen to compare it
+# against.
+#
+# Not a setting: it is a property of how often the board reports, not of the site. The
+# worker polls the board every couple of seconds, so a minute is roughly thirty missed
+# readings -- far beyond a slow pass and well short of noticing a dead board only at dawn.
+environmentStateMaxAge = 60
+
+def getEnvironment():
+    """The last inside reading and how old it is, as ({name: value}, age in seconds).
+
+    age is None when nothing has been read at all, which is a different thing from an old
+    reading and has to stay distinguishable: a board that has never answered has no
+    last-known value to caption, exactly as getRoofState() reports None rather than an age
+    of zero.
+
+    Deliberately takes no lock, the same call the fan logic already makes here and for the
+    same reason: the worker writes the two values and then the timestamp, so the worst a
+    read caught mid-update sees is one new value beside one that is a poll old, and both
+    are far fresher than environmentStateMaxAge. A lock would put every reader on the
+    worker's path to buy consistency that nothing here needs.
+    """
+    data = {thing: environmentLastData.get(thing)
+            for thing in environmentParameterMap.values()}
+    stamp = environmentLastData["timestamp"]
+    if stamp == 0.0:
+        return data, None
+    return data, time.monotonic() - stamp
+
 def closeEnvironmentDatabase():
     """Closes the InfluxDB write API and client, and forgets both.
 
@@ -1458,9 +1490,10 @@ def updateFans():
     dt = time.monotonic() - environmentLastData["timestamp"]
     H = environmentLastData["inside_humidity"]
     T = environmentLastData["inside_temperature"]
-    if dt > 60:
+    if dt > environmentStateMaxAge:
         if fansAreOn:
-            logger.warning("Environment data older than 60s, switching fan off")
+            logger.warning("Environment data older than {}s, switching fan off".format(
+                environmentStateMaxAge))
             setFans("off", auto=True)
         return
     if H is None or T is None or math.isnan(H) or math.isnan(T):
@@ -4024,6 +4057,19 @@ def main():
             }
     weather_labels = {}
 
+    # The two readings that do not come from the weather station at all. They share the
+    # panel because that is where an operator looks for "what is it like right now", but
+    # they are kept in a table of their own because everything about how they are fetched
+    # and judged is different: a separate board on a separate serial port, its own
+    # staleness rule, and its own reasons for being unavailable. Folding them into
+    # weather_items would have updateWeather() look them up in the station's payload,
+    # where they are not, and blank them as absent on every pass.
+    environment_items = {
+            "inside_temperature": "Inside temperature",
+            "inside_humidity": "Inside humidity",
+            }
+    environment_labels = {}
+
     weather_ranges = {
             "10m": "1s",
             "1h": "30s",
@@ -4178,14 +4224,30 @@ def main():
                     weather_allsky_image = ui.image().classes("w-full").props('no-transition no-spinner')
                     weather_allsky_message = makeUnavailableMessage("cloud_off")
                 with ui.column().classes('w-full lg:col-span-2 gap-2'):
-                    with ui.grid().classes('grid-cols-2 lg:grid-cols-5 w-full gap-4'):
+                    # Six columns, not five: ten station readings plus the two from the
+                    # environment board make twelve, which fills two rows exactly instead
+                    # of leaving a row of two hanging under a row of five.
+                    with ui.grid().classes('grid-cols-2 lg:grid-cols-6 w-full gap-4'):
                         for thing in weather_items:
                             with ui.card().classes("w-full"):
                                 ui.label(weather_items[thing])
                                 with ui.card_section().classes("w-full p-1"):
                                     weather_labels[thing] = ui.label("Loading ...").classes("w-full")
+                        # Last, so the station's own readings keep the order they have
+                        # always been in and the pair from the board reads as a pair.
+                        for thing in environment_items:
+                            with ui.card().classes("w-full"):
+                                ui.label(environment_items[thing])
+                                with ui.card_section().classes("w-full p-1"):
+                                    environment_labels[thing] = ui.label("Loading ...").classes("w-full")
                     weather_stale_label = ui.label("").classes("w-full text-right text-red-500")
                     weather_stale_label.set_visibility(False)
+                    # Its own caption, because the two halves of the panel go stale
+                    # independently: the station is scraped over the network and the board
+                    # is read over a serial port, and one of them being old says nothing
+                    # about the other.
+                    environment_stale_label = ui.label("").classes("w-full text-right text-red-500")
+                    environment_stale_label.set_visibility(False)
 
             with ui.row().classes('w-full items-center gap-4'):
                 weather_range_select = ui.select(list(weather_ranges.keys()), label="Time range", value="6h").classes("w-full md:w-64 bg-zinc-800")
@@ -4775,19 +4837,106 @@ def main():
     # order, not by the order they were added in.
     weather_label_colors = "text-red-500 text-orange-500 text-green-500 text-gray-500"
 
+    weatherLabelSize = "text-3xl"
+
+    def setPanelLabel(labels, name, text, color=""):
+        """Write one value into the weather panel, taking off the colour it had before.
+
+        Every writer has to go through here: a label keeps the colour it was last given,
+        so the red left behind by an "Error" pass would otherwise outlive the good reading
+        that replaced it.
+
+        Takes the table to write into rather than closing over one, because there are two
+        of them now -- the station's readings and the environment board's -- and they are
+        written by different functions on different schedules against different notions of
+        "too old". The rule about the colour is the one thing they must share.
+        """
+        thing = labels[name]
+        thing.set_text(text)
+        thing.classes((weatherLabelSize + " " + color).strip(), remove=weather_label_colors)
+
+    def temperatureColor(value):
+        """Green through orange to red, out from the range nothing needs worrying about.
+
+        Shared by the outside reading and the inside one. The ladder was written for the
+        station and it transfers: what it marks is a temperature far enough from ordinary
+        to be worth a second look, and that is the same question in a dome as outside it.
+        """
+        if value < -20 or value >= 35:
+            return "text-red-500"
+        if value < -10 or value >= 25:
+            return "text-orange-500"
+        return "text-green-500"
+
+    def humidityColor(value):
+        """The same shape as temperatureColor(), around the band that is unremarkable.
+
+        The top end is the one that means something inside: it is what the fans are for,
+        and a reading in the reds is dew on the optics rather than a number out of range.
+        """
+        if value < 10 or value >= 90:
+            return "text-red-500"
+        if value < 20 or value >= 80:
+            return "text-orange-500"
+        return "text-green-500"
+
+    # What each inside reading is called on screen, and how to draw it. Kept beside the
+    # function that uses it rather than up with environment_items, which says what the
+    # cards are; this says what goes in them.
+    environment_formats = {
+            "inside_temperature": ("{:.1f} °C", temperatureColor),
+            "inside_humidity": ("{:.1f} %", humidityColor),
+            }
+
+    def updateEnvironment():
+        """Fills the two readings that come from the environment board, not the station.
+
+        Called from updateWeather() so that it rides the same timer and the same four
+        callers, and called from its very first line so that it runs *before* any of that
+        function's early returns. Those returns are all about the weather station -- an
+        allsky camera that is switched off, a scrape that has not come back -- and none of
+        them says anything about a board on a serial port inside the building. Sharing the
+        tick is convenient; sharing the verdict would mean the inside temperature went
+        blank whenever the outside one did.
+        """
+        data, age = getEnvironment()
+        if age is None:
+            # Never read: no board configured, or one that has not answered since OMS
+            # started. Not an error -- an unconfigured board is a supported state under the
+            # no-defaults contract -- and there is no last-known age to caption it with.
+            for name in environment_labels:
+                setPanelLabel(environment_labels, name, "N/A", "text-gray-500")
+            environment_stale_label.set_visibility(False)
+            return
+        if age > environmentStateMaxAge:
+            # The same threshold the fans refuse to run on. Saying "Error" while the fan
+            # logic has already switched them off for the same reading is the point: the
+            # two must not be able to disagree about what current means.
+            for name in environment_labels:
+                setPanelLabel(environment_labels, name, "Error", "text-red-500")
+            environment_stale_label.set_text(
+                    "inside readings last updated {}s ago".format(int(age)))
+            environment_stale_label.set_visibility(True)
+            return
+        environment_stale_label.set_visibility(False)
+        for name, (fmt, color) in environment_formats.items():
+            value = asNumber(data.get(name))
+            if value is None or math.isnan(value):
+                # The board answered, but not with this. NaN is worth testing for
+                # separately from None: a sensor that has dropped off the bus reports one
+                # rather than nothing at all, and it would format as "nan °C" and colour
+                # itself green, since every comparison against NaN is False.
+                setPanelLabel(environment_labels, name, "N/A", "text-gray-500")
+                continue
+            setPanelLabel(environment_labels, name, fmt.format(value), color(value))
+
     def updateWeather():
-        labelSize = "text-3xl"
+        # First, and deliberately above every early return below: see updateEnvironment().
+        updateEnvironment()
+        labelSize = weatherLabelSize
 
         def setLabel(name, text, color=""):
-            """Write one weather value, taking off whatever colour the label had before.
-
-            Every writer has to go through here: a label keeps the colour it was last
-            given, so the red left behind by an "Error" pass would otherwise outlive the
-            good reading that replaced it.
-            """
-            thing = weather_labels[name]
-            thing.set_text(text)
-            thing.classes((labelSize + " " + color).strip(), remove=weather_label_colors)
+            setPanelLabel(weather_labels, name, text, color)
 
         reason = weatherUnavailableReason()
         if reason is None and weatherWarmingUp():
@@ -4835,32 +4984,13 @@ def main():
         try:
             temperature = numbers["env_temperature"]
             if temperature is not None:
-                colstr = ""
-                if temperature < -20:
-                    colstr = "text-red-500"
-                elif temperature < -10:
-                    colstr = "text-orange-500"
-                elif temperature < 25:
-                    colstr = "text-green-500"
-                elif temperature < 35:
-                    colstr = "text-orange-500"
-                else:
-                    colstr = "text-red-500"
-                setLabel("env_temperature", "{:.1f} °C".format(temperature), colstr)
+                setLabel("env_temperature", "{:.1f} °C".format(temperature),
+                         temperatureColor(temperature))
 
             humidity = numbers["env_humidity"]
             if humidity is not None:
-                if humidity < 10:
-                    colstr = "text-red-500"
-                elif humidity < 20:
-                    colstr = "text-orange-500"
-                elif humidity < 80:
-                    colstr = "text-green-500"
-                elif humidity < 90:
-                    colstr = "text-orange-500"
-                else:
-                    colstr = "text-red-500"
-                setLabel("env_humidity", "{:.1f} %".format(humidity), colstr)
+                setLabel("env_humidity", "{:.1f} %".format(humidity),
+                         humidityColor(humidity))
 
             dewpoint = numbers["env_dewpoint"]
             if dewpoint is not None:
