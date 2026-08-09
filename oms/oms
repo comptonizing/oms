@@ -2023,7 +2023,8 @@ def retractRoofRods(roofInstance, status, log):
 
     Both halves, not just the one that was moving. A stop de-energizes both, so leaving the
     other half's rod out because it was not the one being driven would be an odd exception
-    to make -- and in practice only one is ever out, so the loop costs nothing.
+    to make -- and in practice only one is ever out, so the loop costs nothing. The single
+    exception is a rod an open is mid-stroke on, which the loop skips; see there for why.
 
     Returns (ok, status). ok is False if anything could not be sent, so the caller can
     leave it for a tick that can. status is the newest word the board returned, which the
@@ -2045,6 +2046,23 @@ def retractRoofRods(roofInstance, status, log):
     """
     ok = True
     for half in roof.RoofHalf:
+        if roofMotion.running and half is roofMotion.half and roofMotion.rodSent:
+            # The one rod that must not be pulled back. An open put it out on purpose and
+            # OPEN_SETTLE is waiting for the firmware to clear its REQ bit at the end of
+            # the stroke -- the only completion signal there is, since nothing senses the
+            # rod's position. A retract sent here clears that bit exactly as finishing
+            # would, and nothing downstream can tell the two apart: the next tick reads a
+            # stroke that never happened, finds the seat switches clear (a kick alone can
+            # shake a half off them without pushing it clear of its seal) and promotes to
+            # OPEN_RUN. The half then runs open on gravity having never been pushed. That
+            # is the failure OPEN_SETTLE's rodSent guard exists to prevent, and it cannot
+            # catch this one, because here the extend really was acknowledged.
+            #
+            # rodSent rather than running alone: until the board has acknowledged the
+            # extend there is no stroke to spoil, and a rod still out from something
+            # earlier should come back like any other. A stop leaves running False before
+            # it asks for a retract, so no stop path is affected.
+            continue
         try:
             if not roofInstance.rodExtendRequested(half, status=status):
                 continue
