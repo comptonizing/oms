@@ -61,7 +61,28 @@ settingBounds = {
         "weather_refresh": (5, 60),
         "weather_plot_refresh": (10, 600),
         "weather_environment_timeout": (2, 5),
-        "roof_timeout": (0.1, 2),
+        # The roof board's serial read *and* write timeout -- readRoofConfig() hands this one
+        # number to pyserial as both. The ceiling is not a comfort margin, it is load bearing
+        # twice over.
+        #
+        # It cannot usefully be large. roof.ino's loop() is two motor updates, whatever
+        # commands have arrived, and delay(10), so the firmware's worst case is that 10 ms
+        # plus three bytes at 9600 -- ~13 ms, and there is no path in the sketch that can
+        # exceed it. A board needing more than 0.3 s is faulty rather than slow, and waiting
+        # longer only delays finding that out.
+        #
+        # And it must not be large, because roofStopBudget() costs an exchange at
+        # attempts * roof_timeout while one attempt can spend write_timeout *and* the read
+        # timeout, which is twice what it charges. The two are equal at 0.3 and the budget is
+        # short above it -- and a short budget does not merely wait less: stopRoof() abandons
+        # a healthy worker, blames the serial port for it, and leaves makeRoof() unable to
+        # take the lock until the next successful save.
+        #
+        # Lowered from 2, where the real worst-case hold is 40 s against a 23 s budget. Safe
+        # to change under a running installation: a stored value above the ceiling is
+        # reported once by numericSetting() and falls back to the 0.2 every call site already
+        # passes, which is what the shipped configuration uses anyway.
+        "roof_timeout": (0.1, 0.3),
         # Motion budgets. roof_travel_timeout covers the part of one half's motion that is
         # actually travel -- OPEN_RUN, and CLOSE_RUN -- so it only has to sit above the
         # measured ~30 s of travel. Not the rod phases: those are firmware waits bounded by
@@ -1848,7 +1869,7 @@ def roofBlindDriveBudget():
     punished for it: one term is what a failed poll spends inside its own tick, one is the
     gap to the next, and three of them is three or four consecutive failures -- the same
     debounce depth ABSENCE_STRIKES already applies to deciding a half has gone adrift. That
-    is 2.7s at a roof_timeout of 0.2 and 13.5s at its ceiling of 2, either of which is a
+    is 2.7s at a roof_timeout of 0.2 and 3.3s at its ceiling of 0.3, either of which is a
     different order of thing from a full travel budget.
 
     Deliberately not a re-based roofMotion.deadline: that one stays on roof_travel_timeout
@@ -1873,17 +1894,18 @@ def roofMotionCommandMaxAge():
     sum, or a command that was merely waiting its turn is thrown away as stale.
 
     Twice the sum, floored at the 30 s this was for a long time. It was a flat 30 back when
-    the budget could not exceed 11, where 30 was several times the worst wait; once the
-    budget is derived from the real exchange count it reaches 23 at roof_timeout's ceiling,
-    and 5 + 23 = 28 against a flat 30 is no margin at all. Derived, so the relationship holds
-    at every setting instead of at the one it was written for.
+    the budget could not exceed 11, where 30 was several times the worst wait; that stopped
+    being self-evident once the budget started deriving from the real exchange count, so this
+    derives too and the relationship holds at every setting rather than at the one it was
+    written for.
 
-    The floor is what keeps the common case unchanged: at the shipped roof_timeout of 0.2
-    the sum is 10 s and twice it is 20, so 30 stands exactly as before. Only a site that has
-    turned the board timeout up pays for it, and there it buys 56 s -- still short enough
-    that the roof cannot start moving minutes after somebody asked it to, which is what a
-    board that went away for a while used to produce, because the mailbox holds a command
-    until there is a status to judge it against.
+    Since roof_timeout's ceiling came down to 0.3 the floor is what governs everywhere: the
+    budget cannot exceed 6 s, so the sum cannot exceed 11 and twice it is 22. The derivation
+    is kept rather than collapsed back into a constant, because it is what makes 30 provably
+    enough instead of merely traditional, and it is what would notice if the budget grew
+    again. 30 s is short enough that the roof cannot start moving minutes after somebody
+    asked it to, which is what a board that went away for a while used to produce, because
+    the mailbox holds a command until there is a status to judge it against.
 
     A function rather than a setting: it is arithmetic on the poll rate and the lock hold,
     not a property of the site. A stop is never expired and never reaches the check -- it
@@ -2309,7 +2331,7 @@ def advanceRoofMotion(roofInstance, status, log, event):
                 # Re-based here rather than on entry because only here is what remains known
                 # exactly: the kick, then one tick to notice it expired. Before the relay
                 # closes it is however many ticks REVERSE_DEAD_TIME takes, and a tick that
-                # has to retry the port is not a poll period -- it is up to 8s at
+                # has to retry the port is not a poll period -- it is up to 1.2s at
                 # roof_timeout's ceiling. Guessing that window is how OPEN_SETTLE's budget
                 # came to fire mid-stroke on a healthy open, and there is no need to guess
                 # it: nothing is energized until this line, so the generous entry budget
@@ -2322,8 +2344,9 @@ def advanceRoofMotion(roofInstance, status, log, event):
                 # that same tick, so the relay comes off at the same instant either way --
                 # the only difference a tighter bound makes is that the motion latches a
                 # fault instead of going on to the rod. That is a spurious latch bought for
-                # nothing, and at roof_timeout's ceiling one slow tick is 8s, so it would be
-                # the normal outcome rather than an edge case. roofBlindDriveBudget() is
+                # nothing, and at roof_timeout's ceiling one slow tick is 1.2s against the
+                # 1.0s two poll periods would allow, so it would still happen rather than
+                # being an edge case. roofBlindDriveBudget() is
                 # already the answer to "how long may a contactor stay closed while ticks
                 # and status are not landing" -- the run phases hold their relays on it --
                 # and it is derived from the poll, so a site configured slow is not punished.
@@ -2344,7 +2367,7 @@ def advanceRoofMotion(roofInstance, status, log, event):
         # reason. roofOpenPrepBudget() is a sum of everything before OPEN_RUN with one poll
         # period of margin, and a poll period is not what a tick costs: a tick that has to
         # retry the port spends 2 * (WRITE_RETRIES + 1) * roof_timeout inside itself, which
-        # is 0.8s at roof_timeout 0.2 and 8s at its ceiling. Two of those and the prep budget
+        # is 0.8s at roof_timeout 0.2 and 1.2s at its ceiling. Two of those and the prep budget
         # runs out mid-stroke, on a rod still well inside its own deadline, and the fault
         # blames the half for not getting off its seat. Nothing unsafe -- both relays are off
         # here -- but a flaky board turning a working open into a latched fault is the same
