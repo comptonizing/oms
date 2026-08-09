@@ -2280,14 +2280,16 @@ def advanceRoofMotion(roofInstance, status, log, event):
                     half.value.lower(),
                     numericSetting("roof_rod_timeout", 30) + 2 * roofPollPeriod)
         elif roofMotion.phase is MotionPhase.CLOSE_TIGHTEN:
-            # The overrun plus the two poll periods CLOSE_RUN adds when it re-bases, not the
-            # setting on its own: the setting is what the phase pulls for, this is what the
-            # deadline being reported was actually set to. Same reading as OPEN_SETTLE above
-            # -- the gap between the two is what the phase's own deadline had to fire in, so
-            # arriving here means no tick got to run it.
+            # The overrun plus the margin CLOSE_RUN adds when it re-bases, not the setting on
+            # its own: the setting is what the phase pulls for, this is what the deadline
+            # being reported was actually set to. Unlike OPEN_SETTLE above, arriving here is
+            # not merely a starved worker reported under a different name -- the tighten's
+            # own deadline expiring is how a close *succeeds*, so this branch is the one
+            # failure in the machine that can fire on a half already seated. See the re-base
+            # for what keeps that out of reach.
             reason = "{} half did not finish seating within {:.1f}s".format(
                     half.value.lower(),
-                    numericSetting("roof_close_overrun", 2) + 2 * roofPollPeriod)
+                    numericSetting("roof_close_overrun", 2) + roofBlindDriveBudget())
         else:
             reason = "{} half did not finish its {} within {:.0f}s".format(
                     half.value.lower(), roofMotion.action,
@@ -2599,7 +2601,24 @@ def advanceRoofMotion(roofInstance, status, log, event):
             # worked, on a half already on its switches, and the reset means the second half
             # never runs at all. It cannot extend an expired budget: the check above runs
             # first, so this transition is only reached on a tick that had time left.
-            roofMotion.deadline = now + overrun + 2 * roofPollPeriod
+            #
+            # roofBlindDriveBudget() for the margin, exactly as OPEN_KICK's re-base uses it
+            # and for the identical reason -- these are the two phases whose own deadline
+            # expiring is how they *succeed*, and the outer one is checked before the phase
+            # body, so a margin thinner than a slow tick turns a finished close into a
+            # latched fault. Two poll periods is 1.0s and one failed exchange is
+            # (WRITE_RETRIES + 1) * roofTimeoutsPerAttempt * roof_timeout, which is 0.8s at
+            # the shipped 0.2 and 1.2s at the ceiling, before any scheduling delay: at the
+            # ceiling a single failed poll landing on the tick that should have seated the
+            # half was enough, and the fault bought no relay time, because that same tick
+            # goes on to call stopHalf() anyway. What it cost instead was the rest of the
+            # motion -- failRoofMotion() resets the sequence, so the first half seats, the
+            # second never starts, and the roof is left half-shut and latched.
+            #
+            # OPEN_SETTLE keeps its two poll periods on purpose: reaching its outer deadline
+            # is a failure whichever of the two fires, so pre-empting it only picks a
+            # slightly different message.
+            roofMotion.deadline = now + overrun + roofBlindDriveBudget()
             enterMotionPhase(MotionPhase.CLOSE_TIGHTEN, log,
                              "closed switches engaged, pulling {:.1f}s past them".format(
                                  overrun))
