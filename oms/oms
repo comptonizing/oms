@@ -2419,7 +2419,16 @@ def advanceRoofMotion(roofInstance, status, log, event):
                 # already the answer to "how long may a contactor stay closed while ticks
                 # and status are not landing" -- the run phases hold their relays on it --
                 # and it is derived from the poll, so a site configured slow is not punished.
-                # 4.2s at the setting floors, against the 30.5s this used to carry.
+                # 4.2s at the setting floors, on a tick that lands. A lock held by somebody
+                # else adds up to roofStopBudget() on top -- ~7s at the same values -- because
+                # enforceRoofStopWithoutLock() is reached only once serviceRoofOnce()'s
+                # acquire has given up, so the wedged worker named above really costs ~11s.
+                # One acquire timeout and not a repeating one: the tick that fails to take
+                # the lock stops the roof from there. Said out loud because this is the line
+                # a reader takes a number from, and the mechanism above is what makes the
+                # number bigger than it looks. The budget this replaced carried the same
+                # term, so it was ~37.5s rather than 30.5s and the re-base still cuts the
+                # worst case by better than 3x.
                 roofMotion.deadline = now + kick + roofBlindDriveBudget()
                 log(logging.INFO, "Roof open [{}]: driving OPEN for a {:.1f}s kick".format(
                     half.value.lower(), kick))
