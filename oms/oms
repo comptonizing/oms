@@ -2606,14 +2606,40 @@ def advanceRoofMotion(roofInstance, status, log, event):
                     log, event)
             return
         started = roofInstance.drive(half, roof.Direction.CLOSE)
+        onOpen = any(status[sw.bit] for sw in half.openSwitches)
         if started and roofMotion.phaseDeadline is None and not roofMotion.runLogged:
-            roofMotion.phaseDeadline = now + numericSetting("roof_close_start_timeout", 10)
             roofMotion.runLogged = True
-            log(logging.INFO, "Roof close [{}]: driving CLOSE, pulling the half up".format(
-                half.value.lower()))
-        if started and roofMotion.phaseDeadline is not None and not any(
-                status[sw.bit] for sw in half.openSwitches):
+            if onOpen:
+                roofMotion.phaseDeadline = now + numericSetting("roof_close_start_timeout", 10)
+                log(logging.INFO, "Roof close [{}]: driving CLOSE, pulling the half up".format(
+                    half.value.lower()))
+            else:
+                # Nothing to depart from, so no check to arm. The whole of it is "you were on
+                # your open switches, leave them within N seconds"; a half that starts this
+                # phase between switches has no such reading to lose, and arming anyway meant
+                # the retirement below fired in the same tick off the same clear switches --
+                # the check never existed, and the log claimed a departure nothing watched.
+                #
+                # Reachable for any half that is not fully open when a close starts: a roof
+                # picked up part-way, one moved by hand, or one a teardown left mid-travel --
+                # which every settings save can produce, since makeRoof() stops a running
+                # motion whatever it was doing.
+                #
+                # Nothing better is available. With only end switches, no reading distinguishes
+                # a mid-travel half being pulled from one hanging still, which is exactly what
+                # OPEN_RUN says above about having no counterpart to this check. So the run is
+                # on roof_travel_timeout alone here, and that is said out loud rather than left
+                # to be inferred from a check that quietly retired itself.
+                log(logging.INFO, "Roof close [{}]: driving CLOSE from part-way; no departure "
+                    "to confirm, the travel budget is the only bound".format(
+                        half.value.lower()))
+        elif started and roofMotion.phaseDeadline is not None and not onOpen:
             # Confirmed moving. Retire the start check so it cannot fire later.
+            #
+            # elif, so this can only be reached on a tick after the one that armed it. Both
+            # were plain ifs, and the second read the phaseDeadline the first had just set.
+            # The onOpen gate above is what makes the arming honest; this is what makes a
+            # confirmation impossible to issue before there has been anything to confirm.
             roofMotion.phaseDeadline = None
             log(logging.INFO, "Roof close [{}]: confirmed off its open switches".format(
                 half.value.lower()))
