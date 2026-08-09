@@ -3164,8 +3164,6 @@ def stopRoof():
     # Anything still pending was meant for the roof that is going away, and the fans
     # are about to be switched off regardless.
     clearRoofCommands()
-    lastRoofStateTime = 0.0
-    lastRoofDrive = {half: None for half in roof.RoofHalf}
     # Before the join, not after: from here on any worker still running is superseded,
     # whether it manages to stop or not, and must not publish or execute anything more.
     roofGeneration += 1
@@ -3194,6 +3192,21 @@ def stopRoof():
         # Either way this name no longer refers to a worker anything should join or
         # signal: a successful stop leaves none, and an abandoned one is tracked above.
         roofThread = None
+    # After the join, not before. A worker that is mid-tick has already passed its last
+    # generation check -- serviceRoofOnce()'s, a few lines above its publish -- and goes on
+    # to write lastRoofState, lastRoofDrive and a fresh timestamp whatever this function
+    # does to them in the meantime, so clearing them ahead of the join clears nothing. Here
+    # neither kind of worker can: a joined one no longer exists, and an abandoned one is
+    # already retired by the generation bump above. The window this closes is widest exactly
+    # when it matters, because a tick can spend a whole roofStopBudget() in serial retries,
+    # and it is the reason getRoofState() has a timestamp to gate on at all -- a client
+    # connecting after the roof went away must not be handed convincing limit-switch icons
+    # and a pulsing drive arrow for a roof that is not there.
+    #
+    # The roofUpdate(None) at the end of this function still fires after these, so a client
+    # repainting off that event reads the cleared state rather than the one being cleared.
+    lastRoofStateTime = 0.0
+    lastRoofDrive = {half: None for half in roof.RoofHalf}
     log = DeferredLog()
     if roofLock.acquire(timeout=roofStopBudget()):
         try:
