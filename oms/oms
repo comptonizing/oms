@@ -9,6 +9,7 @@ import asyncio
 import threading
 import base64
 import json
+from collections import deque
 from enum import Enum
 import cv2
 from parse import parse
@@ -25,12 +26,73 @@ parser.add_argument("--port", required=False, help="Network port", type=int, def
 parser.add_argument("--loglevel", required=False, help="Log level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
 args = parser.parse_args()
 
+logFormat = "%(asctime)s %(levelname)s:%(name)s:%(message)s"
+
 logging.basicConfig(
         level = getattr(logging, args.loglevel),
-        format = "%(asctime)s %(levelname)s:%(name)s:%(message)s"
+        format = logFormat
         )
 
 logger = logging.getLogger(__name__)
+
+# How many lines the Log tab keeps. A ring buffer, not a setting: nothing about the
+# operator's installation makes one number right and another wrong, and the cost is not
+# theirs to tune blind -- ui.log holds one DOM element per line, per connected client, so
+# this is a memory bound rather than a preference.
+logBufferSize = 500
+
+class LogBuffer(logging.Handler):
+    """The last logBufferSize records, kept so the Log tab can show them.
+
+    Attached to the root logger, so it collects every message that clears the --loglevel
+    threshold, from this file and from anything else that logs through the standard
+    hierarchy -- the same set of lines that reaches stderr.
+
+    Records arrive from every worker thread. Each one is numbered, so a client that has
+    already drawn part of the buffer asks for what is new by serial rather than being
+    re-sent the history; and the numbers survive the deque dropping its oldest lines,
+    which a length or an index would not.
+
+    Deliberately not wired to triggerEvent(). updateWorker() logs a line for every event
+    it dispatches, so an event raised per record would raise a record per event -- at
+    --loglevel DEBUG that is a feedback loop that never quiets down. The Log tab polls
+    since() on a timer instead.
+    """
+
+    def __init__(self, capacity: int):
+        super().__init__()
+        self.records = deque(maxlen=capacity)
+        self.nextSerial = 0
+
+    def emit(self, record):
+        # logging.Handler.handle() holds self.lock across this call, which is the lock
+        # since() takes below -- so the deque is never read while it is being appended to,
+        # and iterating it there cannot raise "deque mutated during iteration".
+        try:
+            text = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        self.records.append((self.nextSerial, record.levelno, text))
+        self.nextSerial += 1
+
+    def since(self, serial: int):
+        """The buffered lines numbered `serial` or above, and the serial to ask for next.
+
+        Returning the next serial rather than letting the caller derive it from the lines
+        matters when nothing new has arrived: an empty result still has to move the
+        caller's cursor past records that were dropped, or a quiet client would keep
+        asking for a serial that no longer exists.
+        """
+        self.acquire()
+        try:
+            return [entry for entry in self.records if entry[0] >= serial], self.nextSerial
+        finally:
+            self.release()
+
+logBuffer = LogBuffer(logBufferSize)
+logBuffer.setFormatter(logging.Formatter(logFormat))
+logging.getLogger().addHandler(logBuffer)
 
 # Order matters here
 os.environ["NICEGUI_STORAGE_PATH"] = args.storage
@@ -3953,6 +4015,20 @@ def main():
         with ui.tab_panel(tab_roof):
             pass
 
+        with ui.tab_panel(tab_log):
+            with ui.card().classes("w-full"):
+                # max_lines matches the buffer: the tab shows exactly what is kept, and
+                # neither end drops a line the other end still holds.
+                #
+                # The height is an inline style rather than a Tailwind class on purpose.
+                # nicegui.css gives .nicegui-log a fixed height: 16rem, and which of the
+                # two would win depends on stylesheet order rather than on anything
+                # visible here; an inline style has no such argument to lose. The
+                # monospace font and the no-wrap come from that same class, so they are
+                # not repeated.
+                log_view = ui.log(max_lines=logBufferSize).classes("w-full text-xs") \
+                        .style("height: 70vh;")
+
         with ui.tab_panel(tab_settings):
             with ui.card().tight().classes("w-full"):
                 ui.label("Stream")
@@ -4105,6 +4181,39 @@ def main():
             status_roof_stale.set_visibility(True)
         else:
             status_roof_stale.set_visibility(False)
+
+    # Line colour by level. INFO gets none: it is the bulk of the log, and colouring the
+    # majority tells the eye nothing. DEBUG is dimmed rather than coloured, so that
+    # running at --loglevel DEBUG does not bury the handful of lines worth finding.
+    logLevelClasses = {
+            logging.DEBUG: "text-gray-500",
+            logging.WARNING: "text-amber-400",
+            logging.ERROR: "text-red-400",
+            logging.CRITICAL: "text-red-500 font-bold",
+            }
+
+    # The serial this client has already drawn up to. Per client, not global: two browsers
+    # on the same OMS each hold their own position in the same buffer.
+    log_cursor = Container(0)
+
+    def updateLog():
+        """Draws whatever has been logged since the last tick into the Log tab.
+
+        Polled rather than pushed -- see LogBuffer for why a log record must not raise an
+        update event. One second is the cadence updateRoofStaleness() ticks on and for the
+        same reason: there is no configured interval to key off, and the work when nothing
+        has been logged is one comparison against an empty list.
+
+        The cursor is moved to what since() reports rather than to the last line drawn, so
+        a client that was quiet while the ring wrapped resumes from what is left rather
+        than asking forever for a serial that has been dropped.
+        """
+        lines, nextSerial = logBuffer.since(log_cursor.get())
+        log_cursor.set(nextSerial)
+        for _, level, text in lines:
+            # classes=None leaves the line at the card's own colour, which is what INFO
+            # and anything at a non-standard level should get.
+            log_view.push(text, classes=logLevelClasses.get(level))
 
     def updateStream():
         reason = cctvUnavailableReason()
@@ -4635,6 +4744,10 @@ def main():
     updateWeather()
     updateStream()
     updateAllskyImages()
+    # The whole buffer, since this client's cursor starts at zero: a page opened after
+    # something went wrong shows the lines that say so, rather than starting blank and
+    # only filling with whatever happens next.
+    updateLog()
 
     weather_range_select.on_value_change(updatePlots)
 
@@ -4720,6 +4833,9 @@ def main():
         # fixed 5s threshold, not a setting -- so it is not in the table above and ticks
         # on its own short, fixed cadence instead.
         timers["update_roof_staleness"] = ui.timer(1.0, updateRoofStaleness, immediate=False)
+        # Same story for the log: how often lines arrive is not something the operator
+        # configures, so there is no setting to read and the cadence is fixed here.
+        timers["update_log"] = ui.timer(1.0, updateLog, immediate=False)
 
     def makeInfluxClient():
         oldClient = influx_client.get()
