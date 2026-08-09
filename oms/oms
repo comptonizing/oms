@@ -1982,6 +1982,12 @@ class RoofMotion:
         # call drive() every tick, and one line per tick for two minutes would bury the
         # transitions that actually matter.
         self.runLogged = False
+        # Whether this half has been seen off its open switches since CLOSE_RUN started
+        # pulling it. The start check and the slide-back check are the same reading -- the
+        # half is on its open switches with the motor pulling -- so this is the only thing
+        # that tells "it never left" from "it left and came back", which are the same
+        # hazard but not the same message. Per half, like rodSent and runLogged.
+        self.departed = False
         # When the run phases last found themselves without a status, or None when the
         # last one they saw was good. Only the run phases touch it, and they clear it on
         # every tick that has a status, so a poll that fails once and then recovers costs
@@ -2194,6 +2200,7 @@ def startRoofMotionHalf(now, log, event):
     # "now running" line.
     roofMotion.rodSent = False
     roofMotion.runLogged = False
+    roofMotion.departed = False
     if roofMotion.action == "open":
         # Always through the kick. There is no skip-the-kick path any more: roof_kick_time
         # has a floor of 1.5 s precisely because a rod pushing a half that is still hard on
@@ -2537,9 +2544,13 @@ def advanceRoofMotion(roofInstance, status, log, event):
             # promoting, so a switch reading engaged again means the drive has let go and
             # gravity has taken the half home. There is no counterpart to CLOSE_RUN's start
             # check here -- departure is a precondition of this phase, so a copy of it would
-            # find the seat switches already clear on the first tick and retire itself --
-            # but this reading exists only on the open side and is the same hazard: a motor
-            # energized for the rest of roof_travel_timeout against a half going nowhere.
+            # find the seat switches already clear on the first tick and have nothing to
+            # test -- but the hazard the check below covers is the same one CLOSE_RUN's
+            # deadline covers on its side: a motor energized for the rest of
+            # roof_travel_timeout against a half going nowhere. Both are one deadline read
+            # as "you are back where you started, with the motor pulling"; the two phases
+            # differ only in which end that is and in whether the start of the phase already
+            # counts as being there.
             failRoofMotion(roofInstance,
                     "{} half is back on its closed switches during the open run".format(
                         half.value.lower()), log, event)
@@ -2623,52 +2634,82 @@ def advanceRoofMotion(roofInstance, status, log, event):
                              "closed switches engaged, pulling {:.1f}s past them".format(
                                  overrun))
             return
-        if roofMotion.phaseDeadline is not None and now > roofMotion.phaseDeadline:
-            # The half never left its open position: the belt is slipping, the motor is
-            # not turning, or the drive is disconnected. Running it for the rest of the
-            # travel budget against a half that is not moving is exactly what must not
-            # happen, so this ends now rather than at the outer deadline.
-            failRoofMotion(roofInstance,
-                    "{} half still reports open {:.0f}s after closing started".format(
-                        half.value.lower(), numericSetting("roof_close_start_timeout", 10)),
-                    log, event)
+        onOpen = any(status[sw.bit] for sw in half.openSwitches)
+        if roofMotion.phaseDeadline is not None and now > roofMotion.phaseDeadline and onOpen:
+            # The half is sitting on its open switches with the motor pulling: the belt is
+            # slipping, the motor is not turning, or the drive is disconnected. Running it
+            # for the rest of the travel budget against a half that is not moving is exactly
+            # what must not happen, so this ends now rather than at the outer deadline.
+            #
+            # Gated on onOpen, and that gate is what makes this the mirror of OPEN_RUN's
+            # back-on-its-seat check rather than only a start check. The deadline used to be
+            # retired to None the moment the half was confirmed off its switches, so
+            # everything after that point was on roof_travel_timeout alone -- a half that got
+            # under way and then slid back down onto its open switches was driven for up to
+            # the whole 90s with nothing looking at it. That is the same hazard OPEN_RUN
+            # names on the other side, and the same reading is available here; retiring the
+            # deadline was what threw it away. Left standing instead, it costs nothing while
+            # the half is off its switches and fires the moment one engages again.
+            #
+            # No fresh grace on the way back, exactly as OPEN_RUN gives none: settling
+            # flicker happens in the seconds right after departure, which are inside the
+            # grace this deadline already carries, and a switch engaging long afterwards is
+            # not flicker.
+            if roofMotion.departed:
+                reason = "{} half is back on its open switches during the close run".format(
+                        half.value.lower())
+            else:
+                reason = "{} half still reports open {:.0f}s after closing started".format(
+                        half.value.lower(), numericSetting("roof_close_start_timeout", 10))
+            failRoofMotion(roofInstance, reason, log, event)
             return
         started = roofInstance.drive(half, roof.Direction.CLOSE)
-        onOpen = any(status[sw.bit] for sw in half.openSwitches)
-        if started and roofMotion.phaseDeadline is None and not roofMotion.runLogged:
-            roofMotion.runLogged = True
-            if onOpen:
-                roofMotion.phaseDeadline = now + numericSetting("roof_close_start_timeout", 10)
+        if started and onOpen and roofMotion.phaseDeadline is None:
+            # Armed whenever the half is on its open switches with the contactor closed, not
+            # only on the first tick of the phase. A half that started part-way arms nothing
+            # below, so without this a slide back down to fully open would land with no
+            # deadline to fire -- the one case the gate above could not otherwise cover.
+            roofMotion.phaseDeadline = now + numericSetting("roof_close_start_timeout", 10)
+            if roofMotion.runLogged:
+                log(logging.WARNING, "Roof close [{}]: on its open switches with the motor "
+                    "pulling, {:.0f}s to leave them".format(
+                        half.value.lower(), numericSetting("roof_close_start_timeout", 10)))
+            else:
+                roofMotion.runLogged = True
                 log(logging.INFO, "Roof close [{}]: driving CLOSE, pulling the half up".format(
                     half.value.lower()))
-            else:
-                # Nothing to depart from, so no check to arm. The whole of it is "you were on
-                # your open switches, leave them within N seconds"; a half that starts this
-                # phase between switches has no such reading to lose, and arming anyway meant
-                # the retirement below fired in the same tick off the same clear switches --
-                # the check never existed, and the log claimed a departure nothing watched.
-                #
-                # Reachable for any half that is not fully open when a close starts: a roof
-                # picked up part-way, one moved by hand, or one a teardown left mid-travel --
-                # which every settings save can produce, since makeRoof() stops a running
-                # motion whatever it was doing.
-                #
-                # Nothing better is available. With only end switches, no reading distinguishes
-                # a mid-travel half being pulled from one hanging still, which is exactly what
-                # OPEN_RUN says above about having no counterpart to this check. So the run is
-                # on roof_travel_timeout alone here, and that is said out loud rather than left
-                # to be inferred from a check that quietly retired itself.
-                log(logging.INFO, "Roof close [{}]: driving CLOSE from part-way; no departure "
-                    "to confirm, the travel budget is the only bound".format(
-                        half.value.lower()))
-        elif started and roofMotion.phaseDeadline is not None and not onOpen:
-            # Confirmed moving. Retire the start check so it cannot fire later.
+        elif started and not roofMotion.runLogged:
+            roofMotion.runLogged = True
+            # Nothing to depart from, so no check to arm yet. The whole of it is "you are on
+            # your open switches, leave them within N seconds"; a half that starts this phase
+            # between switches has no such reading, and arming anyway meant the retirement
+            # fired in the same tick off the same clear switches -- the check never existed,
+            # and the log claimed a departure nothing watched.
+            #
+            # Reachable for any half that is not fully open when a close starts: a roof
+            # picked up part-way, one moved by hand, or one a teardown left mid-travel --
+            # which every settings save can produce, since makeRoof() stops a running motion
+            # whatever it was doing.
+            #
+            # Nothing better is available for the stretch it is actually in. With only end
+            # switches, no reading distinguishes a mid-travel half being pulled from one
+            # hanging still, which is exactly what OPEN_RUN says above. So the run is on
+            # roof_travel_timeout alone until the half reaches an end position, and that is
+            # said out loud rather than left to be inferred.
+            log(logging.INFO, "Roof close [{}]: driving CLOSE from part-way; no departure "
+                "to confirm, the travel budget is the only bound".format(
+                    half.value.lower()))
+        elif started and not onOpen and roofMotion.phaseDeadline is not None and (
+                not roofMotion.departed):
+            # Confirmed moving. The deadline is deliberately *not* retired -- see the gate
+            # above for what retiring it used to cost -- so this flag is what keeps the line
+            # to one per half instead of one per tick for the rest of the travel.
             #
             # elif, so this can only be reached on a tick after the one that armed it. Both
-            # were plain ifs, and the second read the phaseDeadline the first had just set.
-            # The onOpen gate above is what makes the arming honest; this is what makes a
-            # confirmation impossible to issue before there has been anything to confirm.
-            roofMotion.phaseDeadline = None
+            # were plain ifs once, and the second read the phaseDeadline the first had just
+            # set. The onOpen gate on the arming is what makes it honest; this is what makes
+            # a confirmation impossible to issue before there has been anything to confirm.
+            roofMotion.departed = True
             log(logging.INFO, "Roof close [{}]: confirmed off its open switches".format(
                 half.value.lower()))
         return
