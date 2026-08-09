@@ -538,7 +538,9 @@ def startCaptureLoop():
 
 
 def getWeather():
-    data = apiv1.weather()
+    # scrapeWeather(), not the weather endpoint, which now serves this worker's own cache
+    # and would be reading back what it is here to fetch.
+    data = apiv1.scrapeWeather()
     if data.status_code != 200:
         raise Exception("Error getting weather: status code {}: {}".format(data.status_code, data.body))
     try:
@@ -642,6 +644,21 @@ environmentLastData["timestamp"] = 0.0
 # worker polls the board every couple of seconds, so a minute is roughly thirty missed
 # readings -- far beyond a slow pass and well short of noticing a dead board only at dawn.
 environmentStateMaxAge = 60
+
+def getWeatherCache():
+    """The last scrape and how old it is, as (payload, age in seconds).
+
+    age is None when nothing has been scraped, for the same reason getEnvironment() reports
+    it that way: never-fetched and long-stale are different problems and the caller has to
+    be able to tell them apart. The payload is handed out as it was parsed -- readers
+    outside this file want the station's own field names, not a translation of them.
+    """
+    with weatherCacheLock:
+        payload = weatherCache
+        stamp = weatherCacheTimestamp
+    if stamp == 0.0:
+        return payload, None
+    return payload, time.monotonic() - stamp
 
 def getEnvironment():
     """The last inside reading and how old it is, as ({name: value}, age in seconds).
@@ -1118,6 +1135,20 @@ def getSwitchState(name: str):
     if entry is None:
         return switch.State.UNKN
     return entry["switch"].state
+
+def switchConfigured(name: str):
+    """Whether `name` has a pin set up, and can therefore be commanded.
+
+    Deliberately not deviceUnavailableReason(), which answers a different question and is
+    the wrong one here: that reports whether the *device* on the other end can be used, and
+    a switch which is merely off counts as unavailable there. Commanding is about the
+    switch, and a switch that is off is precisely the one a caller most wants to command.
+
+    One lookup rather than a membership test and a subscript, for the same reason
+    getSwitchState() does it that way: initSwitches() deletes entries as it rebuilds, on
+    the event loop, while worker threads and API handlers are reading.
+    """
+    return switches.get(name) is not None
 
 def deviceUnavailableReason(name: str, label: str):
     """Why the device powered by the switch `name` cannot be used, or None if it can.
@@ -3035,7 +3066,12 @@ def executeMotionCommand(roofInstance, status, action, postedAt, log, event):
     startRoofMotionHalf(time.monotonic(), log, event)
 
 def requestRoofMotion(action):
-    """Asks the roof to open or close, or stops it outright.
+    """Asks the roof to open or close, or stops it outright. Returns whether it was taken.
+
+    The return value is for callers that have to answer somebody: the API says 503 or 409
+    rather than 202 on the strength of it. The UI ignores it and waits for the events, which
+    is still the only way to learn what actually happened -- an open that is accepted here
+    can still be refused a tick later by a status this thread has not seen.
 
     Open and close are fire and forget, exactly like setFans(): the worker owns the serial
     port and the relays, judges the command against a status it has just read, and reports
@@ -3054,7 +3090,7 @@ def requestRoofMotion(action):
     if action not in ("open", "close", "stop"):
         logger.error("Ignoring unknown roof motion {}".format(action))
         triggerEvent("roofMotionError", "Unknown roof motion")
-        return
+        return False
     if action == "stop":
         # Fetched once, into a local, rather than asked for at each of the three points
         # below. isInitialized() followed by get() is a check then a use, and what runs in
@@ -3111,25 +3147,26 @@ def requestRoofMotion(action):
         # open or a close: sharing it let a motion requested a moment later overwrite the
         # stop outright, and the half came back on when the dead time ran out. See there.
         postRoofStop()
-        return
+        return True
     if not roofEngaged:
         # Refused here as well as in drive(), which is the interlock. This one exists so the
         # operator is told why rather than watching the command disappear into a mailbox and
         # come back a tick later as a latched fault from a relay write that raised.
         logger.warning("Not requesting roof {}: the roof is disengaged".format(action))
         triggerEvent("roofMotionError", "The roof is disengaged")
-        return
+        return False
     reason = roofUnavailableReason()
     if reason is not None:
         # Posting anyway would drop the command into a mailbox with no worker to drain it,
         # and the caller would see nothing wrong while nothing happened.
         logger.warning("Not requesting roof {}: {}".format(action, reason))
         triggerEvent("roofMotionError", reason)
-        return
+        return False
     logger.info("Requesting roof {}".format(action))
     # Stamped, so a command that sat in the mailbox through a board outage is dropped by
     # executeMotionCommand() instead of starting a motion long after it was asked for.
     postRoofCommand("motion", (action, time.monotonic()))
+    return True
 
 def requestRoofEngaged(engaged: bool):
     """Hands the roof to the operator, or takes it back. Returns whether it happened.
@@ -5901,6 +5938,45 @@ async def startup():
     # something to chain to, and the roof this parks exists. A signal arriving before this
     # line still gets the graceful shutdown uvicorn has always given it.
     installExitSignalHandlers()
+
+# The slice of this file the API is allowed to touch, named one by one.
+#
+# apiv1 cannot import this module: it is a script run as __main__, and it imports apiv1
+# itself. Handing over a namespace is the way round that, and doing it by explicit keyword
+# rather than by passing globals() is the point -- this list *is* the contract, and a
+# function that is not on it is one the API cannot reach. Bound here, at the end, so every
+# name exists; the routes are registered at import time and answer 503 until this runs,
+# which is before uvicorn has accepted a connection.
+#
+# Only callables and objects that are never rebound. Mutable module-level state --
+# roofEngaged, weatherCache, lastRoofState -- is deliberately absent: the API reads it
+# through the accessors above, which is what stops it from capturing a value that then goes
+# stale for the life of the process.
+apiv1.bind(
+        roof=roof,
+        switch=switch,
+        settings=s,
+        RoofStatus=RoofStatus,
+        roofMotion=roofMotion,
+        roofDecisiveState=roofDecisiveState,
+        roofCommandsBlocked=roofCommandsBlocked,
+        roofUnavailableReason=roofUnavailableReason,
+        getRoofState=getRoofState,
+        getRoofDrive=getRoofDrive,
+        roofStateMaxAge=roofStateMaxAge,
+        requestRoofMotion=requestRoofMotion,
+        requestClearRoofFault=requestClearRoofFault,
+        requestRoofEngaged=requestRoofEngaged,
+        switchNames=switch_names,
+        getSwitchState=getSwitchState,
+        setSwitchState=setSwitchState,
+        switchConfigured=switchConfigured,
+        applyFanMode=applyFanMode,
+        getWeatherCache=getWeatherCache,
+        getEnvironment=getEnvironment,
+        environmentStateMaxAge=environmentStateMaxAge,
+        numericSetting=numericSetting,
+        )
 
 try:
     ui.run(dark=True, favicon="favicon.svg", port=args.port, reload=False)
