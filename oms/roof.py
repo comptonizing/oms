@@ -185,6 +185,10 @@ class Roof():
         now = time.monotonic()
         self.__lastStopped = {half: now for half in RoofHalf}
         self.__absenceStrikes = 0
+        # Engaged until an operator says otherwise, and never restored from storage: coming
+        # back from a restart with the safety checks still switched off, because of what
+        # somebody was doing before the last one, is not a state OMS may reach on its own.
+        self.__engaged = True
         self.__switchWestOpen = self.__makeMotionRelay(pinWestOpen)
         self.__switchWestClose = self.__makeMotionRelay(pinWestClose)
         self.__switchEastOpen = self.__makeMotionRelay(pinEastOpen)
@@ -226,6 +230,57 @@ class Roof():
     def motionReady(self):
         """Whether motion is permitted. False from the moment anything faults."""
         return self.__motionFaultReason is None
+
+    @property
+    def engaged(self):
+        """Whether OMS is minding the roof at all.
+
+        Deliberately separate from motionReady, which is about the fault latch. The two
+        both stop a motion and they are not the same thing, and conflating them would make
+        "clear the fault" look like the way back from a disengage.
+        """
+        return self.__engaged
+
+    def disengage(self):
+        """Hands the roof to the operator: checks off, relays off, nothing driving.
+
+        For working on the hardware. Two halves, and both are needed:
+
+        The relays come off because a contactor left closed while somebody is at the roof
+        is the hazard this exists to remove. drive() then refuses for as long as it lasts,
+        so nothing OMS does can put one back on -- an interlock rather than an intention,
+        which matters because the sequence is not the only thing that ever energizes one.
+
+        The consistency checks go quiet because they are assertions about a roof that only
+        OMS is moving. Somebody pushing a half by hand walks it straight through "neither
+        half is fully open or fully closed" and "open and closed at the same time", and a
+        latched fault per attempt is noise that says nothing -- the checks would be
+        reporting the operator, not a defect.
+
+        Never raises even if a relay write does: refusing further motion is already
+        guaranteed by the flag, which is set first, and a disengage that failed because one
+        pin write failed would leave the operator believing the opposite of the truth. The
+        failure is reported to the caller instead, which decides what to say about it.
+        """
+        self.__engaged = False
+        self.stopMotion()
+
+    def engage(self):
+        """Gives the roof back to OMS.
+
+        The strike counter goes back to zero for the same reason clearMotionFault() does
+        it: whatever position the roof was left in, the absence check gets its full
+        ABSENCE_STRIKES readings to judge it on rather than latching on the first one. A
+        roof genuinely left adrift still faults, three polls later, which is the answer
+        wanted -- what is not wanted is a fault stamped before the first status has even
+        been read back.
+
+        Does not clear an existing fault. A fault latched before the disengage is still
+        true afterwards unless somebody has been and looked, and looking is what the other
+        button is for.
+        """
+        self.__engaged = True
+        self.__absenceStrikes = 0
 
     @property
     def motionFaultReason(self):
@@ -289,6 +344,12 @@ class Roof():
         off-before-on, and after a reversal the half sits with both relays de-energized
         for REVERSE_DEAD_TIME before the other direction is allowed.
         """
+        if not self.__engaged:
+            # The hard half of a disengage. Refusing the command is not enough on its own:
+            # a sequence already running reaches here from the phase machine, not from a
+            # command, and the whole point is that nothing OMS does can close a contactor
+            # while somebody is at the roof.
+            raise RuntimeError("Roof motion is disengaged")
         if not self.motionReady:
             raise RuntimeError("Roof motion is faulted: {}".format(self.__motionFaultReason))
         current = self.__driving[half]
@@ -502,7 +563,12 @@ class Roof():
 
         Never raises: it is reached from the fan poll and from the UI's status read, and
         those must not start failing because the roof developed a wiring fault.
+
+        Silent while disengaged. Every one of these is an assertion about a roof that only
+        OMS is moving, and a disengage says exactly that somebody else is. See disengage().
         """
+        if not self.__engaged:
+            return
         for half in RoofHalf:
             openSeen = any(status[sw.bit] for sw in half.openSwitches)
             closedSeen = any(status[sw.bit] for sw in half.closedSwitches)

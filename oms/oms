@@ -1827,6 +1827,95 @@ def roofUnavailableReason():
         return "Roof worker is not running"
     return None
 
+class RoofStatus(Enum):
+    """The one word the operator gets for what the roof is doing.
+
+    Six, not five. The five the roof can be in are open, opening, closed, closing and
+    fault; disengaged is the sixth because it is not a state of the roof at all but of who
+    is minding it, and it has to be distinguishable -- a de-energized roof that OMS has
+    handed over looks exactly like a broken one otherwise.
+
+    Anything that is not squarely one of the others is FAULT, which is the operator's own
+    rule and a deliberate one: a half stopped between its switches, a roof pushed by hand,
+    a board that has stopped answering. Each of those has a different reason and the same
+    answer, which is that nothing may be concluded about where the roof is.
+    """
+    OPEN = "open"
+    OPENING = "opening"
+    CLOSED = "closed"
+    CLOSING = "closing"
+    FAULT = "fault"
+    DISENGAGED = "disengaged"
+
+# Whether OMS is minding the roof, kept here rather than only on the Roof instance.
+#
+# The instance is where the interlock lives -- drive() refuses on it, and that is what
+# actually keeps a contactor open while somebody is at the roof -- but a Roof does not
+# survive a settings save: makeRoof() drops it and builds a fresh one, which starts engaged.
+# An operator who disengaged to work on the hardware, and then had the roof silently
+# re-armed underneath them because somebody saved a setting, is precisely the accident this
+# is for. So the decision is remembered here and re-applied to each new instance.
+#
+# Not persisted, on purpose and by the operator's own choice: a restart comes back engaged.
+# Coming up with the safety checks switched off because of what somebody was doing before
+# the last restart is not a state OMS may reach on its own.
+roofEngaged = True
+
+def roofDecisiveState():
+    """The roof in one word, and the reason if that word is fault.
+
+    Returns (RoofStatus, reason), reason being None whenever the state speaks for itself.
+    The reason is not decoration: every fault below is a different problem with a different
+    thing to do about it, and a screen that says only "fault" sends an operator to the roof
+    to find out which.
+
+    The order of the tests is the design. A running motion is reported before any complaint
+    about the reading, because "a contactor is closed right now" outranks "the last status
+    word is a few seconds old" -- and it is what the controls key off, so a stale poll must
+    not be able to unblock the buttons under a moving roof. Everything after it is a reason
+    the position cannot be trusted, in the order of how fundamental it is.
+    """
+    if not roof.Roof.isInitialized():
+        return RoofStatus.FAULT, roofUnavailableReason()
+    if not roofEngaged:
+        return RoofStatus.DISENGAGED, "the safety checks are off and the relays are de-energized"
+    if roofMotion.running:
+        return ((RoofStatus.OPENING, None) if roofMotion.action == "open"
+                else (RoofStatus.CLOSING, None))
+    reason = roofUnavailableReason()
+    if reason is not None:
+        return RoofStatus.FAULT, reason
+    status, age = getRoofState()
+    if status is None:
+        return RoofStatus.FAULT, "the roof has not been read yet"
+    if age > roofStateMaxAge:
+        return RoofStatus.FAULT, "the last reading is {}s old".format(int(age))
+    instance = roof.Roof.get()
+    if not instance.motionReady:
+        return RoofStatus.FAULT, instance.motionFaultReason
+    if roofMotion.phase is MotionPhase.FAULT:
+        return RoofStatus.FAULT, "the last motion failed"
+    position = instance.position(status=status)
+    if position is roof.RoofState.OPEN:
+        return RoofStatus.OPEN, None
+    if position is roof.RoofState.CLOSED:
+        return RoofStatus.CLOSED, None
+    # Between the switches with nothing driving: a stop part-way, a half moved by hand, or
+    # one that never arrived. Reported as a fault by the operator's decision -- there is no
+    # position to act on, and saying "partially open" would read like a state to leave it in.
+    return RoofStatus.FAULT, "neither fully open nor fully closed"
+
+def roofCommandsBlocked():
+    """Whether a command other than the emergency stop should be refused right now.
+
+    One rule, in one place, so the buttons and the API cannot disagree about it: while the
+    roof is moving, the only thing anybody may ask for is that it stops. Everything else --
+    a second motion, clearing the fault out from under a running sequence, handing the roof
+    to an operator mid-travel -- is either refused deeper down or is a thing that should be.
+    """
+    state, _ = roofDecisiveState()
+    return state in (RoofStatus.OPENING, RoofStatus.CLOSING)
+
 # Work for the roof worker to carry out between status polls. The worker owns the
 # serial port on its own thread, so nothing else ever has to wait on roofLock to
 # change the roof: callers post here and return immediately.
@@ -2375,6 +2464,18 @@ def advanceRoofMotion(roofInstance, status, log, event):
     them together rather than from this line alone.
     """
     if not roofMotion.running:
+        return
+    if not roofInstance.engaged:
+        # Disengaged underneath a running sequence. Ended here rather than left to fail on
+        # its next relay write: drive() refuses now, so the phase machine would reach one,
+        # raise, and be latched as a motion fault by serviceRoofOnce() -- reporting a defect
+        # for something the operator asked for. Nothing is energized by this point either
+        # way; disengage() de-energized on the caller's own thread before the flag was even
+        # readable here.
+        log(logging.WARNING, "Roof {} abandoned in {}: the roof was disengaged".format(
+            roofMotion.action, roofMotion.phase.name))
+        roofMotion.reset()
+        event("roofMotionStopped")
         return
     if not roofInstance.motionReady:
         # Faulted underneath us, almost certainly by a consistency check inside the
@@ -3011,6 +3112,13 @@ def requestRoofMotion(action):
         # stop outright, and the half came back on when the dead time ran out. See there.
         postRoofStop()
         return
+    if not roofEngaged:
+        # Refused here as well as in drive(), which is the interlock. This one exists so the
+        # operator is told why rather than watching the command disappear into a mailbox and
+        # come back a tick later as a latched fault from a relay write that raised.
+        logger.warning("Not requesting roof {}: the roof is disengaged".format(action))
+        triggerEvent("roofMotionError", "The roof is disengaged")
+        return
     reason = roofUnavailableReason()
     if reason is not None:
         # Posting anyway would drop the command into a mailbox with no worker to drain it,
@@ -3022,6 +3130,91 @@ def requestRoofMotion(action):
     # Stamped, so a command that sat in the mailbox through a board outage is dropped by
     # executeMotionCommand() instead of starting a motion long after it was asked for.
     postRoofCommand("motion", (action, time.monotonic()))
+
+def requestRoofEngaged(engaged: bool):
+    """Hands the roof to the operator, or takes it back. Returns whether it happened.
+
+    Disengaging is a stop plus a latch, and it is done on the caller's own thread for the
+    same reason a stop is: what has to happen is that four contactors open, that is four
+    local GPIO writes, and none of it may be made to wait on a serial port, a lock, or a
+    worker that may be wedged. Somebody is about to put their hands on the roof.
+
+    Engaging is only the flag and the strike counter. Nothing is energized by engaging --
+    the roof sits where it is until it is commanded -- so there is nothing here that has to
+    happen promptly, and the checks come back on with the next poll.
+    """
+    global roofEngaged
+    if not roof.Roof.isInitialized():
+        # Nothing to hand over. The flag is still set, because a roof built later must come
+        # up in the state the operator last asked for rather than in the default one.
+        roofEngaged = engaged
+        logger.warning("Roof {} requested with no roof initialized".format(
+            "engaged" if engaged else "disengaged"))
+        triggerEvent("roofMotionError", "Roof not initialized")
+        return False
+    try:
+        roofInstance = roof.Roof.get()
+    except Exception as e:
+        roofEngaged = engaged
+        logger.warning("Roof {} requested while the roof was being replaced ({})".format(
+            "engaged" if engaged else "disengaged", e))
+        return False
+    # Set before the relays are touched, not after: from this instant every path that could
+    # energize one has to find the roof disengaged, and drive() reads the instance's own
+    # copy which disengage() sets first for the same reason.
+    roofEngaged = engaged
+    if engaged:
+        roofInstance.engage()
+        logger.warning("Roof re-engaged: the safety checks and motion handling are back on")
+        triggerEvent("roofEngaged", True)
+        return True
+    ok = True
+    try:
+        roofInstance.disengage()
+        logger.warning("Roof disengaged: motion relays de-energized and the safety checks "
+                       "are off until it is engaged again")
+    except Exception as e:
+        # Every relay was attempted before this raised -- stopMotion() collects failures
+        # rather than stopping at the first -- and the refusal to drive is already in force.
+        # Still reported as a failure, because a contactor that would not open is the one
+        # thing an operator about to touch the roof must not be told went fine.
+        ok = False
+        logger.error("Error de-energizing the roof while disengaging it: {}".format(e))
+        triggerEvent("roofMotionError",
+                     "Disengaged, but a motion relay would not de-energize: {}".format(e))
+    # The arrows come off the relays, and the worker may not run again to publish it.
+    publishRoofDrive(roofInstance)
+    # The rods are the part that needs the board, so they go through the mailbox exactly as
+    # a stop's do; and the stop itself, so a sequence still running is abandoned rather than
+    # left to discover on its next tick that drive() has started refusing.
+    requestRodRetract()
+    postRoofStop()
+    triggerEvent("roofEngaged", False)
+    return ok
+
+def requestClearRoofFault():
+    """Asks the worker to clear the motion fault latch. Returns whether it was posted.
+
+    Through the mailbox rather than straight at the Roof, unlike a stop. Clearing a fault is
+    not urgent -- nothing is energized and nothing is waiting on it -- and it has to happen
+    beside the sequence's own FAULT phase, which only the worker may touch: it reads the
+    sequence for a whole tick under roofLock, so clearing it from another thread is the
+    unsynchronized write that stopRoof() had to be fixed for.
+    """
+    reason = roofUnavailableReason()
+    if reason is not None:
+        # Nothing would drain the mailbox, and the operator would be looking at a fault that
+        # stayed put with no sign that their button did anything.
+        logger.warning("Not clearing the roof fault: {}".format(reason))
+        triggerEvent("roofMotionError", reason)
+        return False
+    if not roofEngaged:
+        logger.warning("Not clearing the roof fault: the roof is disengaged")
+        triggerEvent("roofMotionError", "The roof is disengaged")
+        return False
+    logger.info("Requesting a roof fault clear")
+    postRoofCommand("clearfault", True)
+    return True
 
 def executeFanCommand(roofInstance, status, mode, auto, log, event):
     """Switches the fans unless the just-polled status says they are already there.
@@ -3260,6 +3453,26 @@ def serviceRoofOnce(roofInstance, generation):
                 ok, status = retractRoofRods(roofInstance, status, log)
                 if not ok:
                     requestRodRetract()
+            if "clearfault" in commands:
+                # Both halves of "an operator has been and looked": the latch on the Roof,
+                # which is what refuses motion, and the sequence's own FAULT phase, which is
+                # only the record of how the last one ended. executeMotionCommand() already
+                # drops that phase when it finds it, so this is not what lets the next
+                # motion start -- it is what stops the status reading fault until one does.
+                #
+                # Before the motion below, so a clear and an open pressed in quick
+                # succession still work when they land in the same tick. That does not let
+                # a motion past a live fault: the poll at the top of this tick has already
+                # re-run the consistency checks, and a condition that is still there has
+                # already re-latched by the time this line runs.
+                try:
+                    roofInstance.clearMotionFault()
+                    if roofMotion.phase is MotionPhase.FAULT:
+                        roofMotion.reset()
+                    event("roofFaultCleared")
+                except Exception as e:
+                    log(logging.ERROR, "Error clearing the roof motion fault: {}".format(e))
+                    event("roofMotionError", "Could not clear the fault: {}".format(e))
             if "fans" in commands:
                 mode, auto = commands["fans"]
                 try:
@@ -3752,6 +3965,17 @@ def makeRoof():
         try:
             roof.Roof(**config)
             instance = roof.Roof.get()
+            if not roofEngaged:
+                # A Roof is born engaged, and this is the only place one is born. Without
+                # this line a settings save re-arms the motion relays of a roof an operator
+                # has deliberately handed themselves -- silently, while they are working on
+                # it, and with nothing on screen changing to say so. Applied before the
+                # first status is read, so the consistency checks below stay quiet too:
+                # a roof somebody is moving by hand is exactly what they assert against.
+                instance.disengage()
+                log(logging.WARNING,
+                    "Roof rebuilt while disengaged; it stays disengaged and nothing will "
+                    "drive it until it is engaged again")
             # Publish the first status here rather than leaving the state unknown
             # until the worker's first poll: the auto mode can then act right away.
             #
@@ -4128,13 +4352,83 @@ def main():
         else:
             processClickSwitch(thing)
 
+    # What each button asks before it does anything, and what it then does. The stop is
+    # absent on purpose: it is the one command that is carried out the instant it is
+    # pressed, because a confirmation dialog standing between an operator and a moving roof
+    # is the exact failure an emergency stop exists to prevent.
+    roofCommandPrompts = {
+            "open": ("Open the roof",
+                     "Both halves will be driven open. Do you want to open the roof?"),
+            "close": ("Close the roof",
+                      "Both halves will be driven closed. Do you want to close the roof?"),
+            "reset": ("Clear the roof fault",
+                      "Only do this once you have looked at the roof and know why it "
+                      "faulted. Clear it?"),
+            "disengage": ("Disengage the roof",
+                          "The motion relays are de-energized and the safety checks are "
+                          "switched off, so OMS will neither move the roof nor complain "
+                          "about where it is. Use this while working on the hardware. "
+                          "Disengage?"),
+            "engage": ("Engage the roof",
+                       "The safety checks and motion handling come back on. Make sure "
+                       "nobody is at the roof. Engage?"),
+            }
+
+    def runRoofCommand(action: str):
+        """Carries out one roof command. Everything that asks has already asked."""
+        if action == "stop":
+            requestRoofMotion("stop")
+            return
+        if action in ("open", "close"):
+            requestRoofMotion(action)
+            return
+        if action == "reset":
+            requestClearRoofFault()
+            return
+        if action in ("engage", "disengage"):
+            requestRoofEngaged(action == "engage")
+            return
+        logger.error("Ignoring unknown roof command from the UI: {}".format(action))
+
+    def processRoofCommand(action: str):
+        """One click on one roof button.
+
+        The block is re-tested here rather than left to the disabled state of the button.
+        Disabling is what tells the operator; this is what enforces it. A page that has not
+        repainted since the roof started moving still has live buttons on it, and the whole
+        rule is that nothing but a stop may be asked for while a contactor is closed.
+        """
+        if action != "stop" and roofCommandsBlocked():
+            ui.notify("The roof is moving. Stop it first.", type="warning")
+            return
+        if action == "stop":
+            # Straight through, no dialog. See roofCommandPrompts.
+            runRoofCommand(action)
+            return
+        title, question = roofCommandPrompts[action]
+        with ui.dialog() as dialog, ui.card():
+            ui.label(title).classes('text-lg font-bold')
+            ui.label(question).classes('max-w-sm')
+            with ui.row().classes('w-full gap-2'):
+                ui.button("No", on_click=dialog.close).classes("flex-1")
+                def accept():
+                    dialog.close()
+                    # Tested again on the way out of the dialog: a confirmation is a
+                    # question and the operator may have taken a moment over it, and the
+                    # roof can have started moving in the meantime.
+                    if roofCommandsBlocked():
+                        ui.notify("The roof started moving. Stop it first.", type="warning")
+                        return
+                    runRoofCommand(action)
+                ui.button("Yes", on_click=accept).classes("flex-1")
+        dialog.open()
+
     ui.page_title("OMS")
     with ui.left_drawer(value=False, top_corner=True, bottom_corner=True) as drawer:
         ui.button(icon='close', on_click=drawer.hide).props('flat round')
         with ui.tabs(on_change=onTabChange).props("vertical") as tabs:
             tab_status = ui.tab("Status")
             tab_weather = ui.tab("Weather")
-            tab_roof = ui.tab("Roof")
             tab_log = ui.tab("Log")
             tab_settings = ui.tab("Settings")
 
@@ -4145,68 +4439,106 @@ def main():
     with ui.tab_panels(tabs).classes("w-full"):
         with ui.tab_panel(tab_status):
             with ui.grid().classes('grid-cols-1 lg:grid-cols-3 w-full gap-4 justify-items-center'):
-                with ui.element('div').classes('relative').style("width: 100%; max-width: 400px; aspect-ratio: 1 / 1; border: 1px dashed #ccc;"):
-                    status_indicators = {}
-                    status_indicators["west_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 0;')
-                    status_indicators["west_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 0;')
-                    status_indicators["west_closed_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 40%;')
-                    status_indicators["west_closed_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 40%;')
-                    status_indicators["east_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 0;')
-                    status_indicators["east_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 0;')
-                    status_indicators["east_closed_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 40%;')
-                    status_indicators["east_closed_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 40%;')
-                    status_indicators["west_push_north"] = ui.element("div").classes("absolute").style(
-                            "left: 18%; top: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
-                            )
-                    status_indicators["west_push_south"] = ui.element("div").classes("absolute").style(
-                            "left: 18%; bottom: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
-                            )
-                    status_indicators["east_push_north"] = ui.element("div").classes("absolute").style(
-                            "left: 52%; top: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
-                            )
-                    status_indicators["east_push_south"] = ui.element("div").classes("absolute").style(
-                            "left: 52%; bottom: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
-                            )
-                    status_indicators["west_open"] = ui.icon("arrow_back", size="5rem").classes("absolute") \
-                            .style("top: 50%; left: 5%; transform: translate(50%, -50%);").classes("animate-pulse")
-                    status_indicators["west_close"] = ui.icon("arrow_forward", size="5rem").classes("absolute") \
-                            .style("top: 50%; left: 5%; transform: translate(50%, -50%);").classes("animate-pulse")
-                    status_indicators["east_open"] = ui.icon("arrow_forward", size="5rem").classes("absolute") \
-                            .style("top: 50%; right: 5%; transform: translate(-50%, -50%);").classes("animate-pulse")
-                    status_indicators["east_close"] = ui.icon("arrow_back", size="5rem").classes("absolute") \
-                            .style("top: 50%; right: 5%; transform: translate(-50%, -50%);").classes("animate-pulse")
-                    status_indicators["west_open"].set_visibility(False)
-                    status_indicators["west_close"].set_visibility(False)
-                    status_indicators["east_open"].set_visibility(False)
-                    status_indicators["east_close"].set_visibility(False)
+                # The diagram and the controls under it are one grid cell, not two: put
+                # side by side they would land in the next column, and the buttons belong
+                # under the icons they act on. The width is pinned to the diagram's own so
+                # a row of buttons cannot stretch wider than the roof it drives.
+                with ui.column().classes('w-full items-center gap-0').style('max-width: 400px;'):
+                    with ui.element('div').classes('relative').style("width: 100%; max-width: 400px; aspect-ratio: 1 / 1; border: 1px dashed #ccc;"):
+                        status_indicators = {}
+                        status_indicators["west_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 0;')
+                        status_indicators["west_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 0;')
+                        status_indicators["west_closed_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; left: 40%;')
+                        status_indicators["west_closed_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; left: 40%;')
+                        status_indicators["east_open_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 0;')
+                        status_indicators["east_open_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 0;')
+                        status_indicators["east_closed_north"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('top: 0; right: 40%;')
+                        status_indicators["east_closed_south"] = ui.icon('circle', color='gray').classes('absolute text-3xl').style('bottom: 0; right: 40%;')
+                        status_indicators["west_push_north"] = ui.element("div").classes("absolute").style(
+                                "left: 18%; top: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                                )
+                        status_indicators["west_push_south"] = ui.element("div").classes("absolute").style(
+                                "left: 18%; bottom: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                                )
+                        status_indicators["east_push_north"] = ui.element("div").classes("absolute").style(
+                                "left: 52%; top: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                                )
+                        status_indicators["east_push_south"] = ui.element("div").classes("absolute").style(
+                                "left: 52%; bottom: 12%; width: 30%; height: 5%; border: 2px solid black; background-color: transparent;"
+                                )
+                        status_indicators["west_open"] = ui.icon("arrow_back", size="5rem").classes("absolute") \
+                                .style("top: 50%; left: 5%; transform: translate(50%, -50%);").classes("animate-pulse")
+                        status_indicators["west_close"] = ui.icon("arrow_forward", size="5rem").classes("absolute") \
+                                .style("top: 50%; left: 5%; transform: translate(50%, -50%);").classes("animate-pulse")
+                        status_indicators["east_open"] = ui.icon("arrow_forward", size="5rem").classes("absolute") \
+                                .style("top: 50%; right: 5%; transform: translate(-50%, -50%);").classes("animate-pulse")
+                        status_indicators["east_close"] = ui.icon("arrow_back", size="5rem").classes("absolute") \
+                                .style("top: 50%; right: 5%; transform: translate(-50%, -50%);").classes("animate-pulse")
+                        status_indicators["west_open"].set_visibility(False)
+                        status_indicators["west_close"].set_visibility(False)
+                        status_indicators["east_open"].set_visibility(False)
+                        status_indicators["east_close"].set_visibility(False)
 
-                    status_indicators["fans"] = [
-                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("top: 17%; left:3%").classes('animate-none').on("click", lambda: processClick("fan")),
-                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("bottom: 17%; left:3%").classes('animate-none').on("click", lambda: processClick("fan")),
-                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("top: 17%; right:3%").classes('animate-none').on("click", lambda: processClick("fan")),
-                            ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("bottom: 17%; right:3%").classes('animate-none').on("click", lambda: processClick("fan"))
-                            ]
-                    __str = """aspect-ratio: 1 / 1; border-radius: 50%;
-                            display: flex; align-items: center; justify-content: center;
-                            color: white; font-weight: bold; font-size: 1rem;
-                            background-color: gray;"""
-                    __str_left = __str + "transform: translate(-50%, -50%);"
-                    __str_right = __str + "transform: translate(50%, -50%);"
-                    status_indicators["pier"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'left: 50%; top: 50%; width: 15%;').on("click", lambda: processClick("pier"))
-                    with status_indicators["pier"]:
-                        ui.label("Pier")
-                    status_indicators["cctv"] = ui.element('div').classes('absolute status-circle').style(__str_right + 'left: 23%; top: 6%; width: 10%;').on("click", lambda: processClick("cctv"))
-                    with status_indicators["cctv"]:
-                        ui.label("CCTV")
-                    status_indicators["allsky"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'right: 23%; top: 6%; width: 10%;').on("click", lambda: processClick("allsky"))
-                    with status_indicators["allsky"]:
-                        ui.label("AS")
-                    status_indicators["pc"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'left: 6%; top: 35%; width: 8%').on("click", lambda: processClick("pc"))
-                    with status_indicators["pc"]:
-                        ui.label("PC")
-                    status_roof_stale = ui.label("").classes("absolute text-red-500 text-sm whitespace-nowrap") \
-                            .style("top: 100%; left: 50%; transform: translate(-50%, 0.5rem);")
-                    status_roof_stale.set_visibility(False)
+                        status_indicators["fans"] = [
+                                ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("top: 17%; left:3%").classes('animate-none').on("click", lambda: processClick("fan")),
+                                ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("bottom: 17%; left:3%").classes('animate-none').on("click", lambda: processClick("fan")),
+                                ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("top: 17%; right:3%").classes('animate-none').on("click", lambda: processClick("fan")),
+                                ui.icon('mdi-fan', size='3rem').classes("absolute fan-icon").style("bottom: 17%; right:3%").classes('animate-none').on("click", lambda: processClick("fan"))
+                                ]
+                        __str = """aspect-ratio: 1 / 1; border-radius: 50%;
+                                display: flex; align-items: center; justify-content: center;
+                                color: white; font-weight: bold; font-size: 1rem;
+                                background-color: gray;"""
+                        __str_left = __str + "transform: translate(-50%, -50%);"
+                        __str_right = __str + "transform: translate(50%, -50%);"
+                        status_indicators["pier"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'left: 50%; top: 50%; width: 15%;').on("click", lambda: processClick("pier"))
+                        with status_indicators["pier"]:
+                            ui.label("Pier")
+                        status_indicators["cctv"] = ui.element('div').classes('absolute status-circle').style(__str_right + 'left: 23%; top: 6%; width: 10%;').on("click", lambda: processClick("cctv"))
+                        with status_indicators["cctv"]:
+                            ui.label("CCTV")
+                        status_indicators["allsky"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'right: 23%; top: 6%; width: 10%;').on("click", lambda: processClick("allsky"))
+                        with status_indicators["allsky"]:
+                            ui.label("AS")
+                        status_indicators["pc"] = ui.element('div').classes('absolute status-circle').style(__str_left + 'left: 6%; top: 35%; width: 8%').on("click", lambda: processClick("pc"))
+                        with status_indicators["pc"]:
+                            ui.label("PC")
+                        status_roof_stale = ui.label("").classes("absolute text-red-500 text-sm whitespace-nowrap") \
+                                .style("top: 100%; left: 50%; transform: translate(-50%, 0.5rem);")
+                        status_roof_stale.set_visibility(False)
+                    # mt-10 clears status_roof_stale, which is positioned absolutely at the
+                    # bottom edge of the diagram above and so takes up no height of its own.
+                    with ui.column().classes("w-full items-center gap-2 mt-10"):
+                        roof_state_label = ui.label("...").classes("text-3xl font-bold")
+                        roof_state_reason = ui.label("").classes("text-sm text-center text-gray-400")
+                        # The emergency stop is on its own row and full width, because it is
+                        # the one control that has to be hit without looking. It is also the
+                        # only one that never asks for confirmation: a dialog between the
+                        # operator and a moving roof is the whole failure it exists to avoid.
+                        roof_stop_button = ui.button(
+                                "STOP", icon="pan_tool",
+                                on_click=lambda: processRoofCommand("stop")) \
+                                .props("color=red size=lg").classes("w-full")
+                        with ui.row().classes("w-full gap-2 flex-nowrap"):
+                            roof_open_button = ui.button(
+                                    "Open", icon="unfold_more",
+                                    on_click=lambda: processRoofCommand("open")).classes("flex-1")
+                            roof_close_button = ui.button(
+                                    "Close", icon="unfold_less",
+                                    on_click=lambda: processRoofCommand("close")).classes("flex-1")
+                        with ui.row().classes("w-full gap-2 flex-nowrap"):
+                            roof_reset_button = ui.button(
+                                    "Reset fault", icon="restart_alt",
+                                    on_click=lambda: processRoofCommand("reset")) \
+                                    .props("outline").classes("flex-1")
+                            # One handler, bound once, that reads which way it is going when
+                            # it runs. updateRoofControls() changes only the label and the
+                            # colour: on_click() adds a handler rather than replacing one.
+                            roof_engage_button = ui.button(
+                                    "Disengage", icon="link_off",
+                                    on_click=lambda: processRoofCommand(
+                                        "disengage" if roofEngaged else "engage")) \
+                                    .props("outline color=orange").classes("flex-1")
                 with ui.card().classes("w-full"):
                     status_stream_image = ui.image(createErrorImage("Initializing ...")).classes("w-full").props('no-transition no-spinner')
                     status_stream_message = makeUnavailableMessage("videocam_off")
@@ -4271,9 +4603,6 @@ def main():
                     weather_plots["Pressure"] = makePlot("Pressure")
                 with ui.card().classes('w-full'):
                     weather_plots["Rain Heating"] = makePlot("Rain Heating")
-
-        with ui.tab_panel(tab_roof):
-            pass
 
         with ui.tab_panel(tab_log):
             with ui.card().classes("w-full"):
@@ -4370,7 +4699,60 @@ def main():
                 color = indicator_colors["unkn"]
             status_indicators[name].style(f'background-color: {color}')
 
+    # One colour per decisive state. Green for the two the roof is allowed to sit in, blue
+    # for the two it is passing through, red for the one that wants an operator, orange for
+    # the one an operator asked for.
+    roof_state_colors = {
+            RoofStatus.OPEN: "text-green-500",
+            RoofStatus.CLOSED: "text-green-500",
+            RoofStatus.OPENING: "text-blue-400",
+            RoofStatus.CLOSING: "text-blue-400",
+            RoofStatus.FAULT: "text-red-500",
+            RoofStatus.DISENGAGED: "text-orange-400",
+            }
+    # Every colour the label can be given, taken off on each write. Two mutually exclusive
+    # text colours on one element resolve by stylesheet order rather than by which was set
+    # last, so leaving the old one on is how a label gets stuck red.
+    roof_state_color_classes = " ".join(sorted(set(roof_state_colors.values())))
+
+    def updateRoofControls():
+        """Repaints the decisive status and decides which buttons may be pressed.
+
+        Both from one call, because they are two readings of the same answer and must not
+        be able to disagree: a screen that says CLOSING with an enabled Open button is worse
+        than either half of it being wrong on its own.
+        """
+        state, reason = roofDecisiveState()
+        roof_state_label.set_text(state.value.upper())
+        roof_state_label.classes("text-3xl font-bold " + roof_state_colors[state],
+                                 remove=roof_state_color_classes)
+        roof_state_reason.set_text(reason or "")
+        roof_state_reason.set_visibility(bool(reason))
+
+        # Disengaged disables the same three as a running motion, for a different reason:
+        # there, the roof must not be interrupted; here, OMS has been told to keep its hands
+        # off it. Both leave the stop alone, which is never disabled at all -- a button that
+        # de-energizes four relays has no state in which it is the wrong thing to press.
+        blocked = state in (RoofStatus.OPENING, RoofStatus.CLOSING)
+        for button in (roof_open_button, roof_close_button, roof_reset_button):
+            button.set_enabled(not blocked and roofEngaged)
+        roof_engage_button.set_enabled(not blocked)
+        # Text and props only. The handler is bound once, at construction, and decides which
+        # way it is going when it runs: ui.button.on_click() *adds* a handler rather than
+        # replacing one, so rebinding here would fire the command once per repaint since
+        # the page loaded.
+        if roofEngaged:
+            roof_engage_button.set_text("Disengage")
+            roof_engage_button.props("icon=link_off color=orange")
+        else:
+            roof_engage_button.set_text("Engage")
+            roof_engage_button.props("icon=link color=green")
+
     def updateRoofIcons(status: roof.ResponseState | None):
+        # The icons and the one-word status are two views of the same poll, so they are
+        # repainted together rather than left to drift by up to a timer period. Every
+        # roofUpdate event and onConnect come through here.
+        updateRoofControls()
         if status is None:
             # The limit switch indicators are keyed by the lower-cased RoofSwitch name,
             # so the set stays in step with roof.py by construction.
@@ -4429,6 +4811,10 @@ def main():
         the worker's own publish, independent of whatever this client last happened to be
         shown.
         """
+        # The decisive status turns on the age of the reading as much as on its content --
+        # a poll that stops arriving makes it a fault with nobody publishing an event to
+        # say so -- so it is recomputed on this timer for the same reason this label is.
+        updateRoofControls()
         status, age = getRoofState()
         if status is None:
             # Nothing published yet, or the roof was torn down -- updateRoofIcons()
@@ -5076,6 +5462,11 @@ def main():
     # something went wrong shows the lines that say so, rather than starting blank and
     # only filling with whatever happens next.
     updateLog()
+    # So the first render carries a real state and correctly enabled buttons rather than
+    # the placeholder, which onConnect would otherwise only replace once the websocket is
+    # up. It also means a page loaded while the roof is moving has Open and Close already
+    # disabled on arrival.
+    updateRoofControls()
 
     weather_range_select.on_value_change(updatePlots)
 
@@ -5261,6 +5652,7 @@ def main():
             return
         if thing[0] == "roofMotionDone":
             ui.notify(f"Roof {thing[1]} complete", type="positive")
+            updateRoofControls()
             return
         if thing[0] == "roofMotionError":
             # The only place a motion failure reaches the operator. failRoofMotion() composes
@@ -5268,10 +5660,22 @@ def main():
             # that field, so without this a latched roof looks exactly like an idle one --
             # the icons simply stop moving.
             ui.notify(f"Roof motion failed: {thing[1]}", type="negative")
+            updateRoofControls()
             return
         if thing[0] == "roofMotionStopped":
             # Fired with no payload, unlike the two above, so do not index thing[1].
             ui.notify("Roof stopped", type="warning")
+            updateRoofControls()
+            return
+        if thing[0] == "roofEngaged":
+            ui.notify("Roof engaged" if thing[1] else
+                      "Roof disengaged: relays de-energized, safety checks off",
+                      type="positive" if thing[1] else "warning")
+            updateRoofControls()
+            return
+        if thing[0] == "roofFaultCleared":
+            ui.notify("Roof fault cleared", type="positive")
+            updateRoofControls()
             return
         if thing[0] == "fanUpdate":
             ui.notify(f"Fans set to {thing[1]} ({"auto" if thing[2] else "manual"})")
