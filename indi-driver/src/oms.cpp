@@ -56,12 +56,7 @@ bool OMS::Disconnect() {
 
 void OMS::ISGetProperties(const char *dev) {
     INDI::DefaultDevice::ISGetProperties(dev);
-    IUFillText(&addressT[0], "ADDRESS", "Address", "");
-    IUFillText(&addressT[1], "PORT", "Port", "");
-    IUFillTextVector(&addressTP, addressT, 2, getDeviceName(), "DEVICE_ADDRESS", "Server", CONNECTION_TAB,
-            IP_RW, 60, IPS_IDLE);
     defineProperty(&addressTP);
-    loadConfig(false, "DEVICE_ADDRESS");
 }
 
 const char *OMS::getDefaultName() {
@@ -71,7 +66,17 @@ const char *OMS::getDefaultName() {
 bool OMS::initProperties() {
     INDI::DefaultDevice::initProperties();
     WI::initProperties(WEATHER_TAB, WEATHER_TAB);
-    
+
+    // Built once here, not in ISGetProperties(): IUFillText() blanks the
+    // property's text, and ISGetProperties() runs once per connecting
+    // client, so building it there wiped out the address/port (and any
+    // loaded config) for every client after the first.
+    IUFillText(&addressT[0], "ADDRESS", "Address", "");
+    IUFillText(&addressT[1], "PORT", "Port", "");
+    IUFillTextVector(&addressTP, addressT, 2, getDeviceName(), "DEVICE_ADDRESS", "Server", CONNECTION_TAB,
+            IP_RW, 60, IPS_IDLE);
+    loadConfig(false, "DEVICE_ADDRESS");
+
     for ( const auto& v : parameters ) {
         addParameter(v.name, v.label, v.minOK, v.maxOK, v.percWarn);
     } 
