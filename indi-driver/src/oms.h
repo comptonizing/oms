@@ -117,6 +117,7 @@ class OMS : public INDI::DefaultDevice, public INDI::WeatherInterface {
 
         bool readURL(const std::string &url, std::string &response);
         int parsePort(const char *str);
+        void markUnsafe();
 
         std::string m_url = "";
 };

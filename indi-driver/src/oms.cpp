@@ -137,9 +137,17 @@ bool OMS::ISNewNumber(const char *dev, const char *name, double *values, char *n
     return INDI::DefaultDevice::ISNewNumber(dev, name, values, names, n);
 }
 
+void OMS::markUnsafe() {
+    critialParametersLP.setState(IPS_ALERT);
+    critialParametersLP.apply();
+    SafetyStatusLP.setState(IPS_ALERT);
+    SafetyStatusLP.apply();
+}
+
 IPState OMS::updateWeather() {
     std::string response = "";
     if ( ! readURL("/api/v1/weather", response) ) {
+        markUnsafe();
         return IPS_ALERT;
     }
     json data;
@@ -147,9 +155,11 @@ IPState OMS::updateWeather() {
         data = json::parse(response);
     } catch ( json::exception &e ) {
         LOGF_ERROR("JSON parse error: %s\n%s", e.what(), response.c_str());
+        markUnsafe();
         return IPS_ALERT;
     } catch (...) {
         LOGF_ERROR("Unknown JSON parse error\n%s", response.c_str());
+        markUnsafe();
         return IPS_ALERT;
     }
 
@@ -168,7 +178,11 @@ IPState OMS::updateWeather() {
             continue;
         }
         setParameterValue(v.name, value);
-    } 
+    }
+
+    if ( ret == IPS_ALERT ) {
+        markUnsafe();
+    }
 
     return ret;
 }
