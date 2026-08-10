@@ -297,6 +297,20 @@ bool OMS::readURL(const std::string &url, std::string &response) {
         return false;
     }
 
+    if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, TIMEOUT) ) {
+        LOGF_ERROR("Could not set curl connect timeout: %s",
+                strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT) ) {
+        LOGF_ERROR("Could not set curl timeout: %s",
+                strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
 
