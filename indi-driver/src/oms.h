@@ -29,7 +29,7 @@
 
 #include <indibase.h>
 #include <indiweatherinterface.h>
-#include <defaultdevice.h>
+#include <indidome.h>
 #include <unordered_map>
 
 #include "json.hpp"
@@ -90,7 +90,12 @@ static const weatherData parameters[] = {
 };
 
 
-class OMS : public INDI::DefaultDevice, public INDI::WeatherInterface {
+// OMS is one physical box, so it is one INDI device with two roles: INDI::Dome drives the
+// roof (open/close/stop map onto UnPark/Park/Abort - there is no azimuth, just the two-state
+// roll-off roof OMS's own API already models), and the INDI::WeatherInterface mixin still
+// reports the same station readings as before. Dome is itself a DefaultDevice subclass, so
+// this replaces the old "public INDI::DefaultDevice" base rather than adding to it.
+class OMS : public INDI::Dome, public INDI::WeatherInterface {
     public:
         OMS();
         ~OMS();
@@ -107,16 +112,40 @@ class OMS : public INDI::DefaultDevice, public INDI::WeatherInterface {
         virtual bool saveConfigItems(FILE *fp) override;
         virtual IPState updateWeather() override;
 
+        // Roof (INDI::Dome). DOME_CW/UnPark open the roof, DOME_CCW/Park close it - OMS has
+        // no azimuth, so this is the same two-state model roll_off.cpp uses for a roll-off
+        // roof, just backed by OMS's REST API instead of local limit-switch GPIO.
+        virtual IPState Move(DomeDirection dir, DomeMotionCommand operation) override;
+        virtual IPState Park() override;
+        virtual IPState UnPark() override;
+        virtual bool Abort() override;
+        virtual void TimerHit() override;
+
         ITextVectorProperty addressTP;
         IText addressT[2] {};
+
+        // OMS's roof has two controls beyond open/close/stop that don't map onto anything
+        // INDI::Dome already models: handing the roof to/from an operator, and clearing a
+        // latched motion fault. Exposed as their own switches rather than folded into Park/
+        // UnPark, which client UIs assume only ever mean "move the roof".
+        ISwitch engageS[2];
+        ISwitchVectorProperty engageSP;
+        ISwitch faultClearS[1];
+        ISwitchVectorProperty faultClearSP;
     private:
         static constexpr const char *WEATHER_TAB {"Weather"};
+        // Cadence TimerHit() re-arms itself at while connected. The GET this drives just
+        // reads what the roof worker last published (see roofDetail()'s docstring in
+        // apiv1.py) rather than triggering a serial exchange, so polling this often costs
+        // OMS nothing - it only trades off how quickly INDI notices a state change.
+        static constexpr uint32_t ROOF_POLL_MS {2000};
 
+        bool request(bool isPost, const std::string &url, std::string &response);
         bool readURL(const std::string &url, std::string &response);
+        bool sendRoofCommand(const std::string &command, std::string &response);
+        void pollRoofState();
         int parsePort(const char *str);
         void markUnsafe();
 
         std::string m_url = "";
 };
-
-

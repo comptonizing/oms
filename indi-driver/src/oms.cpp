@@ -29,6 +29,13 @@ static std::unique_ptr<OMS> OMSDriver(new OMS());
 OMS::OMS() : WI(this) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    // OMS's own DEVICE_ADDRESS text property is the only connection surface this driver
+    // has - Dome would otherwise register its own Serial/TCP connection plugins we never use.
+    setDomeConnection(CONNECTION_NONE);
+    // No azimuth, no shutter distinct from the roof itself: open or closed is the whole
+    // state, exactly the model roll_off.cpp uses for a roll-off roof.
+    SetDomeCapability(DOME_CAN_ABORT | DOME_CAN_PARK);
+
     setVersion(1,0);
 }
 
@@ -47,6 +54,12 @@ bool OMS::Connect() {
         return false;
     }
 
+    // Without this, m_DomeState stays DOME_UNKNOWN until the first TimerHit() tick fires
+    // (SetTimer() schedules a future call, not an immediate one) - and Dome::Park()/UnPark()
+    // read m_DomeState to decide whether there is anything to do, so a park/unpark request
+    // arriving in that window would see "already unparked" and silently no-op.
+    pollRoofState();
+    SetTimer(ROOF_POLL_MS);
     return true;
 }
 
@@ -55,7 +68,7 @@ bool OMS::Disconnect() {
 }
 
 void OMS::ISGetProperties(const char *dev) {
-    INDI::DefaultDevice::ISGetProperties(dev);
+    INDI::Dome::ISGetProperties(dev);
     defineProperty(&addressTP);
 }
 
@@ -64,8 +77,11 @@ const char *OMS::getDefaultName() {
 }
 
 bool OMS::initProperties() {
-    INDI::DefaultDevice::initProperties();
+    INDI::Dome::initProperties();
     WI::initProperties(WEATHER_TAB, WEATHER_TAB);
+
+    // Two-state roof, not an azimuth position - nothing to park at beyond open/closed.
+    SetParkDataType(PARK_NONE);
 
     // Built once here, not in ISGetProperties(): IUFillText() blanks the
     // property's text, and ISGetProperties() runs once per connecting
@@ -77,29 +93,48 @@ bool OMS::initProperties() {
             IP_RW, 60, IPS_IDLE);
     loadConfig(false, "DEVICE_ADDRESS");
 
+    IUFillSwitch(&engageS[0], "ENGAGE", "Engage", ISS_ON);
+    IUFillSwitch(&engageS[1], "DISENGAGE", "Disengage", ISS_OFF);
+    IUFillSwitchVector(&engageSP, engageS, 2, getDeviceName(), "ROOF_ENGAGE", "Safety Checks", MAIN_CONTROL_TAB,
+            IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+
+    IUFillSwitch(&faultClearS[0], "CLEAR", "Clear Fault", ISS_OFF);
+    IUFillSwitchVector(&faultClearSP, faultClearS, 1, getDeviceName(), "ROOF_FAULT_CLEAR", "Fault", MAIN_CONTROL_TAB,
+            IP_RW, ISR_ATMOST1, 60, IPS_IDLE);
+
     for ( const auto& v : parameters ) {
         addParameter(v.name, v.label, v.minOK, v.maxOK, v.percWarn);
-    } 
+    }
 
     for ( const auto& v : parameters ) {
         if ( ! v.critical ) {
             continue;
         }
         setCriticalParameter(v.name);
-    } 
+    }
 
-    addDebugControl();
+    // Dome::initProperties() already calls addDebugControl() and sets DOME_INTERFACE;
+    // add Configuration ourselves and fold WEATHER_INTERFACE into what Dome just set.
     addConfigurationControl();
-    setDriverInterface(AUX_INTERFACE | WEATHER_INTERFACE);
+    setDriverInterface(getDriverInterface() | WEATHER_INTERFACE);
 
     return true;
 }
 
 bool OMS::updateProperties() {
-    INDI::DefaultDevice::updateProperties();
+    INDI::Dome::updateProperties();
     // WI::updateProperties() already calls checkWeatherUpdate() -> updateWeather()
     // when connecting; don't fetch a second time here.
     WI::updateProperties();
+
+    if ( isConnected() ) {
+        defineProperty(&engageSP);
+        defineProperty(&faultClearSP);
+    } else {
+        deleteProperty(engageSP.name);
+        deleteProperty(faultClearSP.name);
+    }
+
     return true;
 }
 
@@ -108,8 +143,38 @@ bool OMS::ISNewSwitch(const char * dev, const char * name, ISState * states, cha
         if ( WI::processSwitch(dev, name, states, names, n) ) {
             return true;
         }
+
+        if ( strcmp(name, engageSP.name) == 0 ) {
+            IUUpdateSwitch(&engageSP, states, names, n);
+            bool engage = engageS[0].s == ISS_ON;
+            std::string response;
+            if ( ! sendRoofCommand(engage ? "engage" : "disengage", response) ) {
+                engageSP.s = IPS_ALERT;
+                LOGF_ERROR("Could not %s the roof", engage ? "engage" : "disengage");
+            } else {
+                engageSP.s = IPS_OK;
+                LOGF_INFO("Roof %s", engage ? "engaged" : "disengaged");
+            }
+            IDSetSwitch(&engageSP, nullptr);
+            return true;
+        }
+
+        if ( strcmp(name, faultClearSP.name) == 0 ) {
+            IUUpdateSwitch(&faultClearSP, states, names, n);
+            faultClearS[0].s = ISS_OFF;
+            std::string response;
+            if ( ! sendRoofCommand("reset", response) ) {
+                faultClearSP.s = IPS_ALERT;
+                LOG_ERROR("Could not clear the roof fault");
+            } else {
+                faultClearSP.s = IPS_OK;
+                LOG_INFO("Roof fault clear requested");
+            }
+            IDSetSwitch(&faultClearSP, nullptr);
+            return true;
+        }
     }
-    return INDI::DefaultDevice::ISNewSwitch(dev, name, states, names, n);
+    return INDI::Dome::ISNewSwitch(dev, name, states, names, n);
 }
 
 bool OMS::ISNewNumber(const char *dev, const char *name, double *values, char *names[], int n) {
@@ -118,7 +183,7 @@ bool OMS::ISNewNumber(const char *dev, const char *name, double *values, char *n
             return true;
         }
     }
-    return INDI::DefaultDevice::ISNewNumber(dev, name, values, names, n);
+    return INDI::Dome::ISNewNumber(dev, name, values, names, n);
 }
 
 void OMS::markUnsafe() {
@@ -218,17 +283,147 @@ bool OMS::ISNewText(const char *dev, const char *name, char *texts[], char *name
         }
     }
 
-    return INDI::DefaultDevice::ISNewText(dev, name, texts, names, n);
+    return INDI::Dome::ISNewText(dev, name, texts, names, n);
 }
 
 bool OMS::saveConfigItems(FILE * fp)
 {
-    INDI::DefaultDevice::saveConfigItems(fp);
+    INDI::Dome::saveConfigItems(fp);
     WI::saveConfigItems(fp);
     IUSaveConfigText(fp, &addressTP);
 
     return true;
 }
+
+// --- roof motion (INDI::Dome) -----------------------------------------------------------
+
+IPState OMS::Move(DomeDirection dir, DomeMotionCommand operation) {
+    if ( operation == MOTION_STOP ) {
+        // Goes through the same wrapper Dome::ISNewSwitch's Abort switch does, which
+        // handles the ParkSP/DomeMotionSP bookkeeping before it calls our Abort() virtually.
+        return Dome::Abort() ? IPS_OK : IPS_ALERT;
+    }
+
+    std::string command = dir == DOME_CW ? "open" : "close";
+    std::string response;
+    if ( ! sendRoofCommand(command, response) ) {
+        LOGF_ERROR("Could not request roof %s", command.c_str());
+        return IPS_ALERT;
+    }
+    LOGF_INFO("Roof %s requested.", command.c_str());
+    return IPS_BUSY;
+}
+
+IPState OMS::Park() {
+    // Explicitly qualified so the base wrapper's busy/parked bookkeeping runs before it
+    // calls our Move() override virtually - the same reason roll_off.cpp does this.
+    IPState rc = INDI::Dome::Move(DOME_CCW, MOTION_START);
+    if ( rc == IPS_BUSY ) {
+        LOG_INFO("Roof is closing...");
+        return IPS_BUSY;
+    }
+    return IPS_ALERT;
+}
+
+IPState OMS::UnPark() {
+    IPState rc = INDI::Dome::Move(DOME_CW, MOTION_START);
+    if ( rc == IPS_BUSY ) {
+        LOG_INFO("Roof is opening...");
+        return IPS_BUSY;
+    }
+    return IPS_ALERT;
+}
+
+bool OMS::Abort() {
+    std::string response;
+    if ( ! sendRoofCommand("stop", response) ) {
+        LOG_ERROR("Could not request roof stop");
+        return false;
+    }
+    LOG_INFO("Roof stop requested.");
+    return true;
+}
+
+void OMS::TimerHit() {
+    if ( ! isConnected() ) {
+        return;
+    }
+    pollRoofState();
+    SetTimer(ROOF_POLL_MS);
+}
+
+void OMS::pollRoofState() {
+    std::string response;
+    if ( ! readURL("/api/v1/roof", response) ) {
+        setDomeState(DOME_ERROR);
+        return;
+    }
+
+    json data;
+    try {
+        data = json::parse(response);
+    } catch ( json::exception &e ) {
+        LOGF_ERROR("Roof state JSON parse error: %s\n%s", e.what(), response.c_str());
+        setDomeState(DOME_ERROR);
+        return;
+    } catch (...) {
+        LOGF_ERROR("Unknown roof state JSON parse error\n%s", response.c_str());
+        setDomeState(DOME_ERROR);
+        return;
+    }
+
+    std::string state;
+    try {
+        state = data["state"].template get<std::string>();
+    } catch ( json::exception &e ) {
+        LOGF_ERROR("Roof state missing \"state\": %s\n%s", e.what(), response.c_str());
+        setDomeState(DOME_ERROR);
+        return;
+    }
+
+    std::string reason;
+    if ( data.contains("reason") && ! data["reason"].is_null() ) {
+        try {
+            reason = data["reason"].template get<std::string>();
+        } catch ( json::exception &e ) {
+            reason = "";
+        }
+    }
+
+    // roofDecisiveState() on the OMS side already reduces everything the board and the
+    // relays can say to one of six words (see RoofStatus in oms/oms); mirror that directly
+    // rather than re-deriving it from limit switches, which the driver never sees.
+    if ( state == "open" ) {
+        if ( isParked() ) {
+            SetParked(false);
+        } else if ( getDomeState() != DOME_UNPARKED ) {
+            setDomeState(DOME_UNPARKED);
+        }
+    } else if ( state == "closed" ) {
+        if ( ! isParked() ) {
+            SetParked(true);
+        } else if ( getDomeState() != DOME_PARKED ) {
+            setDomeState(DOME_PARKED);
+        }
+    } else if ( state == "opening" ) {
+        setDomeState(DOME_UNPARKING);
+    } else if ( state == "closing" ) {
+        setDomeState(DOME_PARKING);
+    } else if ( state == "disengaged" ) {
+        if ( getDomeState() != DOME_UNKNOWN ) {
+            LOGF_WARN("Roof is disengaged: %s", reason.empty() ? "safety checks are off" : reason.c_str());
+        }
+        setDomeState(DOME_UNKNOWN);
+    } else {
+        // "fault", or anything this driver doesn't recognize yet.
+        if ( getDomeState() != DOME_ERROR ) {
+            LOGF_ERROR("Roof fault: %s", reason.empty() ? "unknown" : reason.c_str());
+        }
+        setDomeState(DOME_ERROR);
+    }
+}
+
+// --- HTTP --------------------------------------------------------------------------------
 
 static size_t WriteCB(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string *)userp)->append((char *)contents, size * nmemb);
@@ -236,11 +431,19 @@ static size_t WriteCB(void *contents, size_t size, size_t nmemb, void *userp) {
 }
 
 bool OMS::readURL(const std::string &url, std::string &response) {
+    return request(false, url, response);
+}
+
+bool OMS::sendRoofCommand(const std::string &command, std::string &response) {
+    return request(true, "/api/v1/roof/" + command, response);
+}
+
+bool OMS::request(bool isPost, const std::string &url, std::string &response) {
     char curlErrorBuff[CURL_ERROR_SIZE] = ""; // Necessary, see curl docs
     std::string buff;
     std::string address = m_url + url;
 
-    LOGF_DEBUG("URL: %s", url.c_str());
+    LOGF_DEBUG("%s %s", isPost ? "POST" : "GET", url.c_str());
 
     if ( m_url == "" ) {
         LOG_ERROR("Connection details not provided!");
@@ -265,6 +468,24 @@ bool OMS::readURL(const std::string &url, std::string &response) {
                 strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
         curl_easy_cleanup(curl);
         return false;
+    }
+
+    if ( isPost ) {
+        // The roof/weather commands take no body - POSTFIELDS("") is enough to make curl
+        // send POST rather than GET, and CURLOPT_POST makes that explicit either way.
+        if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_POST, 1L) ) {
+            LOGF_ERROR("Could not set curl POST method: %s",
+                    strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
+            curl_easy_cleanup(curl);
+            return false;
+        }
+
+        if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "") ) {
+            LOGF_ERROR("Could not set curl POST body: %s",
+                    strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
+            curl_easy_cleanup(curl);
+            return false;
+        }
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCB) ) {

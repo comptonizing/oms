@@ -21,7 +21,7 @@
 
 <?xml version="1.0" encoding="UTF-8"?>
 <driversList>
-   <devGroup group="Auxiliary">
+   <devGroup group="Domes">
      <device label="OMS" manufacturer="Pollux Astro">
        <driver name="OMS">indi_pollux_oms</driver>
          <version>1.0</version>
