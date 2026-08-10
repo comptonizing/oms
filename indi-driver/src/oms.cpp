@@ -118,6 +118,10 @@ bool OMS::initProperties() {
     IUFillSwitchVector(&fanSP, fanS, 3, getDeviceName(), "SWITCH_FANS", "Fans", SWITCHES_TAB,
             IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
 
+    IUFillLight(&fanRunningL[0], "RUNNING", "Running", IPS_IDLE);
+    IUFillLightVector(&fanRunningLP, fanRunningL, 1, getDeviceName(), "SWITCH_FANS_RUNNING", "Fans Actual",
+            SWITCHES_TAB, IPS_IDLE);
+
     for ( size_t i = 0; i < NUM_LIMIT_SWITCHES; i++ ) {
         const auto& ld = limitSwitchLights[i];
         IUFillLight(&limitSwitchL[i], ld.name.c_str(), ld.label.c_str(), IPS_IDLE);
@@ -146,6 +150,10 @@ bool OMS::initProperties() {
 
     IUFillText(&faultReasonT[0], "REASON", "Reason", "");
     IUFillTextVector(&faultReasonTP, faultReasonT, 1, getDeviceName(), "ROOF_FAULT_REASON", "Fault",
+            MAIN_CONTROL_TAB, IP_RO, 60, IPS_IDLE);
+
+    IUFillText(&motionPhaseT[0], "PHASE", "Phase", "");
+    IUFillTextVector(&motionPhaseTP, motionPhaseT, 1, getDeviceName(), "ROOF_MOTION_PHASE", "Motion Phase",
             MAIN_CONTROL_TAB, IP_RO, 60, IPS_IDLE);
 
     IUFillNumber(&environmentN[0], "INSIDE_TEMPERATURE", "Temperature (C)", "%.2f", -50, 80, 0, 0);
@@ -185,11 +193,13 @@ bool OMS::updateProperties() {
             defineProperty(&switchSP[i]);
         }
         defineProperty(&fanSP);
+        defineProperty(&fanRunningLP);
         defineProperty(&limitSwitchLP);
         defineProperty(&rodLP);
         defineProperty(&relayLP);
         defineProperty(&positionTP);
         defineProperty(&faultReasonTP);
+        defineProperty(&motionPhaseTP);
         defineProperty(&environmentNP);
     } else {
         deleteProperty(engageSP.name);
@@ -198,11 +208,13 @@ bool OMS::updateProperties() {
             deleteProperty(switchSP[i].name);
         }
         deleteProperty(fanSP.name);
+        deleteProperty(fanRunningLP.name);
         deleteProperty(limitSwitchLP.name);
         deleteProperty(rodLP.name);
         deleteProperty(relayLP.name);
         deleteProperty(positionTP.name);
         deleteProperty(faultReasonTP.name);
+        deleteProperty(motionPhaseTP.name);
         deleteProperty(environmentNP.name);
     }
 
@@ -528,6 +540,32 @@ void OMS::pollRoofState() {
         setDomeState(DOME_ERROR);
     }
 
+    // "motion" is always present, unlike the detail below - roofDetail() sets it before
+    // the "no reading yet" early return, since it's about the sequence driving the roof
+    // rather than what the board last said.
+    if ( data.contains("motion") && ! data["motion"].is_null() ) {
+        const auto &motion = data["motion"];
+        std::string phase;
+        if ( motion.contains("phase") && ! motion["phase"].is_null() ) {
+            try {
+                phase = motion.at("phase").template get<std::string>();
+            } catch ( json::exception &e ) {
+                phase = "";
+            }
+        }
+        bool running = false;
+        try {
+            running = motion.at("running").template get<bool>();
+        } catch ( json::exception &e ) {
+        }
+        IPState want = running ? IPS_BUSY : IPS_IDLE;
+        if ( motionPhaseTP.s != want || phase != motionPhaseT[0].text ) {
+            IUSaveText(&motionPhaseT[0], phase.c_str());
+            motionPhaseTP.s = want;
+            IDSetText(&motionPhaseTP, nullptr);
+        }
+    }
+
     // Limit switches, rods and position are null together until the roof board has
     // answered once (see roofDetail()'s docstring); relays are not, since those come from
     // Pi GPIO the worker always knows. Each block below only pushes an update when
@@ -713,6 +751,24 @@ void OMS::pollSwitches() {
             fanS[2].s = wantAuto;
             fanSP.s = IPS_OK;
             IDSetSwitch(&fanSP, nullptr);
+        }
+    }
+
+    if ( data.contains(FAN_ID) && data[FAN_ID].contains("state") && ! data[FAN_ID]["state"].is_null() ) {
+        std::string state;
+        try {
+            state = data[FAN_ID]["state"].template get<std::string>();
+        } catch ( json::exception &e ) {
+            return;
+        }
+        // "unkn" (no roof reading yet) and "off" both read as not-running; the fan mode
+        // switch above is what tells them apart, since it comes from settings rather than
+        // the board.
+        IPState want = state == "on" ? IPS_OK : IPS_IDLE;
+        if ( fanRunningLP.s != IPS_OK || fanRunningL[0].s != want ) {
+            fanRunningL[0].s = want;
+            fanRunningLP.s = IPS_OK;
+            IDSetLight(&fanRunningLP, nullptr);
         }
     }
 }

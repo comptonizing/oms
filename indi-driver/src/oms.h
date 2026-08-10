@@ -206,6 +206,10 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // than a fifth entry in switchDevices[].
         ISwitch fanS[3];
         ISwitchVectorProperty fanSP;
+        // fanSP above is the commanded mode; this is switches()[fans]["state"], the board's
+        // live answer to whether they're actually spinning - the two can disagree in "auto".
+        ILight fanRunningL[1];
+        ILightVectorProperty fanRunningLP;
 
         // Detailed roof status - limit switches, rod state, half position, relay drive and
         // a latched fault reason - on the main tab because that's where the roof controls
@@ -221,6 +225,11 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         ITextVectorProperty positionTP;
         IText faultReasonT[1] {};
         ITextVectorProperty faultReasonTP;
+        // "state" (opening/closing/...) is the six-word summary; this is the actual step
+        // within it - OPEN_KICK, OPEN_RUN, OPEN_SETTLE, CLOSE_RODCLEAR, ... (see roofMotion
+        // in oms/oms) - which is what a motion stuck mid-sequence needs to diagnose.
+        IText motionPhaseT[1] {};
+        ITextVectorProperty motionPhaseTP;
 
         // Inside temperature/humidity, from the board behind the environment sensor port -
         // a different sensor, port and staleness rule than the outdoor station above (see
