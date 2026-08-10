@@ -90,17 +90,8 @@ bool OMS::initProperties() {
 
     addDebugControl();
     addConfigurationControl();
-    addPollPeriodControl();
-    setDefaultPollingPeriod(500);
     setDriverInterface(AUX_INTERFACE | WEATHER_INTERFACE);
 
-    return true;
-}
-
-bool OMS::loadConfig(bool silent, const char *property) {
-    DefaultDevice::loadConfig(silent, property);
-    if ( property == nullptr ) {
-    }
     return true;
 }
 
@@ -111,13 +102,6 @@ bool OMS::updateProperties() {
     WI::updateProperties();
     return true;
 }
-
-void OMS::TimerHit() {
-    if ( isConnected() ) {
-    }
-    SetTimer(getCurrentPollingPeriod());
-}
-
 
 bool OMS::ISNewSwitch(const char * dev, const char * name, ISState * states, char * names[], int n) {
     if (dev != nullptr && strcmp(dev, getDeviceName()) == 0) {

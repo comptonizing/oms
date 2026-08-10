@@ -22,7 +22,6 @@
 
 #pragma once
 
-#include <termios.h>
 #include <regex>
 #include <map>
 
@@ -105,9 +104,7 @@ class OMS : public INDI::DefaultDevice, public INDI::WeatherInterface {
         virtual bool ISNewNumber(const char *dev, const char *name, double *values, char *names[], int n) override;
         virtual bool ISNewText(const char *dev, const char *name, char *texts[], char *names[], int n) override;
         virtual void ISGetProperties(const char *dev) override;
-        virtual void TimerHit() override;
         virtual bool saveConfigItems(FILE *fp) override;
-        virtual bool loadConfig(bool silent = false, const char *property = nullptr) override;
         virtual IPState updateWeather() override;
 
         ITextVectorProperty addressTP;
