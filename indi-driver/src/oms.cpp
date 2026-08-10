@@ -239,6 +239,8 @@ bool OMS::ISNewText(const char *dev, const char *name, char *texts[], char *name
 
 bool OMS::saveConfigItems(FILE * fp)
 {
+    INDI::DefaultDevice::saveConfigItems(fp);
+    WI::saveConfigItems(fp);
     IUSaveConfigText(fp, &addressTP);
 
     return true;
