@@ -58,7 +58,7 @@ AC_ARG_WITH([indi],
             [indiloc=$withval],
             [indiloc="/usr"])
 AS_IF([ [[ "${indiloc}" != "notgiven" ]] ],
-      [LDFLAGS="$LDFLAGS -L${indiloc}/lib" && CXXFLAGS="$CXXFLAGS -isystem ${indiloc}/include/libindi" && AC_SUBST([INDILOC], [$indiloc])],
+      [LDFLAGS="$LDFLAGS -L${indiloc}/lib -Wl,-rpath-link,${indiloc}/lib" && CXXFLAGS="$CXXFLAGS -isystem ${indiloc}/include/libindi" && AC_SUBST([INDILOC], [$indiloc])],
       [])
 
 AC_SEARCH_LIBS(sin, m, [], [AC_MSG_ERROR([No math library found!])], [])
