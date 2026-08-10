@@ -108,6 +108,52 @@ static const switchData switchDevices[] = {
 static constexpr size_t NUM_SWITCHES = sizeof(switchDevices) / sizeof(switchDevices[0]);
 static constexpr const char *FAN_ID = "fans";
 
+// The board and relay detail roofDetail() (see apiv1.py) reports each tick, beyond the
+// six-word summary pollRoofState() already reduces "state" to. All read-only: nothing here
+// is a command, it is what the state machine used to decide the six-word summary.
+struct lightData {
+    std::string id;    // key within the JSON dict this light is read from
+    std::string name;  // INDI light name
+    std::string label;
+};
+
+static const lightData limitSwitchLights[] = {
+    lightData {"west_closed_north", "WEST_CLOSED_NORTH", "West Closed North"},
+    lightData {"west_closed_south", "WEST_CLOSED_SOUTH", "West Closed South"},
+    lightData {"west_open_north", "WEST_OPEN_NORTH", "West Open North"},
+    lightData {"west_open_south", "WEST_OPEN_SOUTH", "West Open South"},
+    lightData {"east_closed_north", "EAST_CLOSED_NORTH", "East Closed North"},
+    lightData {"east_closed_south", "EAST_CLOSED_SOUTH", "East Closed South"},
+    lightData {"east_open_north", "EAST_OPEN_NORTH", "East Open North"},
+    lightData {"east_open_south", "EAST_OPEN_SOUTH", "East Open South"},
+};
+static constexpr size_t NUM_LIMIT_SWITCHES = sizeof(limitSwitchLights) / sizeof(limitSwitchLights[0]);
+
+static const lightData relayLights[] = {
+    lightData {"west_open", "WEST_OPEN", "West Open"},
+    lightData {"west_close", "WEST_CLOSE", "West Close"},
+    lightData {"east_open", "EAST_OPEN", "East Open"},
+    lightData {"east_close", "EAST_CLOSE", "East Close"},
+};
+static constexpr size_t NUM_RELAYS = sizeof(relayLights) / sizeof(relayLights[0]);
+
+// Rods live under two keys deep ("rods"."west"."retracted", not a flat dict), so they get
+// their own two-key lookup rather than reusing lightData's single id.
+struct rodLightData {
+    std::string half;   // "west" / "east"
+    std::string field;  // "extendRequested" / "retracted"
+    std::string name;
+    std::string label;
+};
+
+static const rodLightData rodLights[] = {
+    rodLightData {"west", "extendRequested", "WEST_EXTEND_REQUESTED", "West Extend Requested"},
+    rodLightData {"west", "retracted", "WEST_RETRACTED", "West Retracted"},
+    rodLightData {"east", "extendRequested", "EAST_EXTEND_REQUESTED", "East Extend Requested"},
+    rodLightData {"east", "retracted", "EAST_RETRACTED", "East Retracted"},
+};
+static constexpr size_t NUM_RODS = sizeof(rodLights) / sizeof(rodLights[0]);
+
 
 // OMS is one physical box, so it is one INDI device with two roles: INDI::Dome drives the
 // roof (open/close/stop map onto UnPark/Park/Abort - there is no azimuth, just the two-state
@@ -160,9 +206,31 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // than a fifth entry in switchDevices[].
         ISwitch fanS[3];
         ISwitchVectorProperty fanSP;
+
+        // Detailed roof status - limit switches, rod state, half position, relay drive and
+        // a latched fault reason - on the main tab because that's where the roof controls
+        // already are. All read-only and all sourced from the same /api/v1/roof poll that
+        // already drives the six-word summary above.
+        ILight limitSwitchL[NUM_LIMIT_SWITCHES];
+        ILightVectorProperty limitSwitchLP;
+        ILight rodL[NUM_RODS];
+        ILightVectorProperty rodLP;
+        ILight relayL[NUM_RELAYS];
+        ILightVectorProperty relayLP;
+        IText positionT[3] {};
+        ITextVectorProperty positionTP;
+        IText faultReasonT[1] {};
+        ITextVectorProperty faultReasonTP;
+
+        // Inside temperature/humidity, from the board behind the environment sensor port -
+        // a different sensor, port and staleness rule than the outdoor station above (see
+        // /api/v1/environment's docstring), so its own tab rather than folded into Weather.
+        INumber environmentN[2];
+        INumberVectorProperty environmentNP;
     private:
         static constexpr const char *WEATHER_TAB {"Weather"};
         static constexpr const char *SWITCHES_TAB {"Switches"};
+        static constexpr const char *ENVIRONMENT_TAB {"Environment"};
         // Cadence TimerHit() re-arms itself at while connected. The GETs this drives just
         // read what the worker/settings last published (see roofDetail()'s docstring in
         // apiv1.py, and fanDetail()'s use of the same cached roof status word) rather than
@@ -176,6 +244,7 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         bool sendSwitchCommand(const std::string &id, const std::string &state, std::string &response);
         void pollRoofState();
         void pollSwitches();
+        void pollEnvironment();
         int parsePort(const char *str);
         void markUnsafe();
 

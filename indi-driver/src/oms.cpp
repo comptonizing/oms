@@ -60,6 +60,7 @@ bool OMS::Connect() {
     // arriving in that window would see "already unparked" and silently no-op.
     pollRoofState();
     pollSwitches();
+    pollEnvironment();
     SetTimer(ROOF_POLL_MS);
     return true;
 }
@@ -117,6 +118,41 @@ bool OMS::initProperties() {
     IUFillSwitchVector(&fanSP, fanS, 3, getDeviceName(), "SWITCH_FANS", "Fans", SWITCHES_TAB,
             IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
 
+    for ( size_t i = 0; i < NUM_LIMIT_SWITCHES; i++ ) {
+        const auto& ld = limitSwitchLights[i];
+        IUFillLight(&limitSwitchL[i], ld.name.c_str(), ld.label.c_str(), IPS_IDLE);
+    }
+    IUFillLightVector(&limitSwitchLP, limitSwitchL, NUM_LIMIT_SWITCHES, getDeviceName(), "ROOF_LIMIT_SWITCHES",
+            "Limit Switches", MAIN_CONTROL_TAB, IPS_IDLE);
+
+    for ( size_t i = 0; i < NUM_RODS; i++ ) {
+        const auto& rd = rodLights[i];
+        IUFillLight(&rodL[i], rd.name.c_str(), rd.label.c_str(), IPS_IDLE);
+    }
+    IUFillLightVector(&rodLP, rodL, NUM_RODS, getDeviceName(), "ROOF_RODS", "Rods", MAIN_CONTROL_TAB, IPS_IDLE);
+
+    for ( size_t i = 0; i < NUM_RELAYS; i++ ) {
+        const auto& rd = relayLights[i];
+        IUFillLight(&relayL[i], rd.name.c_str(), rd.label.c_str(), IPS_IDLE);
+    }
+    IUFillLightVector(&relayLP, relayL, NUM_RELAYS, getDeviceName(), "ROOF_RELAYS", "Relays", MAIN_CONTROL_TAB,
+            IPS_IDLE);
+
+    IUFillText(&positionT[0], "ROOF", "Roof", "");
+    IUFillText(&positionT[1], "WEST", "West", "");
+    IUFillText(&positionT[2], "EAST", "East", "");
+    IUFillTextVector(&positionTP, positionT, 3, getDeviceName(), "ROOF_POSITION", "Position", MAIN_CONTROL_TAB,
+            IP_RO, 60, IPS_IDLE);
+
+    IUFillText(&faultReasonT[0], "REASON", "Reason", "");
+    IUFillTextVector(&faultReasonTP, faultReasonT, 1, getDeviceName(), "ROOF_FAULT_REASON", "Fault",
+            MAIN_CONTROL_TAB, IP_RO, 60, IPS_IDLE);
+
+    IUFillNumber(&environmentN[0], "INSIDE_TEMPERATURE", "Temperature (C)", "%.2f", -50, 80, 0, 0);
+    IUFillNumber(&environmentN[1], "INSIDE_HUMIDITY", "Humidity (%)", "%.2f", 0, 100, 0, 0);
+    IUFillNumberVector(&environmentNP, environmentN, 2, getDeviceName(), "INSIDE_ENVIRONMENT", "Inside",
+            ENVIRONMENT_TAB, IP_RO, 60, IPS_IDLE);
+
     for ( const auto& v : parameters ) {
         addParameter(v.name, v.label, v.minOK, v.maxOK, v.percWarn);
     }
@@ -149,6 +185,12 @@ bool OMS::updateProperties() {
             defineProperty(&switchSP[i]);
         }
         defineProperty(&fanSP);
+        defineProperty(&limitSwitchLP);
+        defineProperty(&rodLP);
+        defineProperty(&relayLP);
+        defineProperty(&positionTP);
+        defineProperty(&faultReasonTP);
+        defineProperty(&environmentNP);
     } else {
         deleteProperty(engageSP.name);
         deleteProperty(faultClearSP.name);
@@ -156,6 +198,12 @@ bool OMS::updateProperties() {
             deleteProperty(switchSP[i].name);
         }
         deleteProperty(fanSP.name);
+        deleteProperty(limitSwitchLP.name);
+        deleteProperty(rodLP.name);
+        deleteProperty(relayLP.name);
+        deleteProperty(positionTP.name);
+        deleteProperty(faultReasonTP.name);
+        deleteProperty(environmentNP.name);
     }
 
     return true;
@@ -406,6 +454,7 @@ void OMS::TimerHit() {
     }
     pollRoofState();
     pollSwitches();
+    pollEnvironment();
     SetTimer(ROOF_POLL_MS);
 }
 
@@ -478,6 +527,132 @@ void OMS::pollRoofState() {
         }
         setDomeState(DOME_ERROR);
     }
+
+    // Limit switches, rods and position are null together until the roof board has
+    // answered once (see roofDetail()'s docstring); relays are not, since those come from
+    // Pi GPIO the worker always knows. Each block below only pushes an update when
+    // something actually changed, same as pollSwitches() - a light vector updating every
+    // 2s regardless would just be client chatter over what is, most of the time, a switch
+    // sitting exactly where it was last tick.
+    if ( data.contains("limitSwitches") && ! data["limitSwitches"].is_null() ) {
+        const auto &sw = data["limitSwitches"];
+        bool changed = limitSwitchLP.s != IPS_OK;
+        for ( size_t i = 0; i < NUM_LIMIT_SWITCHES; i++ ) {
+            const auto &ld = limitSwitchLights[i];
+            bool engaged;
+            try {
+                engaged = sw.at(ld.id).template get<bool>();
+            } catch ( json::exception &e ) {
+                continue;
+            }
+            IPState want = engaged ? IPS_OK : IPS_IDLE;
+            if ( limitSwitchL[i].s != want ) {
+                limitSwitchL[i].s = want;
+                changed = true;
+            }
+        }
+        if ( changed ) {
+            limitSwitchLP.s = IPS_OK;
+            IDSetLight(&limitSwitchLP, nullptr);
+        }
+    }
+
+    if ( data.contains("rods") && ! data["rods"].is_null() ) {
+        const auto &rods = data["rods"];
+        bool changed = rodLP.s != IPS_OK;
+        for ( size_t i = 0; i < NUM_RODS; i++ ) {
+            const auto &rd = rodLights[i];
+            bool value;
+            try {
+                value = rods.at(rd.half).at(rd.field).template get<bool>();
+            } catch ( json::exception &e ) {
+                continue;
+            }
+            IPState want = value ? IPS_OK : IPS_IDLE;
+            if ( rodL[i].s != want ) {
+                rodL[i].s = want;
+                changed = true;
+            }
+        }
+        if ( changed ) {
+            rodLP.s = IPS_OK;
+            IDSetLight(&rodLP, nullptr);
+        }
+    }
+
+    if ( data.contains("relays") && ! data["relays"].is_null() ) {
+        const auto &rel = data["relays"];
+        bool changed = relayLP.s != IPS_OK;
+        for ( size_t i = 0; i < NUM_RELAYS; i++ ) {
+            const auto &rd = relayLights[i];
+            bool value;
+            try {
+                value = rel.at(rd.id).template get<bool>();
+            } catch ( json::exception &e ) {
+                continue;
+            }
+            IPState want = value ? IPS_OK : IPS_IDLE;
+            if ( relayL[i].s != want ) {
+                relayL[i].s = want;
+                changed = true;
+            }
+        }
+        if ( changed ) {
+            relayLP.s = IPS_OK;
+            IDSetLight(&relayLP, nullptr);
+        }
+    }
+
+    if ( data.contains("position") && ! data["position"].is_null() ) {
+        const auto &pos = data["position"];
+        static const std::pair<const char *, size_t> positionFields[] = {
+            {"roof", 0}, {"west", 1}, {"east", 2},
+        };
+        bool changed = positionTP.s != IPS_OK;
+        for ( const auto &f : positionFields ) {
+            std::string value;
+            try {
+                value = pos.at(f.first).template get<std::string>();
+            } catch ( json::exception &e ) {
+                continue;
+            }
+            if ( value != positionT[f.second].text ) {
+                IUSaveText(&positionT[f.second], value.c_str());
+                changed = true;
+            }
+        }
+        if ( changed ) {
+            positionTP.s = IPS_OK;
+            IDSetText(&positionTP, nullptr);
+        }
+    }
+
+    if ( data.contains("fault") && ! data["fault"].is_null() ) {
+        const auto &fault = data["fault"];
+        bool latched = false;
+        bool known = fault.contains("latched") && ! fault["latched"].is_null();
+        if ( known ) {
+            try {
+                latched = fault.at("latched").template get<bool>();
+            } catch ( json::exception &e ) {
+                known = false;
+            }
+        }
+        std::string faultReason;
+        if ( known && latched && fault.contains("reason") && ! fault["reason"].is_null() ) {
+            try {
+                faultReason = fault.at("reason").template get<std::string>();
+            } catch ( json::exception &e ) {
+                faultReason = "";
+            }
+        }
+        IPState want = ! known ? IPS_IDLE : latched ? IPS_ALERT : IPS_OK;
+        if ( faultReasonTP.s != want || faultReason != faultReasonT[0].text ) {
+            IUSaveText(&faultReasonT[0], faultReason.c_str());
+            faultReasonTP.s = want;
+            IDSetText(&faultReasonTP, nullptr);
+        }
+    }
 }
 
 void OMS::pollSwitches() {
@@ -540,6 +715,54 @@ void OMS::pollSwitches() {
             IDSetSwitch(&fanSP, nullptr);
         }
     }
+}
+
+void OMS::pollEnvironment() {
+    std::string response;
+    // Ignored on purpose: /api/v1/environment answers 503-with-a-body when the reading is
+    // merely stale (see its docstring), and request() now leaves that body in response
+    // either way - an empty response, not the false return, is what says nothing came back.
+    readURL("/api/v1/environment", response);
+    if ( response.empty() ) {
+        if ( environmentNP.s != IPS_ALERT ) {
+            environmentNP.s = IPS_ALERT;
+            IDSetNumber(&environmentNP, nullptr);
+        }
+        return;
+    }
+
+    json data;
+    try {
+        data = json::parse(response);
+    } catch ( json::exception &e ) {
+        LOGF_ERROR("Environment JSON parse error: %s\n%s", e.what(), response.c_str());
+        return;
+    } catch (...) {
+        LOGF_ERROR("Unknown environment JSON parse error\n%s", response.c_str());
+        return;
+    }
+
+    double temperature, humidity;
+    bool stale;
+    try {
+        temperature = data["inside_temperature"].template get<double>();
+        humidity = data["inside_humidity"].template get<double>();
+        stale = data.value("stale", false);
+    } catch ( json::exception &e ) {
+        // Also the "no reading yet" case: problem() answers {"error": ...}, with neither
+        // field present.
+        LOGF_ERROR("Error accessing environment fields: %s\n%s", e.what(), response.c_str());
+        if ( environmentNP.s != IPS_ALERT ) {
+            environmentNP.s = IPS_ALERT;
+            IDSetNumber(&environmentNP, nullptr);
+        }
+        return;
+    }
+
+    environmentN[0].value = temperature;
+    environmentN[1].value = humidity;
+    environmentNP.s = stale ? IPS_ALERT : IPS_OK;
+    IDSetNumber(&environmentNP, nullptr);
 }
 
 // --- HTTP --------------------------------------------------------------------------------
@@ -652,13 +875,17 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response) {
         return false;
     }
 
+    // Set regardless of what httpCode turns out to be below: /api/v1/environment answers a
+    // handled 503 with the reading still in the body when it's merely stale (see its
+    // docstring), and a caller reading such a body on a false return should not have to
+    // duplicate the curl call to get it.
+    response = buff;
+
     if ( httpCode < 200 || httpCode >= 300 ) {
         LOGF_ERROR("URL %s returned HTTP %ld: %s", address.c_str(), httpCode, buff.c_str());
         return false;
     }
 
     LOGF_DEBUG("Response: %s", buff.c_str());
-
-    response = buff;
     return true;
 }
