@@ -89,6 +89,25 @@ static const weatherData parameters[] = {
     weatherData {"ir_diff", "WEATHER_IR_DIFF", "Sky difference (C)", 15, 40, 15, true},
 };
 
+// The four plain on/off switches OMS drives as Pi GPIO pins. Fans are a fifth switch to an
+// operator (and to /api/v1/switches) but are not one of these: they live on the roof board
+// behind the serial port and take a third state ("auto"), so they get their own property.
+struct switchData {
+    std::string id;    // OMS's /api/v1/switches/{id} name
+    std::string name;  // INDI switch vector name
+    std::string label;
+};
+
+static const switchData switchDevices[] = {
+    switchData {"pier", "SWITCH_PIER", "Pier"},
+    switchData {"cctv", "SWITCH_CCTV", "CCTV"},
+    switchData {"pc", "SWITCH_PC", "PC"},
+    switchData {"allsky", "SWITCH_ALLSKY", "Allsky"},
+};
+
+static constexpr size_t NUM_SWITCHES = sizeof(switchDevices) / sizeof(switchDevices[0]);
+static constexpr const char *FAN_ID = "fans";
+
 
 // OMS is one physical box, so it is one INDI device with two roles: INDI::Dome drives the
 // roof (open/close/stop map onto UnPark/Park/Abort - there is no azimuth, just the two-state
@@ -132,18 +151,31 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         ISwitchVectorProperty engageSP;
         ISwitch faultClearS[1];
         ISwitchVectorProperty faultClearSP;
+
+        // pier/cctv/pc/allsky - plain on/off GPIO switches, one property each, under their
+        // own tab rather than folded into Main Control or Options.
+        ISwitch switchS[NUM_SWITCHES][2];
+        ISwitchVectorProperty switchSP[NUM_SWITCHES];
+        // Fans: a third state ("auto") the other four don't have, so its own property rather
+        // than a fifth entry in switchDevices[].
+        ISwitch fanS[3];
+        ISwitchVectorProperty fanSP;
     private:
         static constexpr const char *WEATHER_TAB {"Weather"};
-        // Cadence TimerHit() re-arms itself at while connected. The GET this drives just
-        // reads what the roof worker last published (see roofDetail()'s docstring in
-        // apiv1.py) rather than triggering a serial exchange, so polling this often costs
-        // OMS nothing - it only trades off how quickly INDI notices a state change.
+        static constexpr const char *SWITCHES_TAB {"Switches"};
+        // Cadence TimerHit() re-arms itself at while connected. The GETs this drives just
+        // read what the worker/settings last published (see roofDetail()'s docstring in
+        // apiv1.py, and fanDetail()'s use of the same cached roof status word) rather than
+        // triggering a serial exchange, so polling this often costs OMS nothing - it only
+        // trades off how quickly INDI notices a state change.
         static constexpr uint32_t ROOF_POLL_MS {2000};
 
         bool request(bool isPost, const std::string &url, std::string &response);
         bool readURL(const std::string &url, std::string &response);
         bool sendRoofCommand(const std::string &command, std::string &response);
+        bool sendSwitchCommand(const std::string &id, const std::string &state, std::string &response);
         void pollRoofState();
+        void pollSwitches();
         int parsePort(const char *str);
         void markUnsafe();
 

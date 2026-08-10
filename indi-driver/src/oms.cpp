@@ -59,6 +59,7 @@ bool OMS::Connect() {
     // read m_DomeState to decide whether there is anything to do, so a park/unpark request
     // arriving in that window would see "already unparked" and silently no-op.
     pollRoofState();
+    pollSwitches();
     SetTimer(ROOF_POLL_MS);
     return true;
 }
@@ -102,6 +103,20 @@ bool OMS::initProperties() {
     IUFillSwitchVector(&faultClearSP, faultClearS, 1, getDeviceName(), "ROOF_FAULT_CLEAR", "Fault", MAIN_CONTROL_TAB,
             IP_RW, ISR_ATMOST1, 60, IPS_IDLE);
 
+    for ( size_t i = 0; i < NUM_SWITCHES; i++ ) {
+        const auto& sw = switchDevices[i];
+        IUFillSwitch(&switchS[i][0], "ON", "On", ISS_OFF);
+        IUFillSwitch(&switchS[i][1], "OFF", "Off", ISS_ON);
+        IUFillSwitchVector(&switchSP[i], switchS[i], 2, getDeviceName(), sw.name.c_str(), sw.label.c_str(),
+                SWITCHES_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+    }
+
+    IUFillSwitch(&fanS[0], "ON", "On", ISS_OFF);
+    IUFillSwitch(&fanS[1], "OFF", "Off", ISS_OFF);
+    IUFillSwitch(&fanS[2], "AUTO", "Auto", ISS_ON);
+    IUFillSwitchVector(&fanSP, fanS, 3, getDeviceName(), "SWITCH_FANS", "Fans", SWITCHES_TAB,
+            IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+
     for ( const auto& v : parameters ) {
         addParameter(v.name, v.label, v.minOK, v.maxOK, v.percWarn);
     }
@@ -130,9 +145,17 @@ bool OMS::updateProperties() {
     if ( isConnected() ) {
         defineProperty(&engageSP);
         defineProperty(&faultClearSP);
+        for ( size_t i = 0; i < NUM_SWITCHES; i++ ) {
+            defineProperty(&switchSP[i]);
+        }
+        defineProperty(&fanSP);
     } else {
         deleteProperty(engageSP.name);
         deleteProperty(faultClearSP.name);
+        for ( size_t i = 0; i < NUM_SWITCHES; i++ ) {
+            deleteProperty(switchSP[i].name);
+        }
+        deleteProperty(fanSP.name);
     }
 
     return true;
@@ -171,6 +194,39 @@ bool OMS::ISNewSwitch(const char * dev, const char * name, ISState * states, cha
                 LOG_INFO("Roof fault clear requested");
             }
             IDSetSwitch(&faultClearSP, nullptr);
+            return true;
+        }
+
+        for ( size_t i = 0; i < NUM_SWITCHES; i++ ) {
+            if ( strcmp(name, switchSP[i].name) != 0 ) {
+                continue;
+            }
+            IUUpdateSwitch(&switchSP[i], states, names, n);
+            bool on = switchS[i][0].s == ISS_ON;
+            std::string response;
+            if ( ! sendSwitchCommand(switchDevices[i].id, on ? "on" : "off", response) ) {
+                switchSP[i].s = IPS_ALERT;
+                LOGF_ERROR("Could not switch %s %s", switchDevices[i].label.c_str(), on ? "on" : "off");
+            } else {
+                switchSP[i].s = IPS_OK;
+                LOGF_INFO("%s switched %s", switchDevices[i].label.c_str(), on ? "on" : "off");
+            }
+            IDSetSwitch(&switchSP[i], nullptr);
+            return true;
+        }
+
+        if ( strcmp(name, fanSP.name) == 0 ) {
+            IUUpdateSwitch(&fanSP, states, names, n);
+            std::string state = fanS[0].s == ISS_ON ? "on" : fanS[1].s == ISS_ON ? "off" : "auto";
+            std::string response;
+            if ( ! sendSwitchCommand(FAN_ID, state, response) ) {
+                fanSP.s = IPS_ALERT;
+                LOGF_ERROR("Could not set fans to %s", state.c_str());
+            } else {
+                fanSP.s = IPS_OK;
+                LOGF_INFO("Fans set to %s", state.c_str());
+            }
+            IDSetSwitch(&fanSP, nullptr);
             return true;
         }
     }
@@ -349,6 +405,7 @@ void OMS::TimerHit() {
         return;
     }
     pollRoofState();
+    pollSwitches();
     SetTimer(ROOF_POLL_MS);
 }
 
@@ -423,6 +480,68 @@ void OMS::pollRoofState() {
     }
 }
 
+void OMS::pollSwitches() {
+    std::string response;
+    if ( ! readURL("/api/v1/switches", response) ) {
+        // Transport failure already gets a log line out of readURL() itself; nothing more
+        // useful to say here than leaving the last-known switch states in place.
+        return;
+    }
+
+    json data;
+    try {
+        data = json::parse(response);
+    } catch ( json::exception &e ) {
+        LOGF_ERROR("Switches JSON parse error: %s\n%s", e.what(), response.c_str());
+        return;
+    } catch (...) {
+        LOGF_ERROR("Unknown switches JSON parse error\n%s", response.c_str());
+        return;
+    }
+
+    for ( size_t i = 0; i < NUM_SWITCHES; i++ ) {
+        const auto& sw = switchDevices[i];
+        if ( ! data.contains(sw.id) ) {
+            continue;
+        }
+        std::string apiState;
+        try {
+            apiState = data[sw.id]["state"].template get<std::string>();
+        } catch ( json::exception &e ) {
+            continue;
+        }
+        bool wantOn = apiState == "on";
+        IPState wantIPS = apiState == "unkn" ? IPS_IDLE : IPS_OK;
+        bool curOn = switchS[i][0].s == ISS_ON;
+        if ( curOn == wantOn && switchSP[i].s == wantIPS ) {
+            continue;
+        }
+        switchS[i][0].s = wantOn ? ISS_ON : ISS_OFF;
+        switchS[i][1].s = wantOn ? ISS_OFF : ISS_ON;
+        switchSP[i].s = wantIPS;
+        IDSetSwitch(&switchSP[i], nullptr);
+    }
+
+    if ( data.contains(FAN_ID) && data[FAN_ID].contains("mode") && ! data[FAN_ID]["mode"].is_null() ) {
+        std::string mode;
+        try {
+            mode = data[FAN_ID]["mode"].template get<std::string>();
+        } catch ( json::exception &e ) {
+            return;
+        }
+        ISState wantOn = mode == "on" ? ISS_ON : ISS_OFF;
+        ISState wantOff = mode == "off" ? ISS_ON : ISS_OFF;
+        ISState wantAuto = mode == "auto" ? ISS_ON : ISS_OFF;
+        if ( fanS[0].s != wantOn || fanS[1].s != wantOff || fanS[2].s != wantAuto ) {
+            fanS[0].s = wantOn;
+            fanS[1].s = wantOff;
+            fanS[2].s = wantAuto;
+            fanSP.s = IPS_OK;
+            IDSetSwitch(&fanSP, nullptr);
+        }
+    }
+}
+
 // --- HTTP --------------------------------------------------------------------------------
 
 static size_t WriteCB(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -436,6 +555,10 @@ bool OMS::readURL(const std::string &url, std::string &response) {
 
 bool OMS::sendRoofCommand(const std::string &command, std::string &response) {
     return request(true, "/api/v1/roof/" + command, response);
+}
+
+bool OMS::sendSwitchCommand(const std::string &id, const std::string &state, std::string &response) {
+    return request(true, "/api/v1/switches/" + id + "/" + state, response);
 }
 
 bool OMS::request(bool isPost, const std::string &url, std::string &response) {
