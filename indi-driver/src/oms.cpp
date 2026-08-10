@@ -101,14 +101,9 @@ bool OMS::loadConfig(bool silent, const char *property) {
 
 bool OMS::updateProperties() {
     INDI::DefaultDevice::updateProperties();
-    if ( isConnected() ) {
-        WI::updateProperties();
-        if ( updateWeather() != IPS_OK ) {
-            return false;
-        }
-    } else {
-        WI::updateProperties();
-    }
+    // WI::updateProperties() already calls checkWeatherUpdate() -> updateWeather()
+    // when connecting; don't fetch a second time here.
+    WI::updateProperties();
     return true;
 }
 
