@@ -312,12 +312,20 @@ bool OMS::readURL(const std::string &url, std::string &response) {
     }
 
     CURLcode res = curl_easy_perform(curl);
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     curl_easy_cleanup(curl);
 
     if ( CURLE_OK != res ) {
         LOGF_ERROR("Could query URL %s: %s",
                 address.c_str(),
                 strlen(curlErrorBuff) ? curlErrorBuff : curl_easy_strerror(res));
+        return false;
+    }
+
+    if ( httpCode < 200 || httpCode >= 300 ) {
+        LOGF_ERROR("URL %s returned HTTP %ld: %s", address.c_str(), httpCode, buff.c_str());
         return false;
     }
 
