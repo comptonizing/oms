@@ -40,6 +40,9 @@ OMS::OMS() : WI(this) {
 }
 
 OMS::~OMS() {
+    // Defensive: normally Disconnect() has already done this, but the poll thread must
+    // never outlive the OMS object it captured by pointer.
+    stopPolling();
     curl_global_cleanup();
 }
 
@@ -57,15 +60,19 @@ bool OMS::Connect() {
     // Without this, m_DomeState stays DOME_UNKNOWN until the first TimerHit() tick fires
     // (SetTimer() schedules a future call, not an immediate one) - and Dome::Park()/UnPark()
     // read m_DomeState to decide whether there is anything to do, so a park/unpark request
-    // arriving in that window would see "already unparked" and silently no-op.
+    // arriving in that window would see "already unparked" and silently no-op. Run
+    // synchronously here, on the connection thread, rather than through the poll thread
+    // below - that one may not have produced a first snapshot yet.
     pollRoofState();
     pollSwitches();
     pollEnvironment();
+    startPolling();
     SetTimer(ROOF_POLL_MS);
     return true;
 }
 
 bool OMS::Disconnect() {
+    stopPolling();
     return true;
 }
 
@@ -392,6 +399,8 @@ bool OMS::ISNewText(const char *dev, const char *name, char *texts[], char *name
                 IUUpdateText(&addressTP, texts, names, n);
                 char buff[256];
                 snprintf(buff, 255, "http://%s:%d", host.c_str(), port);
+                // The poll thread reads m_url concurrently with this write.
+                std::lock_guard<std::mutex> lock(m_urlMutex);
                 m_url = buff;
             }
             IDSetText(&addressTP, nullptr);
@@ -460,19 +469,115 @@ bool OMS::Abort() {
     return true;
 }
 
+// --- polling -------------------------------------------------------------------------
+
+// TimerHit() runs on the same single-threaded event loop that reads commands off the wire
+// from indiserver (see libs/eventloop/eventloop.c's select() loop) - so it must never
+// block on OMS's network, or an Abort sitting in that loop's read buffer would have to
+// wait out however long the poll takes to time out. All it does now is pick up whatever
+// pollWorker() (below) last fetched and, if it's new, parse and publish it - no I/O of
+// its own.
 void OMS::TimerHit() {
     if ( ! isConnected() ) {
         return;
     }
-    pollRoofState();
-    pollSwitches();
-    pollEnvironment();
+
+    PollSnapshot snap;
+    {
+        std::lock_guard<std::mutex> lock(m_snapshotMutex);
+        snap = m_snapshot;
+    }
+    if ( snap.generation != m_appliedGeneration ) {
+        applyRoofState(snap.roofOk, snap.roofResponse, snap.roofError);
+        applySwitches(snap.switchesOk, snap.switchesResponse, snap.switchesError);
+        applyEnvironment(snap.environmentResponse, snap.environmentError);
+        m_appliedGeneration = snap.generation;
+    }
     SetTimer(ROOF_POLL_MS);
 }
 
+// The one function that runs on m_pollThread. It must never touch an INDI property or
+// call LOG*/IDSet*/def*/delete* - those write the wire indiserver reads with no locking
+// of their own (see IDMessage() and friends in indidriver.c), so a call from here could
+// interleave with one TimerHit() or ISNewSwitch() makes on the main thread and corrupt
+// the XML both are writing. request(..., quiet=true, ...) keeps readURL() from logging
+// off-thread; everything fetched here is handed to TimerHit() as inert strings instead.
+void OMS::pollWorker() {
+    while ( ! m_stopPoll.load() ) {
+        std::string roofResp, roofErr, switchResp, switchErr, envResp, envErr;
+        bool roofOk = readURL("/api/v1/roof", roofResp, true, &roofErr);
+        bool switchesOk = readURL("/api/v1/switches", switchResp, true, &switchErr);
+        // Return value ignored here too, same as applyEnvironment() ignores it below -
+        // a handled stale-503 still has its body in envResp either way.
+        readURL("/api/v1/environment", envResp, true, &envErr);
+
+        {
+            std::lock_guard<std::mutex> lock(m_snapshotMutex);
+            m_snapshot.roofOk = roofOk;
+            m_snapshot.roofResponse = roofResp;
+            m_snapshot.roofError = roofErr;
+            m_snapshot.switchesOk = switchesOk;
+            m_snapshot.switchesResponse = switchResp;
+            m_snapshot.switchesError = switchErr;
+            m_snapshot.environmentResponse = envResp;
+            m_snapshot.environmentError = envErr;
+            m_snapshot.generation++;
+        }
+
+        // Interruptible sleep so stopPolling() doesn't have to wait out a full idle period
+        // on top of whatever request was in flight when it was asked to stop.
+        std::unique_lock<std::mutex> lk(m_stopMutex);
+        m_stopCv.wait_for(lk, std::chrono::milliseconds(ROOF_POLL_MS), [this]{ return m_stopPoll.load(); });
+    }
+}
+
+void OMS::startPolling() {
+    m_stopPoll.store(false);
+    m_pollThread = std::thread(&OMS::pollWorker, this);
+}
+
+void OMS::stopPolling() {
+    if ( ! m_pollThread.joinable() ) {
+        return;
+    }
+    m_stopPoll.store(true);
+    m_stopCv.notify_all();
+    // Worst case this waits out one in-flight request per endpoint (TIMEOUT each) - paid
+    // once, on disconnect, not on every tick the way it used to be paid on the main thread.
+    m_pollThread.join();
+}
+
+// Fetches used only for the synchronous priming read in Connect() (see its comment) -
+// pollWorker() above does the three GETs itself from then on. Kept as their own functions,
+// rather than folded into Connect(), so the fetch-then-apply shape stays in one place.
 void OMS::pollRoofState() {
     std::string response;
-    if ( ! readURL("/api/v1/roof", response) ) {
+    bool ok = readURL("/api/v1/roof", response);
+    applyRoofState(ok, response, "");
+}
+
+void OMS::pollSwitches() {
+    std::string response;
+    bool ok = readURL("/api/v1/switches", response);
+    applySwitches(ok, response, "");
+}
+
+void OMS::pollEnvironment() {
+    std::string response;
+    // Return value ignored, same as applyEnvironment() ignores it: a handled stale-503
+    // still has its body in response either way (see request()'s comment).
+    readURL("/api/v1/environment", response);
+    applyEnvironment(response, "");
+}
+
+void OMS::applyRoofState(bool ok, const std::string &response, const std::string &error) {
+    if ( ! ok ) {
+        // readURL() already logged this itself when it wasn't quiet (the Connect() priming
+        // read); when it was quiet (pollWorker(), off the main thread), error carries what
+        // it would have logged, for us to say here instead.
+        if ( ! error.empty() ) {
+            LOGF_ERROR("%s", error.c_str());
+        }
         setDomeState(DOME_ERROR);
         return;
     }
@@ -540,6 +645,24 @@ void OMS::pollRoofState() {
         setDomeState(DOME_ERROR);
     }
 
+    // engageSP is also a command the operator sends, but it must still mirror the server
+    // like every other polled property here: the web UI has its own Engage/Disengage
+    // button on the same roofEngaged flag, so another client (or the roof disengaging
+    // itself) can move it out from under whatever this client last clicked.
+    if ( data.contains("engaged") && ! data["engaged"].is_null() ) {
+        try {
+            bool engaged = data.at("engaged").template get<bool>();
+            bool curEngaged = engageS[0].s == ISS_ON;
+            if ( curEngaged != engaged || engageSP.s != IPS_OK ) {
+                engageS[0].s = engaged ? ISS_ON : ISS_OFF;
+                engageS[1].s = engaged ? ISS_OFF : ISS_ON;
+                engageSP.s = IPS_OK;
+                IDSetSwitch(&engageSP, nullptr);
+            }
+        } catch ( json::exception &e ) {
+        }
+    }
+
     // "motion" is always present, unlike the detail below - roofDetail() sets it before
     // the "no reading yet" early return, since it's about the sequence driving the roof
     // rather than what the board last said.
@@ -569,7 +692,7 @@ void OMS::pollRoofState() {
     // Limit switches, rods and position are null together until the roof board has
     // answered once (see roofDetail()'s docstring); relays are not, since those come from
     // Pi GPIO the worker always knows. Each block below only pushes an update when
-    // something actually changed, same as pollSwitches() - a light vector updating every
+    // something actually changed, same as applySwitches() - a light vector updating every
     // 2s regardless would just be client chatter over what is, most of the time, a switch
     // sitting exactly where it was last tick.
     if ( data.contains("limitSwitches") && ! data["limitSwitches"].is_null() ) {
@@ -693,11 +816,15 @@ void OMS::pollRoofState() {
     }
 }
 
-void OMS::pollSwitches() {
-    std::string response;
-    if ( ! readURL("/api/v1/switches", response) ) {
-        // Transport failure already gets a log line out of readURL() itself; nothing more
-        // useful to say here than leaving the last-known switch states in place.
+void OMS::applySwitches(bool ok, const std::string &response, const std::string &error) {
+    if ( ! ok ) {
+        // Transport failure already gets a log line out of readURL() itself when it isn't
+        // quiet; the background poller passes its captured message through here instead
+        // (see applyRoofState()'s comment) - either way, nothing more useful to say here
+        // than leaving the last-known switch states in place.
+        if ( ! error.empty() ) {
+            LOGF_ERROR("%s", error.c_str());
+        }
         return;
     }
 
@@ -773,13 +900,17 @@ void OMS::pollSwitches() {
     }
 }
 
-void OMS::pollEnvironment() {
-    std::string response;
-    // Ignored on purpose: /api/v1/environment answers 503-with-a-body when the reading is
-    // merely stale (see its docstring), and request() now leaves that body in response
-    // either way - an empty response, not the false return, is what says nothing came back.
-    readURL("/api/v1/environment", response);
+void OMS::applyEnvironment(const std::string &response, const std::string &error) {
+    // response.empty(), not ok/error, is what says nothing came back: /api/v1/environment
+    // answers 503-with-a-body when the reading is merely stale (see its docstring), and
+    // request() leaves that body in response either way.
     if ( response.empty() ) {
+        // Genuinely nothing came back (host unreachable, etc.), as opposed to the handled
+        // stale-503-with-a-body case above - surface it once, here, since the background
+        // poller that fetched it may not log directly (see applyRoofState()'s comment).
+        if ( ! error.empty() ) {
+            LOGF_ERROR("%s", error.c_str());
+        }
         if ( environmentNP.s != IPS_ALERT ) {
             environmentNP.s = IPS_ALERT;
             IDSetNumber(&environmentNP, nullptr);
@@ -828,8 +959,8 @@ static size_t WriteCB(void *contents, size_t size, size_t nmemb, void *userp) {
     return size * nmemb;
 }
 
-bool OMS::readURL(const std::string &url, std::string &response) {
-    return request(false, url, response);
+bool OMS::readURL(const std::string &url, std::string &response, bool quiet, std::string *errorOut) {
+    return request(false, url, response, quiet, errorOut);
 }
 
 bool OMS::sendRoofCommand(const std::string &command, std::string &response) {
@@ -840,82 +971,97 @@ bool OMS::sendSwitchCommand(const std::string &id, const std::string &state, std
     return request(true, "/api/v1/switches/" + id + "/" + state, response);
 }
 
-bool OMS::request(bool isPost, const std::string &url, std::string &response) {
+bool OMS::request(bool isPost, const std::string &url, std::string &response, bool quiet,
+        std::string *errorOut) {
     char curlErrorBuff[CURL_ERROR_SIZE] = ""; // Necessary, see curl docs
     std::string buff;
-    std::string address = m_url + url;
+    std::string urlBase;
+    {
+        // Read under lock: ISNewText() writes m_url from the main thread while this may
+        // run on the poll thread (see the PollSnapshot comment in oms.h).
+        std::lock_guard<std::mutex> lock(m_urlMutex);
+        urlBase = m_url;
+    }
+    std::string address = urlBase + url;
 
-    LOGF_DEBUG("%s %s", isPost ? "POST" : "GET", url.c_str());
-
-    if ( m_url == "" ) {
-        LOG_ERROR("Connection details not provided!");
+    // quiet is true only for the poll thread's GETs. It must never call LOG*/IDSet*/etc -
+    // those write the wire indiserver reads with no locking of their own - so on that path
+    // this hands the message that would have been logged back through errorOut instead,
+    // for the caller to log later, on the main thread.
+    auto fail = [&](const std::string &msg) -> bool {
+        if ( quiet ) {
+            if ( errorOut ) {
+                *errorOut = msg;
+            }
+        } else {
+            LOGF_ERROR("%s", msg.c_str());
+        }
         return false;
+    };
+
+    if ( ! quiet ) {
+        LOGF_DEBUG("%s %s", isPost ? "POST" : "GET", url.c_str());
+    }
+
+    if ( urlBase.empty() ) {
+        return fail("Connection details not provided!");
     }
 
     CURL *curl = curl_easy_init();
     if ( curl == NULL ) {
-        LOG_ERROR("Could not initialize curl!");
         curl_easy_cleanup(curl);
-        return false;
+        return fail("Could not initialize curl!");
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curlErrorBuff) ) {
-        LOG_ERROR("Could not set curl error buffer!");
         curl_easy_cleanup(curl);
-        return false;
+        return fail("Could not set curl error buffer!");
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, address.c_str()) ) {
-        LOGF_ERROR("Could not use specified URL: %s",
-                strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
         curl_easy_cleanup(curl);
-        return false;
+        return fail(std::string("Could not use specified URL: ") +
+                (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     if ( isPost ) {
         // The roof/weather commands take no body - POSTFIELDS("") is enough to make curl
         // send POST rather than GET, and CURLOPT_POST makes that explicit either way.
         if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_POST, 1L) ) {
-            LOGF_ERROR("Could not set curl POST method: %s",
-                    strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
             curl_easy_cleanup(curl);
-            return false;
+            return fail(std::string("Could not set curl POST method: ") +
+                    (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
         }
 
         if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "") ) {
-            LOGF_ERROR("Could not set curl POST body: %s",
-                    strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
             curl_easy_cleanup(curl);
-            return false;
+            return fail(std::string("Could not set curl POST body: ") +
+                    (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
         }
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCB) ) {
-        LOGF_ERROR("Could not set curl write callback: %s",
-                strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
         curl_easy_cleanup(curl);
-        return false;
+        return fail(std::string("Could not set curl write callback: ") +
+                (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buff) ) {
-        LOGF_ERROR("Could not set curl data buffer: %s",
-                strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
         curl_easy_cleanup(curl);
-        return false;
+        return fail(std::string("Could not set curl data buffer: ") +
+                (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, TIMEOUT) ) {
-        LOGF_ERROR("Could not set curl connect timeout: %s",
-                strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
         curl_easy_cleanup(curl);
-        return false;
+        return fail(std::string("Could not set curl connect timeout: ") +
+                (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT) ) {
-        LOGF_ERROR("Could not set curl timeout: %s",
-                strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error");
         curl_easy_cleanup(curl);
-        return false;
+        return fail(std::string("Could not set curl timeout: ") +
+                (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -925,10 +1071,8 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response) {
     curl_easy_cleanup(curl);
 
     if ( CURLE_OK != res ) {
-        LOGF_ERROR("Could query URL %s: %s",
-                address.c_str(),
-                strlen(curlErrorBuff) ? curlErrorBuff : curl_easy_strerror(res));
-        return false;
+        return fail("Could query URL " + address + ": " +
+                (strlen(curlErrorBuff) ? curlErrorBuff : curl_easy_strerror(res)));
     }
 
     // Set regardless of what httpCode turns out to be below: /api/v1/environment answers a
@@ -938,10 +1082,11 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response) {
     response = buff;
 
     if ( httpCode < 200 || httpCode >= 300 ) {
-        LOGF_ERROR("URL %s returned HTTP %ld: %s", address.c_str(), httpCode, buff.c_str());
-        return false;
+        return fail("URL " + address + " returned HTTP " + std::to_string(httpCode) + ": " + buff);
     }
 
-    LOGF_DEBUG("Response: %s", buff.c_str());
+    if ( ! quiet ) {
+        LOGF_DEBUG("Response: %s", buff.c_str());
+    }
     return true;
 }

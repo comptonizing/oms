@@ -24,6 +24,11 @@
 
 #include <regex>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <cstdint>
 
 #include <curl/curl.h>
 
@@ -240,22 +245,64 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         static constexpr const char *WEATHER_TAB {"Weather"};
         static constexpr const char *SWITCHES_TAB {"Switches"};
         static constexpr const char *ENVIRONMENT_TAB {"Environment"};
-        // Cadence TimerHit() re-arms itself at while connected. The GETs this drives just
-        // read what the worker/settings last published (see roofDetail()'s docstring in
-        // apiv1.py, and fanDetail()'s use of the same cached roof status word) rather than
-        // triggering a serial exchange, so polling this often costs OMS nothing - it only
-        // trades off how quickly INDI notices a state change.
+        // Cadence both TimerHit() re-arms itself at and the poll thread (below) sleeps
+        // between fetches. The GETs this drives just read what the worker/settings last
+        // published (see roofDetail()'s docstring in apiv1.py, and fanDetail()'s use of the
+        // same cached roof status word) rather than triggering a serial exchange, so
+        // polling this often costs OMS nothing - it only trades off how quickly INDI
+        // notices a state change.
         static constexpr uint32_t ROOF_POLL_MS {2000};
 
-        bool request(bool isPost, const std::string &url, std::string &response);
-        bool readURL(const std::string &url, std::string &response);
+        bool request(bool isPost, const std::string &url, std::string &response,
+                bool quiet = false, std::string *errorOut = nullptr);
+        bool readURL(const std::string &url, std::string &response, bool quiet = false,
+                std::string *errorOut = nullptr);
         bool sendRoofCommand(const std::string &command, std::string &response);
         bool sendSwitchCommand(const std::string &id, const std::string &state, std::string &response);
         void pollRoofState();
         void pollSwitches();
         void pollEnvironment();
+        void applyRoofState(bool ok, const std::string &response, const std::string &error);
+        void applySwitches(bool ok, const std::string &response, const std::string &error);
+        void applyEnvironment(const std::string &response, const std::string &error);
         int parsePort(const char *str);
         void markUnsafe();
 
         std::string m_url = "";
+        // Guards m_url: ISNewText() writes it from the main thread, request() reads it
+        // from both the main thread (commands) and the poll thread below (GETs).
+        std::mutex m_urlMutex;
+
+        // The three GETs TimerHit() used to run inline now run on this thread instead, so
+        // the main event loop - the same one that reads commands off the wire from
+        // indiserver - is never blocked on OMS's network. libindi's IDSet*/LOGF_* calls
+        // write that wire with no locking of their own (see IDMessage() and friends in
+        // indidriver.c), so this thread must never call them: request(..., quiet=true, ...)
+        // keeps it from logging off-thread, and it only fetches raw JSON, stashing it here
+        // for TimerHit() - main thread only - to parse, diff and publish.
+        struct PollSnapshot {
+            uint64_t generation = 0;
+            bool roofOk = false;
+            std::string roofResponse;
+            std::string roofError;
+            bool switchesOk = false;
+            std::string switchesResponse;
+            std::string switchesError;
+            std::string environmentResponse;
+            std::string environmentError;
+        };
+        std::mutex m_snapshotMutex;
+        PollSnapshot m_snapshot;
+        // TimerHit()-only, so it needs no lock: the generation last applied, to skip
+        // re-parsing a snapshot the poll thread hasn't refreshed since.
+        uint64_t m_appliedGeneration = 0;
+
+        std::thread m_pollThread;
+        std::atomic<bool> m_stopPoll {false};
+        std::mutex m_stopMutex;
+        std::condition_variable m_stopCv;
+
+        void pollWorker();
+        void startPolling();
+        void stopPolling();
 };
