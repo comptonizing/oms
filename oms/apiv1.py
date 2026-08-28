@@ -33,6 +33,7 @@ from http import HTTPStatus as status
 from fastapi.responses import JSONResponse, Response
 import requests
 import logging
+import math
 
 import settings as s
 
@@ -122,6 +123,31 @@ def unbound():
                 content={"error": "OMS is still starting up"},
                 status_code=status.SERVICE_UNAVAILABLE)
     return None
+
+
+def jsonSafe(value):
+    """`value` with every non-finite float replaced by None, recursively.
+
+    The station sends NaN for a sensor it could not read this cycle, and json.loads()
+    parses that happily -- while Starlette renders every JSONResponse with allow_nan=False
+    and raises ValueError on it, which reaches the caller as a bare 500 with nothing in it
+    to say which field was at fault. One unreadable field is not a server failure, so it
+    goes out as null and the rest of the reading goes out with it.
+
+    null rather than the string "NaN", because null is what the rest of OMS already means
+    by an absent reading: asNumber() in oms/oms folds NaN into None for exactly this
+    reason, and a consumer that tests for one absent value should not have to learn a
+    second. Applied at the boundary rather than to the cache, deliberately -- the payload
+    is stored as the station sent it, and the rain interlock reads it through asNumber()
+    either way, so nothing that decides whether the roof may open changes shape here.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: jsonSafe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonSafe(item) for item in value]
+    return value
 
 
 def problem(message, code=status.SERVICE_UNAVAILABLE):
@@ -474,7 +500,7 @@ async def weather():
     maxAge = oms.numericSetting("weather_refresh", 5) * 3
     if age > maxAge:
         return problem("The weather data is {:.0f}s old (limit {:.0f}s)".format(age, maxAge))
-    return JSONResponse(content=payload, status_code=status.OK)
+    return JSONResponse(content=jsonSafe(payload), status_code=status.OK)
 
 
 @app.get(__base + "environment")
@@ -500,8 +526,8 @@ async def environment():
         # 503 with the reading still in the body: the values are real, they are simply too
         # old to act on, and somebody deciding whether to open a roof should have to reach
         # past a 503 for them rather than be handed them as current.
-        return JSONResponse(content=body, status_code=status.SERVICE_UNAVAILABLE)
-    return JSONResponse(content=body, status_code=status.OK)
+        return JSONResponse(content=jsonSafe(body), status_code=status.SERVICE_UNAVAILABLE)
+    return JSONResponse(content=jsonSafe(body), status_code=status.OK)
 
 
 @app.get(__base + "status")
@@ -518,7 +544,7 @@ async def overallStatus():
         return down
     payload, weatherAge = oms.getWeatherCache()
     data, environmentAge = oms.getEnvironment()
-    return JSONResponse(content={
+    return JSONResponse(content=jsonSafe({
             "roof": roofDetail(),
             "switches": {name: switchDetail(name) for name in switchNames()},
             "weather": None if payload is None else {
@@ -529,4 +555,4 @@ async def overallStatus():
                 "age": None if environmentAge is None else round(environmentAge, 2),
                 "data": data,
                 },
-            }, status_code=status.OK)
+            }), status_code=status.OK)
