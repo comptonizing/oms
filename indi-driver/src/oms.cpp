@@ -570,6 +570,14 @@ void OMS::pollEnvironment() {
     applyEnvironment(response, "");
 }
 
+// IUFillText() leaves .text as NULL rather than "" when the initial value is empty (see
+// indidriver.c), and positionT/faultReasonT/motionPhaseT all start out empty - so read
+// them through this, or std::string's operator!= runs strlen() on a null pointer the
+// first time a poll compares an incoming value against one.
+static const char *textOrEmpty(const IText &t) {
+    return t.text ? t.text : "";
+}
+
 void OMS::applyRoofState(bool ok, const std::string &response, const std::string &error) {
     if ( ! ok ) {
         // readURL() already logged this itself when it wasn't quiet (the Connect() priming
@@ -682,7 +690,7 @@ void OMS::applyRoofState(bool ok, const std::string &response, const std::string
         } catch ( json::exception &e ) {
         }
         IPState want = running ? IPS_BUSY : IPS_IDLE;
-        if ( motionPhaseTP.s != want || phase != motionPhaseT[0].text ) {
+        if ( motionPhaseTP.s != want || phase != textOrEmpty(motionPhaseT[0]) ) {
             IUSaveText(&motionPhaseT[0], phase.c_str());
             motionPhaseTP.s = want;
             IDSetText(&motionPhaseTP, nullptr);
@@ -777,7 +785,7 @@ void OMS::applyRoofState(bool ok, const std::string &response, const std::string
             } catch ( json::exception &e ) {
                 continue;
             }
-            if ( value != positionT[f.second].text ) {
+            if ( value != textOrEmpty(positionT[f.second]) ) {
                 IUSaveText(&positionT[f.second], value.c_str());
                 changed = true;
             }
@@ -808,7 +816,7 @@ void OMS::applyRoofState(bool ok, const std::string &response, const std::string
             }
         }
         IPState want = ! known ? IPS_IDLE : latched ? IPS_ALERT : IPS_OK;
-        if ( faultReasonTP.s != want || faultReason != faultReasonT[0].text ) {
+        if ( faultReasonTP.s != want || faultReason != textOrEmpty(faultReasonT[0]) ) {
             IUSaveText(&faultReasonT[0], faultReason.c_str());
             faultReasonTP.s = want;
             IDSetText(&faultReasonTP, nullptr);
