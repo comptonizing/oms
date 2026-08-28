@@ -1080,6 +1080,46 @@ async def queryWeather(api, thing, start, window):
     return times, values
 
 
+async def queryState(api, fields, start, window):
+    """Several fields of the "oms" measurement at once, as {field: (times, values)}.
+
+    Its own function rather than a flag on queryWeather(), because the two differ in both
+    halves. A different measurement, and last() rather than mean(): a state is not a
+    quantity, the mean of "closed" and "opening" is not a thing, and last() is what keeps
+    a value a value. createEmpty stays false for the same reason it is false there -- a
+    window with no point in it is a gap, not a zero.
+
+    All the fields of one plot in a single query, unlike queryWeather()'s one call per
+    field. There are twenty-five of these against the weather's fifteen, and a pass over
+    24h is already a few seconds of work on the Pi; asking for them one at a time would
+    have roughly tripled a pass to draw four more figures.
+
+    Read through the record API rather than to_values()' positional columns, because this
+    needs the field name to sort the rows into series and that is what the column is for.
+    """
+    bucket = s.q("weather_db_bucket", fallback="weather") or "weather"
+    query = """from(bucket: "{}")
+      |> range(start: -{})
+      |> filter(fn: (r) => r["_measurement"] == "oms")
+      |> filter(fn: (r) => contains(value: r["_field"], set: [{}]))
+      |> aggregateWindow(every: {}, fn: last, createEmpty: false)
+      |> yield(name: "last")""".format(
+              bucket, start, ", ".join('"{}"'.format(f) for f in fields), window)
+    logger.debug("Querying state: " + query)
+
+    series = {field: ([], []) for field in fields}
+    for table in await api.query(org=s.q("weather_db_org"), query=query):
+        for record in table.records:
+            entry = series.get(record.get_field())
+            if entry is None:
+                # A field the query did not ask for cannot appear, but a bucket holding an
+                # older schema can still answer with one this version does not know.
+                continue
+            entry[0].append(record.get_time())
+            entry[1].append(record.get_value())
+    return series
+
+
 updateQueue = asyncio.Queue()
 updateCallbacks: dict[str, callable] = {}
 def triggerEvent(*args):
@@ -4448,6 +4488,52 @@ def main():
         updatePlot(plot)
         return plot
 
+    # The seven words roof_state and the three position fields share, indexed by the code
+    # that goes into the database -- see roofStateCodes and positionCodes in the state
+    # archive. One list, because the two encodings were deliberately made to agree, and a
+    # second copy here is exactly how they would come to disagree.
+    stateWords = ["open", "opening", "closed", "closing", "fault", "disengaged", "unknown"]
+
+    # How far apart stacked lanes sit. 1.0 would let a series sitting at true touch the
+    # baseline of the one above it, which reads as one signal rather than two.
+    laneSpacing = 1.4
+
+    def plotLanes(fig, lanes):
+        """Draws boolean series as stacked lanes on one figure.
+
+        Eight booleans on a shared 0/1 axis are eight traces drawn on top of each other,
+        and the only one visible is whichever was added last. Each series gets a lane of
+        its own instead: its value is drawn at its own offset, and the axis is ticked with
+        the names rather than with numbers that would every one of them read 0 or 1.
+
+        Step lines, not straight ones. These change instantly and hold, so a slope between
+        two samples would draw a transition that never happened -- and where it happened is
+        the whole question when a roof stopped halfway.
+
+        `lanes` is (name, times, values, colour), bottom lane first, so a figure reads in
+        the order its list is written.
+        """
+        for index, (name, times, values, colour) in enumerate(lanes):
+            base = index * laneSpacing
+            fig.add_scatter(
+                    x = times,
+                    y = [base + (1 if value else 0) for value in values],
+                    mode = "lines",
+                    line_shape = "hv",
+                    name = name,
+                    line = {"color": colour},
+                    )
+        fig.update_layout(
+                showlegend = False,
+                yaxis = {
+                    "tickmode": "array",
+                    "tickvals": [index * laneSpacing for index in range(len(lanes))],
+                    "ticktext": [name for name, _, _, _ in lanes],
+                    "range": [-0.4, (len(lanes) - 1) * laneSpacing + 1.4],
+                    "gridcolor": "#555",
+                    },
+                )
+
     def makeUnavailableMessage(icon: str):
         """Placeholder shown in a camera card while that camera has nothing to show.
 
@@ -4900,6 +4986,23 @@ def main():
                     weather_plots["Pressure"] = makePlot("Pressure")
                 with ui.card().classes('w-full'):
                     weather_plots["Rain Heating"] = makePlot("Rain Heating")
+
+            # Under the weather plots rather than in a tab of their own, so they share the
+            # time range, the refresh timer and the staleness caption above -- which is
+            # the whole reason to look at them next to the weather in the first place.
+            # What the sky was doing and whether the roof was open are the same question
+            # asked twice.
+            ui.separator().classes("w-full mt-4")
+            ui.label("Equipment").classes("w-full text-lg")
+            with ui.grid().classes('grid-cols-1 lg:grid-cols-2 w-full gap-4'):
+                with ui.card().classes('w-full'):
+                    weather_plots["Roof"] = makePlot("Roof")
+                with ui.card().classes('w-full'):
+                    weather_plots["Limit Switches"] = makePlot("Limit Switches")
+                with ui.card().classes('w-full'):
+                    weather_plots["Relays and Rods"] = makePlot("Relays and Rods")
+                with ui.card().classes('w-full'):
+                    weather_plots["Switches and Fans"] = makePlot("Switches and Fans")
 
         with ui.tab_panel(tab_log):
             with ui.card().classes("w-full"):
@@ -5388,6 +5491,130 @@ def main():
                     "gridcolor": '#555'
                     }
                 )
+        await pushPlot(plot)
+
+        # --- equipment ------------------------------------------------------------
+        #
+        # Four figures off the "oms" measurement, each drawn from a single query: these
+        # are twenty-five fields against the weather's fifteen, and one call per field
+        # would have roughly tripled the length of a pass.
+
+        plot = weather_plots["Roof"]
+        fig = plot.figure
+        fig.data = []
+        series = await queryState(api, ["roof_state", "position_west", "position_east"], r, w)
+        await asyncio.sleep(sleepTime)
+        logger.debug("Plotting Roof")
+        # Step lines: the roof is in one state and then in another, and a slope between
+        # two samples would draw a transition that never happened.
+        #
+        # position_roof is left out on purpose. It is UNKN whenever the halves disagree,
+        # which on a chart showing both halves is the one thing already visible.
+        for field, label, colour in (
+                ("roof_state", "Roof", "white"),
+                ("position_west", "West", "green"),
+                ("position_east", "East", "orange"),
+                ):
+            t, v = series[field]
+            fig.add_scatter(x=t, y=v, mode="lines", line_shape="hv", name=label,
+                            line={"color": colour})
+        fig.update_layout(
+                showlegend = True,
+                yaxis = {
+                    "tickmode": "array",
+                    "tickvals": list(range(len(stateWords))),
+                    "ticktext": stateWords,
+                    "range": [-0.4, len(stateWords) - 0.6],
+                    "gridcolor": "#555",
+                    },
+                )
+        logger.debug("Done")
+        await pushPlot(plot)
+
+        plot = weather_plots["Limit Switches"]
+        fig = plot.figure
+        fig.data = []
+        # Ordered so a half's two ends sit together and the two halves mirror each other:
+        # a roof closing evenly draws four lanes stepping in step, and one half lagging is
+        # visible as exactly that rather than as four unrelated signals.
+        limitFields = [
+                ("limit_west_closed_north", "W closed N", "green"),
+                ("limit_west_closed_south", "W closed S", "green"),
+                ("limit_west_open_north", "W open N", "orange"),
+                ("limit_west_open_south", "W open S", "orange"),
+                ("limit_east_closed_north", "E closed N", "green"),
+                ("limit_east_closed_south", "E closed S", "green"),
+                ("limit_east_open_north", "E open N", "orange"),
+                ("limit_east_open_south", "E open S", "orange"),
+                ]
+        series = await queryState(api, [field for field, _, _ in limitFields], r, w)
+        await asyncio.sleep(sleepTime)
+        logger.debug("Plotting Limit Switches")
+        plotLanes(fig, [(label, series[field][0], series[field][1], colour)
+                        for field, label, colour in limitFields])
+        logger.debug("Done")
+        await pushPlot(plot)
+
+        plot = weather_plots["Relays and Rods"]
+        fig = plot.figure
+        fig.data = []
+        # The relays are what OMS did and the rods are what the firmware answered, so they
+        # belong on one figure: a relay energized with a rod still out is the picture of a
+        # motion that should not have started, and it takes both to see it.
+        driveFields = [
+                ("relay_west_open", "W drive open", "orange"),
+                ("relay_west_close", "W drive close", "green"),
+                ("relay_east_open", "E drive open", "orange"),
+                ("relay_east_close", "E drive close", "green"),
+                ("rod_west_extend_requested", "W rod out asked", "yellow"),
+                ("rod_west_retracted", "W rod back", "cyan"),
+                ("rod_east_extend_requested", "E rod out asked", "yellow"),
+                ("rod_east_retracted", "E rod back", "cyan"),
+                ]
+        series = await queryState(api, [field for field, _, _ in driveFields], r, w)
+        await asyncio.sleep(sleepTime)
+        logger.debug("Plotting Relays and Rods")
+        plotLanes(fig, [(label, series[field][0], series[field][1], colour)
+                        for field, label, colour in driveFields])
+        logger.debug("Done")
+        await pushPlot(plot)
+
+        plot = weather_plots["Switches and Fans"]
+        fig = plot.figure
+        fig.data = []
+        switchFields = [
+                ("switch_pier", "Pier", "green"),
+                ("switch_cctv", "CCTV", "green"),
+                ("switch_pc", "PC", "green"),
+                ("switch_allsky", "Allsky", "green"),
+                ("fans_running", "Fans running", "cyan"),
+                ]
+        series = await queryState(
+                api, [field for field, _, _ in switchFields] + ["fans_mode"], r, w)
+        await asyncio.sleep(sleepTime)
+        logger.debug("Plotting Switches and Fans")
+        plotLanes(fig, [(label, series[field][0], series[field][1], colour)
+                        for field, label, colour in switchFields])
+        # fans_mode on its own axis rather than as a sixth lane: it has three values where
+        # every lane has two, and it is the one series here that says what OMS was told
+        # rather than what the hardware did. The same second-axis shape the Rain Heating
+        # plot already uses.
+        t, v = series["fans_mode"]
+        fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", line_shape="hv",
+                        name="Fan mode", line={"color": "yellow"})
+        fig.update_layout(
+                showlegend = True,
+                yaxis2 = {
+                    "tickmode": "array",
+                    "tickvals": [0, 1, 2],
+                    "ticktext": ["off", "on", "auto"],
+                    "range": [-0.2, 2.2],
+                    "overlaying": "y",
+                    "side": "right",
+                    "gridcolor": "#555",
+                    },
+                )
+        logger.debug("Done")
         await pushPlot(plot)
 
     # The plot pass currently in flight for this client, if any, and the lock that makes
