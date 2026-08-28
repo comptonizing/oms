@@ -6135,6 +6135,23 @@ roofStateCodes = {
         RoofStatus.DISENGAGED: 5,
         }
 
+# Where a half or the roof itself is. Deliberately the same numbering roofStateCodes uses
+# above, so one value mapping in a dashboard covers roof_state and all three position
+# fields rather than two legends that disagree about what 0 means. RoofState's own values
+# are not reused for that reason: they are 0 for CLOSED, which is 2 here.
+#
+# UNKN gets a code rather than being left out, unlike the absent readings elsewhere in
+# here. "Between its switches" is a real answer about a half that is present and reporting
+# -- it is the most interesting one there is -- and it must not look like a half nobody
+# has heard from. It is 6 rather than 4 or 5, which roofStateCodes has already spent.
+positionCodes = {
+        roof.RoofState.OPEN: 0,
+        roof.RoofState.OPENING: 1,
+        roof.RoofState.CLOSED: 2,
+        roof.RoofState.CLOSING: 3,
+        roof.RoofState.UNKN: 6,
+        }
+
 # Same for the fan mode, which is what OMS was told to do. What the fans are actually
 # doing under it is fans_running, read from the board -- the two disagree by design in
 # "auto", which is the whole reason both are recorded.
@@ -6178,6 +6195,18 @@ def stateFields():
     if mode is not None:
         fields["fans_mode"] = mode
 
+    # The four motion relays are Pi GPIO and the board cannot see them, so unlike
+    # everything below they need no status word -- roofDetail() reports them ahead of its
+    # own no-reading early return for exactly the same reason. drive() only ever energizes
+    # one relay of a pair, which is the interlock the whole Roof class is built around, so
+    # the direction a half is driven says precisely which of its two contactors is closed.
+    drive = getRoofDrive()
+    for half in roof.RoofHalf:
+        name = half.value.lower()
+        direction = drive.get(half)
+        fields["relay_" + name + "_open"] = direction is roof.Direction.OPEN
+        fields["relay_" + name + "_close"] = direction is roof.Direction.CLOSE
+
     # The fans and the eight limit switches are all read out of the roof board's status
     # word, so with no reading there is nothing to say about any of them -- which is a
     # different thing from the fan mode above, and is why that one is not in here. Same
@@ -6195,6 +6224,24 @@ def stateFields():
         # switches, or which switch was the one that stopped reporting.
         for sw, engaged in instance.switchStates(status=word).items():
             fields["limit_" + sw.name.lower()] = bool(engaged)
+
+        for half in roof.RoofHalf:
+            name = half.value.lower()
+            # Both, because they answer different questions and there are twenty seconds
+            # in which neither is true: extendRequested is what the firmware was last
+            # told, retracted is what it says about the stroke, and isRetracted() only
+            # goes true 20 s after the last retract command. A motion waiting on a rod
+            # looks identical to one that is stuck unless both are recorded.
+            fields["rod_" + name + "_extend_requested"] = bool(
+                    instance.rodExtendRequested(half, status=word))
+            fields["rod_" + name + "_retracted"] = bool(
+                    instance.rodRetracted(half, status=word))
+            fields["position_" + name] = positionCodes[instance.halfPosition(half, status=word)]
+
+        # The whole roof as well as the halves, though it is derived from them: position()
+        # is UNKN whenever the two disagree, and a half-open roof is the case where that
+        # distinction is the entire story.
+        fields["position_roof"] = positionCodes[instance.position(status=word)]
 
     return fields
 
