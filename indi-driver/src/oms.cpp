@@ -76,11 +76,6 @@ bool OMS::Disconnect() {
     return true;
 }
 
-void OMS::ISGetProperties(const char *dev) {
-    INDI::Dome::ISGetProperties(dev);
-    defineProperty(&addressTP);
-}
-
 const char *OMS::getDefaultName() {
     return "OMS";
 }
@@ -92,14 +87,20 @@ bool OMS::initProperties() {
     // Two-state roof, not an azimuth position - nothing to park at beyond open/closed.
     SetParkDataType(PARK_NONE);
 
-    // Built once here, not in ISGetProperties(): IUFillText() blanks the
-    // property's text, and ISGetProperties() runs once per connecting
-    // client, so building it there wiped out the address/port (and any
-    // loaded config) for every client after the first.
+    // Built here rather than in an ISGetProperties() override: IUFillText() blanks the
+    // property's text, and ISGetProperties() runs once per connecting client, so building
+    // it there wiped out the address/port (and any loaded config) for every client after
+    // the first.
     IUFillText(&addressT[0], "ADDRESS", "Address", "");
     IUFillText(&addressT[1], "PORT", "Port", "");
     IUFillTextVector(&addressTP, addressT, 2, getDeviceName(), "DEVICE_ADDRESS", "Server", CONNECTION_TAB,
             IP_RW, 60, IPS_IDLE);
+    // Register before loading: loadConfig() dispatches the saved value at whatever property
+    // is registered under that name, so reading the config before defineProperty() drops the
+    // saved address on the floor - and still reports "Device configuration applied". This
+    // also replaces the old defineProperty() in ISGetProperties(): DefaultDevice re-sends
+    // every registered property to each client that asks, so once is enough.
+    defineProperty(&addressTP);
     loadConfig(false, "DEVICE_ADDRESS");
 
     IUFillSwitch(&engageS[0], "ENGAGE", "Engage", ISS_ON);
