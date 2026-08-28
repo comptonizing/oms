@@ -11,6 +11,7 @@ import threading
 import base64
 import json
 from collections import deque
+from datetime import datetime, timezone
 from enum import Enum
 import cv2
 from parse import parse
@@ -6059,17 +6060,308 @@ def main():
         });
     ''')
 
-def startWorkers():
-    """Starts the three background workers, each independently.
+# --- state archive ------------------------------------------------------------------
 
-    One worker failing to start must not keep the other two down: they share no state,
-    and losing the capture loop is no reason to also lose the environment readings the
-    fan safety logic depends on.
+# The readings have always been archived; what the equipment was doing while they were
+# taken has not. That is the half of a night that answers "was the roof even open for
+# this", and no amount of weather data says it.
+#
+# Its own measurement, "oms", in the same bucket rather than more fields on "weather":
+# the station owns that measurement's namespace -- it writes env_*, ir_*, rain_*, sqm_*
+# and wind_* into it itself -- and what the roof was doing is not a reading of the sky.
+#
+# Its own InfluxDB client too, rather than the environment worker's. That one is built by
+# setupEnvironmentWorker() and lives and dies with the serial port behind the inside
+# sensor, and whether the roof state is recorded must not depend on a board that is
+# unplugged.
+
+stateInfluxClient = None
+stateWriteApi = None
+stateThread = None
+# The current worker's stop event, and only that -- the rule the capture, environment and
+# roof workers all keep, for the same reason: signalling one worker must not be undoable
+# on behalf of another.
+stateStopEvent = threading.Event()
+# Bumped by stopStateWorker(), so a worker whose join expired stops writing as soon as it
+# notices it is no longer the current one.
+stateGeneration = 0
+
+stateWriteOptions = WriteOptions(
+        # One point per request, against the environment worker's twenty. This writes on a
+        # change and then not again for a minute, so batching would hold a roof transition
+        # back until either the flush interval or the nineteen points after it -- and on a
+        # quiet night the nineteenth point is an hour away.
+        batch_size = 1,
+        flush_interval = 2000,
+        jitter_interval = 0,
+        retry_interval = 5000,
+        max_retry_time = 600000,
+        max_retries = 100,
+        max_retry_delay = 60000,
+        # As on the environment write API, and for the same reason: this bounds what
+        # closeStateDatabase() may spend flushing to a database that has gone away.
+        max_close_wait = 5000,
+        exponential_base = 2
+        )
+
+# How often the worker looks. Not how often it writes: a pass that finds nothing changed
+# writes nothing until the heartbeat below comes due. A second is twice the roof's own
+# poll period, so a transition reaches the database about a second after the board reports
+# it, and the cost of a pass that writes nothing is a handful of dictionary reads.
+statePollPeriod = 1.0
+
+# A point goes in at least this often even when nothing has changed. Without it a panel
+# showing the last hour of a quiet night is empty rather than flat, and every reader has
+# to be told to fill from the last value before its range. Sixty seconds is ~1.4k points a
+# day; a point per roof poll would be ~170k for the same information.
+stateHeartbeat = 60.0
+
+# The loop waits at most statePollPeriod between checks and a pass costs one write, which
+# the batching API hands off rather than waiting out. Five seconds on top is the same
+# headroom environmentStopGrace gives, and closeStateDatabase()'s flush is bounded
+# separately by max_close_wait above.
+stateStopBudget = statePollPeriod + 5
+
+# The six states as the integers that go into the database. Written out rather than taken
+# from the enum's own order, because that order is a matter of how RoofStatus reads and
+# these numbers are years of history: a state inserted in the middle of that class would
+# silently renumber all of it.
+roofStateCodes = {
+        RoofStatus.OPEN: 0,
+        RoofStatus.OPENING: 1,
+        RoofStatus.CLOSED: 2,
+        RoofStatus.CLOSING: 3,
+        RoofStatus.FAULT: 4,
+        RoofStatus.DISENGAGED: 5,
+        }
+
+# Same for the fan mode, which is what OMS was told to do. What the fans are actually
+# doing under it is fans_running, read from the board -- the two disagree by design in
+# "auto", which is the whole reason both are recorded.
+fanModeCodes = {"off": 0, "on": 1, "auto": 2}
+
+
+def stateFields():
+    """What the equipment is doing, as the fields of one InfluxDB point.
+
+    Every read here is of state a worker has already published -- roofDecisiveState() off
+    the last status word, getSwitchState() off the switch objects, the fan mode out of
+    settings. Nothing here touches a serial port or takes a lock, which is what makes it
+    safe to call on the cadence above rather than only when something asks.
+
+    A value that is not known is left out rather than written as a placeholder. A switch
+    with no pin configured reads UNKN, and no boolean means that: false would be a lie
+    about a switch that may well be powering the observatory PC, and a sentinel integer
+    becomes a number every reader has to remember is not a state. An absent field is what
+    InfluxDB already has for "no value", and it plots as a gap.
+    """
+    fields = {}
+
+    # roofDecisiveState() rather than the status word, so this records the same six-word
+    # answer the operator, the API and the INDI driver are all looking at. Deriving it
+    # here from limit switches would be a second implementation of that judgement, free
+    # to disagree with the one on screen.
+    state, _ = roofDecisiveState()
+    code = roofStateCodes.get(state)
+    if code is not None:
+        fields["roof_state"] = code
+
+    for name in switch_names:
+        value = getSwitchState(name)
+        if value is switch.State.ON:
+            fields["switch_" + name] = True
+        elif value is switch.State.OFF:
+            fields["switch_" + name] = False
+
+    mode = fanModeCodes.get(s.q("fan_mode", fallback=None))
+    if mode is not None:
+        fields["fans_mode"] = mode
+
+    # The fans are on the roof board, so with no status word there is nothing to say about
+    # what they are doing -- which is a different thing from the mode above. Same guard
+    # fanDetail() uses in apiv1, and for the same reason.
+    word, _ = getRoofState()
+    if word is not None and roof.Roof.isInitialized():
+        fields["fans_running"] = bool(roof.Roof.get().fansAreOn(status=word))
+
+    return fields
+
+
+def closeStateDatabase():
+    """Closes the state write API and client, and forgets both.
+
+    Each close is guarded separately, as in closeEnvironmentDatabase(): one that fails
+    must not stop the other, since the whole point is to leave nothing behind. The write
+    API goes first, because flushing it needs the client it belongs to.
+    """
+    global stateInfluxClient, stateWriteApi
+    if stateWriteApi is not None:
+        try:
+            stateWriteApi.close()
+        except Exception as e:
+            logger.warning("Error closing the state write API: {}".format(e))
+        stateWriteApi = None
+    if stateInfluxClient is not None:
+        try:
+            stateInfluxClient.close()
+        except Exception as e:
+            logger.warning("Error closing the state database client: {}".format(e))
+        stateInfluxClient = None
+
+
+def setupStateWorker():
+    """Opens an InfluxDB client for the state archive. Returns whether there is one.
+
+    False is not an error. The same three settings drive the readings' archive and the
+    plots, so a site with no database configured simply keeps no history, and saying so
+    at debug level is the whole of the report -- setupEnvironmentWorker() treats the
+    identical case the identical way.
+    """
+    global stateInfluxClient, stateWriteApi
+    closeStateDatabase()
+    _db_url = s.q("weather_db_url", fallback=None)
+    _db_token = s.q("weather_db_token", fallback=None)
+    _db_org = s.q("weather_db_org", fallback=None)
+    if _db_url in [None, ""] or _db_token in [None, ""] or _db_org in [None, ""]:
+        logger.debug("No weather database configured, equipment state will not be stored")
+        return False
+    try:
+        stateInfluxClient = InfluxDBClient(
+                url = _db_url,
+                token = _db_token,
+                org = _db_org
+            )
+        stateWriteApi = stateInfluxClient.write_api(write_options=stateWriteOptions)
+    except Exception as e:
+        logger.error("Error setting up the state influx client: {}".format(e))
+        closeStateDatabase()
+        return False
+    return True
+
+
+def stateWorkerLoop(stopEvent, generation):
+    """Writes a point whenever the equipment's state changes, and once a minute regardless.
+
+    stopEvent is this worker's own and generation is what makes a worker that could not be
+    joined harmless, exactly as in roofLoop() and environmentWorkerLoop().
+
+    Paced on a deadline rather than by sleeping a fixed gap after each pass, so the period
+    stays constant regardless of how long a pass takes, and waiting on the stop event
+    rather than sleeping makes shutdown immediate instead of up to one period late.
+
+    The comparison is against the fields last *written*, not the fields last seen, so a
+    state that flips away and back between two passes does not go unrecorded -- and a
+    field that has gone from known to absent counts as a change, because a dict without it
+    does not equal a dict with it.
+    """
+    lastFields = None
+    lastWrite = 0.0
+    nextPoll = time.monotonic() + statePollPeriod
+    while True:
+        if stopEvent.wait(max(0.0, nextPoll - time.monotonic())):
+            break
+        nextPoll = time.monotonic() + statePollPeriod
+        if generation != stateGeneration:
+            logger.warning("State worker {} superseded by {}, exiting".format(
+                generation, stateGeneration))
+            break
+        # Read once into a local: stopStateWorker() clears the global from the event loop
+        # while this thread is running, and a pass must not find it None halfway through.
+        api = stateWriteApi
+        if api is None:
+            continue
+        try:
+            fields = stateFields()
+            if not fields:
+                # Nothing is known yet -- no roof, no switches, no fan mode. InfluxDB
+                # rejects a point with no fields anyway, and there would be nothing in it.
+                continue
+            now = time.monotonic()
+            if fields == lastFields and now - lastWrite < stateHeartbeat:
+                continue
+            # Stamped here rather than left to the server. The write API hands the point
+            # off to its own thread, and a point that arrives a retry interval late would
+            # otherwise be recorded as having happened then.
+            point = Point("oms").time(datetime.now(timezone.utc))
+            for key, value in fields.items():
+                point = point.field(key, value)
+            api.write(
+                    bucket=s.q("weather_db_bucket", fallback=None),
+                    org=s.q("weather_db_org", fallback=None),
+                    record=point)
+            lastFields = fields
+            lastWrite = now
+        except Exception as e:
+            logger.warning("Error in state loop: {}".format(e))
+
+
+def stopStateWorker():
+    """Stops the worker and closes the database client it was writing through."""
+    global stateThread, stateStopEvent, stateGeneration
+    # Before the join, not after: from here on any worker still running is superseded,
+    # whether it manages to stop or not, and must not write another point.
+    stateGeneration += 1
+    if stateThread is not None and stateThread.is_alive():
+        logger.info("Stopping state thread")
+        stateStopEvent.set()
+        stateThread.join(timeout=stateStopBudget)
+        if stateThread.is_alive():
+            logger.warning("State thread still alive")
+        else:
+            logger.info("State thread stopped")
+    # Cleared either way: a thread that outlived its join is not something anything should
+    # go on to join or signal again.
+    stateThread = None
+    # After the join, so the worker is not writing through a write API being closed under
+    # it, and unconditionally, so a client survives no worker rather than the other way round.
+    closeStateDatabase()
+
+
+def startStateWorker():
+    """Starts the state worker, if there is a database to write to.
+
+    Unlike the environment worker, this does not start a thread that retries: what setup
+    can fail on here is settings, not hardware. A database configured later arrives
+    through a settings save, and that calls initStuff(), which calls startWorkers(), which
+    is this function -- so the retry is the save itself, and an idle thread in the
+    meantime would buy nothing.
+    """
+    global stateThread, stateStopEvent
+    stopStateWorker()
+    if not setupStateWorker():
+        return
+    # A fresh event per worker, handed over as an argument, rather than clearing the
+    # shared one -- a previous worker that stopStateWorker() signalled but could not join
+    # is still waiting on *its* event, and clearing that same object would resume it.
+    workerStopEvent = threading.Event()
+    stateStopEvent = workerStopEvent
+    logger.info("Starting state loop")
+    # stopStateWorker() bumped the generation above, so this worker takes the current
+    # value and every older one is already superseded.
+    stateThread = threading.Thread(
+            target = stateWorkerLoop,
+            args = (workerStopEvent, stateGeneration),
+            daemon = True,
+            name = "State worker"
+            )
+    stateThread.start()
+    logger.info("State loop started")
+
+
+def startWorkers():
+    """Starts the four background workers, each independently.
+
+    One worker failing to start must not keep the others down: they share no state, and
+    losing the capture loop is no reason to also lose the environment readings the fan
+    safety logic depends on.
     """
     for name, start in (
             ("capture loop", startCaptureLoop),
             ("environment worker", startEnvironmentWorker),
             ("weather worker", startWeatherWorker),
+            # Last, and it only reads what the three above publish. A site with no
+            # database configured starts no thread here at all -- see startStateWorker().
+            ("state worker", startStateWorker),
             ):
         try:
             start()
@@ -6209,6 +6501,10 @@ async def shutdown():
                     shutdownInitLockTimeout))
     try:
         stops = (
+                # First of the tuple, though these run concurrently: it is the one that
+                # only reads, so nothing is lost by retiring it before the workers whose
+                # state it was recording are torn down underneath it.
+                ("state worker", stopStateWorker),
                 ("capture loop", stopCaptureLoop),
                 ("environment worker", stopEnvironmentWorker),
                 ("weather worker", stopWeatherWorker),
