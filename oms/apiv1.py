@@ -167,6 +167,25 @@ def roofDetail():
             "available": oms.roofUnavailableReason() is None,
             "unavailableReason": oms.roofUnavailableReason(),
             }
+
+    # The rain interlock, reported in full rather than as one boolean. A caller refused an
+    # open needs to be able to tell three cases apart that a single flag would collapse: it
+    # is raining and the roof is held shut, it is raining but somebody has overridden the
+    # interlock, and the station is not reporting a usable rain figure at all -- which is
+    # *not* treated as rain, and a client deciding whether to start an observing run has
+    # every reason to want to know that rather than to read `false` as "dry". `detected`
+    # ignores the override on purpose, for the same reason the UI shows both.
+    interlock = oms.rainInterlockReason()
+    detected = oms.rainReason()
+    detail["rain"] = {
+            "reading": oms.rainReading(),
+            "threshold": oms.numericSetting("roof_rain_threshold", oms.rainThresholdDefault),
+            "detected": detected is not None,
+            "detectedReason": detected,
+            "override": oms.rainOverrideActive(),
+            "holdingClosed": interlock is not None,
+            "reason": interlock,
+            }
     motion = oms.roofMotion
     detail["motion"] = {
             "running": motion.running,
@@ -262,6 +281,15 @@ async def roofCommand(command: str):
         # 409 rather than 403: nothing about the request is wrong, it is the state of the
         # roof that makes it impossible, and it will succeed once the motion ends.
         return problem("The roof is moving; stop it first", status.CONFLICT)
+    if command == "open":
+        held = oms.rainInterlockReason()
+        if held is not None:
+            # Answered here as well as refused in requestRoofMotion(), which is the guard.
+            # This exists so the caller gets 409 and the reason rather than the flat 503 the
+            # generic refusal below would give -- same distinction as the block above: the
+            # request is fine, the weather is not, and it will be accepted once that changes
+            # or once somebody overrides the interlock.
+            return problem("Cannot open the roof: {}".format(held), status.CONFLICT)
 
     if command in ("open", "close", "stop"):
         if not oms.requestRoofMotion(command):
@@ -287,6 +315,30 @@ async def roofCommand(command: str):
     # latches the refusal before it returns, and engage() is a flag -- so by the time a
     # caller reads this the roof is already in the state they asked for.
     return done("Roof {}".format("engaged" if engaged else "disengaged"))
+
+
+# A path of its own rather than another word in ROOF_COMMANDS, because it is not a roof
+# command: nothing is driven, nothing is posted, and it is deliberately *not* subject to
+# the moving-roof block those are all held to -- overriding while a rain close runs stops
+# nothing, so there is nothing there to refuse. Two segments, so it cannot collide with the
+# single-segment {command} route above whichever order they are registered in.
+@app.post(__base + "roof/rain-override/{state}")
+async def roofRainOverride(state: str):
+    logger.info("roof rain override endpoint call: {}".format(state))
+    down = unbound()
+    if down is not None:
+        return down
+    if state not in ("on", "off"):
+        return problem("Unknown rain override state {!r}, expected on or off".format(state),
+                       status.NOT_FOUND)
+    override = state == "on"
+    changed = oms.setRainOverride(override)
+    # 200, not 202: this is a flag and it is set by the time this returns. `changed` says
+    # whether it was already in that state rather than whether anything failed -- there is
+    # nothing here that can fail -- so a repeated call is a success, not a conflict.
+    return done("Rain interlock {}".format("overridden" if override else "armed"),
+                changed=changed,
+                holdingClosed=oms.rainInterlockReason() is not None)
 
 
 # --- switches -----------------------------------------------------------------------

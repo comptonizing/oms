@@ -163,6 +163,15 @@ settingBounds = {
         "roof_close_overrun": (0, 5),
         "roof_close_start_timeout": (5, 30),
         "roof_fan_change_delay": (0, 600),
+        # The station's rain_percentage at or above which the roof is shut and kept shut.
+        # A percentage, so the ceiling is where the scale ends rather than a judgement.
+        # The floor is 0 deliberately: an operator who wants the roof closed on any wetness
+        # the sensor can register at all is entitled to ask for that, and 0 says it exactly.
+        # Note that the ceiling is not a way to switch the interlock off -- the test is "at
+        # or above", so 100 still fires on a reading of 100. The override is what switches
+        # it off, and it is a switch on the page rather than a number in a field for a
+        # reason: an interlock disabled by a setting looks identical to one that is armed.
+        "roof_rain_threshold": (0, 100),
         "weather_elevation": (0, 9000),
         "roof_fan_temp_min": (-50, 50),
         "roof_fan_humidity_deadband": (0, 50),
@@ -1398,8 +1407,16 @@ def weatherWorkerLoop(stopEvent, generation):
                 with weatherCacheLock:
                     weatherCache = data
                     weatherCacheTimestamp = time.monotonic()
-            # Fan decisions are driven from here (rather than from roofLoop) so that the
-            # network call above never delays the roof status poll loop.
+            # Both roof decisions that turn on the weather are driven from here (rather
+            # than from roofLoop) so that the network call above never delays the roof
+            # status poll loop.
+            #
+            # The rain interlock goes first, being the one of the two that can need the roof
+            # itself to move. Neither depends on the other having run: both read the state
+            # the roof worker published rather than anything the other leaves behind, and
+            # the fans are switched off by updateFans() on the strength of a roof that is
+            # not shut, whoever it was that started it moving.
+            enforceRainInterlock()
             updateFans()
         except Exception as e:
             logger.error(f"Error in weather loop: {e}")
@@ -1892,6 +1909,37 @@ class RoofStatus(Enum):
 # the last restart is not a state OMS may reach on its own.
 roofEngaged = True
 
+# Whether the rain interlock has been switched off by hand.
+#
+# Not persisted, and for exactly the reason stated just above roofEngaged rather than for a
+# new one: an override is somebody's answer to what is happening right now -- a sensor they
+# have been out to look at, a close they need to undo to get the roof shut properly -- and
+# none of that survives a restart. OMS comes back with the interlock armed, always.
+rainOverride = False
+
+# The last time the interlock asked for a close, and how long it waits before asking again.
+# time.monotonic(); 0.0 means it has not asked since startup, or that something has since
+# made the next ask due immediately. One writer -- the weather worker -- and a rebind is
+# atomic under the GIL, exactly as lastFanChange.
+lastRainCloseRequest = 0.0
+
+# Long enough that a close which was accepted has had its whole travel to finish: one half's
+# travel budget alone starts at 60s, so a re-ask inside that would be made about a roof that
+# is still shutting perfectly well. Short enough that a roof which *cannot* close -- latched
+# fault, board gone -- goes on saying so about once a minute while it sits open in the rain,
+# which is not a thing to report once and then fall silent about.
+#
+# Not a setting: it is a property of how long the roof takes to move, and that is already
+# described by roof_travel_timeout. A second number the operator could set below it would
+# only let them ask for a re-ask mid-travel.
+rainCloseRetryInterval = 60
+
+# The rain reading that counts as rain until the operator enters a threshold of their own.
+# Named because two places need the same number and they must not be able to disagree: the
+# guard below reads it as a fallback, and the settings field says it in its label so that an
+# empty field still tells the operator what the roof will do.
+rainThresholdDefault = 20
+
 def roofDecisiveState():
     """The roof in one word, and the reason if that word is fault.
 
@@ -1946,6 +1994,157 @@ def roofCommandsBlocked():
     """
     state, _ = roofDecisiveState()
     return state in (RoofStatus.OPENING, RoofStatus.CLOSING)
+
+def rainReading():
+    """The station's rain percentage, or None if there is no reading to judge.
+
+    None is every way there can be no answer at once: the station is unreachable, the
+    worker has not fetched yet, the cache has aged out, or the payload arrived without a
+    usable rain_percentage. They are one answer here because they have one consequence --
+    nothing may be concluded about the rain -- and telling them apart would only invite a
+    caller to read some of them as "dry", which is the one thing none of them says.
+
+    Judged stale by the same three refresh periods the weather card and updateFans() use,
+    rather than by a rule of its own, so that the reading this acts on is the reading the
+    operator is looking at on the Weather tab.
+    """
+    with weatherCacheLock:
+        weather = weatherCache
+        age = time.monotonic() - weatherCacheTimestamp
+    if weather is None or age > numericSetting("weather_refresh", 5) * 3:
+        return None
+    return asNumber(weather.get("rain_percentage"))
+
+def rainReason():
+    """Why the station's reading counts as rain, or None if it does not.
+
+    Ignores the override entirely: this answers what the weather is doing, and an operator
+    who has switched the interlock off still has to be able to see what they switched it
+    off in the face of. rainInterlockReason() is the one that answers what the roof may do.
+
+    An absent reading is not rain. That asymmetry is the one judgement in here, and it is
+    deliberate: this interlock fires on the station *saying* it is raining, and a station
+    saying nothing at all is not saying that. The alternative would put the roof under an
+    interlock nobody could lift every time the allsky camera the station hangs off is
+    switched off -- a normal daytime state, and one weatherUnavailableReason() already
+    describes -- and it would do it by treating silence as a measurement. A dead station is
+    a thing the operator reads off the Weather tab, where every field goes to N/A.
+    """
+    rain = rainReading()
+    if rain is None:
+        return None
+    threshold = numericSetting("roof_rain_threshold", rainThresholdDefault)
+    if rain < threshold:
+        return None
+    return "rain is at {:.0f}%, at or above the {:.0f}% threshold".format(rain, threshold)
+
+def rainInterlockReason():
+    """Why the roof is being held shut, or None if nothing is holding it.
+
+    The one place the rule lives, so that the Open button, the refusal inside
+    requestRoofMotion() and the answer the API gives cannot disagree about it -- the same
+    job roofCommandsBlocked() does for the moving-roof rule, and kept beside it for that
+    reason.
+
+    This is the only reading of the rain that accounts for the override, which is what
+    makes it the one every *decision* goes through.
+    """
+    if rainOverride:
+        return None
+    return rainReason()
+
+def rainOverrideActive():
+    """Whether the rain interlock has been switched off by hand.
+
+    An accessor rather than the flag itself because the API may only be handed things that
+    are never rebound -- see the bind() call at the foot of this file. Every other reader is
+    in this module and reads the global directly.
+    """
+    return rainOverride
+
+def setRainOverride(override: bool):
+    """Switches the rain interlock off, or arms it again. Returns whether it changed.
+
+    Nothing is commanded here, in either direction. Arming the interlock does not close the
+    roof by itself: the weather worker's next pass finds the rain and asks, which is the
+    only path that ever drives the roof on the weather's account, and routing this through
+    it too means there is one such path rather than two that could come to differ.
+
+    Overriding likewise stops nothing already in flight. A rain close that is running goes
+    on running, and the way to end that is the Stop button, which is the way to end any
+    motion. An override that reached into a moving roof would be a second kind of stop, and
+    the whole design here is that there is one.
+    """
+    global rainOverride, lastRainCloseRequest
+    if rainOverride == override:
+        return False
+    rainOverride = override
+    if override:
+        logger.warning("Rain interlock overridden: OMS will not close the roof on rain, "
+                       "and will allow it to be opened in the rain")
+    else:
+        logger.warning("Rain interlock armed")
+        # Dropped so that a roof left open in the rain by the override is closed on the very
+        # next weather pass, rather than at the end of a retry interval started before
+        # anybody switched the interlock off.
+        lastRainCloseRequest = 0.0
+    triggerEvent("rainOverride", override)
+    return True
+
+def enforceRainInterlock():
+    """Closes the roof if the station is reporting rain. Runs on the weather thread.
+
+    The same contract as updateFans(), and for the same reasons: it touches neither the
+    serial port nor roofLock, it reads the state the roof worker last published, and
+    everything it wants goes into the command mailbox. It runs *before* updateFans() on
+    each pass because a roof that has to shut outranks what the fans are doing.
+
+    What it will not do is command a disengaged roof. requestRoofMotion() would refuse it
+    anyway -- that is what the interlock is -- but it would also raise a roofMotionError at
+    the operator once per weather pass, and somebody who has disengaged to work on the
+    hardware has said that OMS is to keep its hands off the roof. Rain does not revoke
+    that: a roof with somebody standing at it is not one to drive shut underneath them.
+    """
+    global lastRainCloseRequest
+    if roofUnavailableReason() is not None:
+        # Nothing would execute the command, and the state that follows is not worth
+        # reasoning about. Deliberately without touching the retry stamp: this says nothing
+        # about whether an earlier ask was carried out.
+        return
+    if not roofEngaged:
+        return
+    reason = rainInterlockReason()
+    state, _ = roofDecisiveState()
+    if reason is None or state in (RoofStatus.CLOSED, RoofStatus.CLOSING):
+        # Dry, overridden, already shut, or already shutting -- nothing to ask for. The
+        # retry stamp goes with it, so a roof that closes and is later opened again is
+        # closed the instant rain comes back rather than at whatever happens to be left of
+        # an interval that started before it ever opened.
+        lastRainCloseRequest = 0.0
+        return
+    now = time.monotonic()
+    if lastRainCloseRequest != 0.0 and now - lastRainCloseRequest < rainCloseRetryInterval:
+        return
+    lastRainCloseRequest = now
+    logger.warning("Closing the roof: {}".format(reason))
+    triggerEvent("warning", "Closing the roof: {}".format(reason))
+    if state is RoofStatus.OPENING:
+        # Stopped first, because executeMotionCommand() refuses a motion while one is
+        # running: a close posted on its own here would be turned away and the open would
+        # carry on into the rain. The stop and the close travel under separate mailbox keys
+        # and the worker takes the stop first -- the Stop-then-Close postRoofStop()
+        # documents -- so the open is abandoned and the close is judged against the status
+        # of that same tick. The half's REVERSE_DEAD_TIME costs the close its first two
+        # seconds, which drive() reports by asking to be called again rather than by
+        # failing, and which the close-start budget is far wider than.
+        requestRoofMotion("stop")
+    # FAULT included, on purpose. It covers a roof that is between its switches, one whose
+    # reading has gone stale, and one that has not been read at all -- and in every one of
+    # those closing is both the right thing to want and a thing that may well work. The
+    # cases where it cannot work, a latched motion fault above all, are refused by
+    # executeMotionCommand() with a reason the operator is shown; the retry interval is what
+    # keeps that from being said every five seconds.
+    requestRoofMotion("close")
 
 # Work for the roof worker to carry out between status polls. The worker owns the
 # serial port on its own thread, so nothing else ever has to wait on roofLock to
@@ -3075,9 +3274,9 @@ def requestRoofMotion(action):
 
     Open and close are fire and forget, exactly like setFans(): the worker owns the serial
     port and the relays, judges the command against a status it has just read, and reports
-    back through events. Nothing calls this yet -- the operator controls, the API and the
-    weather-driven close are all still to come -- but the interface they will use is this
-    one.
+    back through events. All three callers go through here -- the operator controls, the
+    API and the rain interlock's automatic close -- which is what makes this the place the
+    rain refusal below can be enforced once rather than in each of them.
 
     **A stop is not fire and forget, on purpose.** It needs no worker, no serial port, no
     status and no lock, because de-energizing is four local GPIO writes -- and every
@@ -3162,6 +3361,24 @@ def requestRoofMotion(action):
         logger.warning("Not requesting roof {}: {}".format(action, reason))
         triggerEvent("roofMotionError", reason)
         return False
+    if action == "open":
+        held = rainInterlockReason()
+        if held is not None:
+            # The second half of the interlock, and the half that is actually load bearing.
+            # Closing the roof on rain is worth little if anything can open it again a
+            # second later, and this is where "anything" is held to the rule: the buttons
+            # and the API both arrive here, so neither can be more permissive than the
+            # other, and a page that has not repainted since it started raining still has a
+            # live Open button on it. Exactly the reasoning processRoofCommand() re-tests
+            # the moving-roof block for rather than trusting a disabled button.
+            #
+            # Last of the refusals, so that the reason given is the most specific one that
+            # applies: a roof that is disengaged or has no worker is not going to open for
+            # reasons that outrank the weather, and saying "rain" there would send an
+            # operator to look at a sensor when the problem is elsewhere.
+            logger.warning("Not opening the roof: {}".format(held))
+            triggerEvent("roofMotionError", "Cannot open the roof: {}".format(held))
+            return False
     logger.info("Requesting roof {}".format(action))
     # Stamped, so a command that sat in the mailbox through a board outage is dropped by
     # executeMotionCommand() instead of starting a motion long after it was asked for.
@@ -4416,6 +4633,16 @@ def main():
             "engage": ("Engage the roof",
                        "The safety checks and motion handling come back on. Make sure "
                        "nobody is at the roof. Engage?"),
+            "rain-override": ("Override the rain interlock",
+                              "OMS will stop closing the roof when the station reports "
+                              "rain, and will let the roof be opened while it is raining. "
+                              "Nothing moves now, and a close already running is not "
+                              "stopped by this. The override is dropped when OMS restarts. "
+                              "Override?"),
+            "rain-arm": ("Arm the rain interlock",
+                         "OMS will close the roof again as soon as the station reports "
+                         "rain. If it is reporting rain now, the roof starts closing "
+                         "within a few seconds. Arm?"),
             }
 
     def runRoofCommand(action: str):
@@ -4431,6 +4658,9 @@ def main():
             return
         if action in ("engage", "disengage"):
             requestRoofEngaged(action == "engage")
+            return
+        if action in ("rain-override", "rain-arm"):
+            setRainOverride(action == "rain-override")
             return
         logger.error("Ignoring unknown roof command from the UI: {}".format(action))
 
@@ -4583,6 +4813,26 @@ def main():
                                     on_click=lambda: processRoofCommand(
                                         "disengage" if roofEngaged else "engage")) \
                                     .props("outline color=orange").classes("flex-1")
+                        # The rain interlock. Below the three rows above and on its own,
+                        # because it is not a command: nothing moves when it is pressed,
+                        # and putting it in a row with things that do move would invite it
+                        # to be read as a fourth of them.
+                        #
+                        # The label is only shown when there is something to say -- the roof
+                        # held shut, or the interlock switched off -- so a row that is
+                        # visible at all is one the operator needs to read. An override left
+                        # on is exactly as much worth seeing as the rain somebody reached
+                        # for it over, which is why both states put something here.
+                        roof_rain_label = ui.label("").classes("text-sm text-center")
+                        roof_rain_label.set_visibility(False)
+                        # Bound once and reading which way it is going at click time, for
+                        # the reason spelled out on roof_engage_button above: on_click()
+                        # adds a handler rather than replacing one.
+                        roof_rain_button = ui.button(
+                                "Override rain interlock", icon="umbrella",
+                                on_click=lambda: processRoofCommand(
+                                    "rain-arm" if rainOverride else "rain-override")) \
+                                .props("outline color=orange").classes("w-full")
                 with ui.card().classes("w-full"):
                     status_stream_image = ui.image(createErrorImage("Initializing ...")).classes("w-full").props('no-transition no-spinner')
                     status_stream_message = makeUnavailableMessage("videocam_off")
@@ -4701,6 +4951,14 @@ def main():
                     settings["roof_rod_timeout"] = boundedNumber("Time for a push rod to complete its stroke (s)", "roof_rod_timeout")
                     settings["roof_close_start_timeout"] = boundedNumber("Time for a half to start closing (s)", "roof_close_start_timeout")
                     settings["roof_close_overrun"] = boundedNumber("Extra pull after the closed switches (s)", "roof_close_overrun")
+                    # The one field whose label states the value used when it is left empty.
+                    # Every other setting that is not entered simply does not happen, and an
+                    # empty field says so plainly; this one still closes the roof, and a
+                    # blank box beside a safety interlock has to say at what.
+                    settings["roof_rain_threshold"] = boundedNumber(
+                            "Rain at or above which the roof is closed (%, {} if unset)".format(
+                                rainThresholdDefault),
+                            "roof_rain_threshold")
                     settings["roof_fan_change_delay"] = boundedNumber("Minimal time between fan state changes (s)", "roof_fan_change_delay")
                     settings["roof_fan_temp_min"] = boundedNumber("Minimum outside temperature for fan", "roof_fan_temp_min")
                     settings["roof_fan_humidity_deadband"] = boundedNumber("Dead range for inside/outside humidity difference (%)", "roof_fan_humidity_deadband")
@@ -4760,6 +5018,10 @@ def main():
     # text colours on one element resolve by stylesheet order rather than by which was set
     # last, so leaving the old one on is how a label gets stuck red.
     roof_state_color_classes = " ".join(sorted(set(roof_state_colors.values())))
+    # Both colours the rain line can carry, taken off on each write for the same reason the
+    # state label's are: two text colours on one element resolve by stylesheet order rather
+    # than by which was set last, so an orange left standing under a red wins by accident.
+    roof_rain_label_colors = "text-orange-400 text-red-500"
 
     def updateRoofControls():
         """Repaints the decisive status and decides which buttons may be pressed.
@@ -4775,14 +5037,47 @@ def main():
         roof_state_reason.set_text(reason or "")
         roof_state_reason.set_visibility(bool(reason))
 
-        # Disengaged disables the same three as a running motion, for a different reason:
+        # Disengaged disables the same buttons as a running motion, for a different reason:
         # there, the roof must not be interrupted; here, OMS has been told to keep its hands
         # off it. Both leave the stop alone, which is never disabled at all -- a button that
         # de-energizes four relays has no state in which it is the wrong thing to press.
+        #
+        # Open is set separately just below rather than in this loop only because it answers
+        # to one condition more; the two above it are the ones with nothing else to say.
         blocked = state in (RoofStatus.OPENING, RoofStatus.CLOSING)
-        for button in (roof_open_button, roof_close_button, roof_reset_button):
+        for button in (roof_close_button, roof_reset_button):
             button.set_enabled(not blocked and roofEngaged)
+        # Open answers to one thing the other two do not. The rain interlock shuts the roof
+        # and then keeps it shut, and a button left live while every press of it is refused
+        # deeper down is a control that lies about what it will do -- the refusal in
+        # requestRoofMotion() is what enforces the rule, this is what tells the operator.
+        rainHeld = rainInterlockReason()
+        roof_open_button.set_enabled(not blocked and roofEngaged and rainHeld is None)
         roof_engage_button.set_enabled(not blocked)
+        # Disabled while a motion runs, exactly as the engage button is. Overriding the
+        # interlock mid-close would not stop that close in any case -- setRainOverride()
+        # commands nothing, deliberately -- and the control for a roof that is moving and
+        # should not be is the Stop above.
+        roof_rain_button.set_enabled(not blocked)
+        if rainOverride:
+            roof_rain_label.set_text("Rain interlock overridden -- {}".format(
+                rainReason() or "no rain reported"))
+            roof_rain_label.classes("text-sm text-center text-orange-400",
+                                    remove=roof_rain_label_colors)
+            roof_rain_label.set_visibility(True)
+        elif rainHeld is not None:
+            roof_rain_label.set_text("Held closed: {}".format(rainHeld))
+            roof_rain_label.classes("text-sm text-center text-red-500",
+                                    remove=roof_rain_label_colors)
+            roof_rain_label.set_visibility(True)
+        else:
+            roof_rain_label.set_visibility(False)
+        # Text and props only, for the reason given below about the engage button: the
+        # handler is bound once and reads rainOverride when it runs.
+        roof_rain_button.set_text("Arm rain interlock" if rainOverride
+                                  else "Override rain interlock")
+        roof_rain_button.props("icon=umbrella color={}".format(
+            "green" if rainOverride else "orange"))
         # Text and props only. The handler is bound once, at construction, and decides which
         # way it is going when it runs: ui.button.on_click() *adds* a handler rather than
         # replacing one, so rebinding here would fire the command once per repaint since
@@ -5719,6 +6014,13 @@ def main():
                       type="positive" if thing[1] else "warning")
             updateRoofControls()
             return
+        if thing[0] == "rainOverride":
+            ui.notify("Rain interlock overridden: OMS will not close the roof on rain"
+                      if thing[1] else
+                      "Rain interlock armed: OMS will close the roof on rain",
+                      type="warning" if thing[1] else "positive")
+            updateRoofControls()
+            return
         if thing[0] == "roofFaultCleared":
             ui.notify("Roof fault cleared", type="positive")
             updateRoofControls()
@@ -5976,6 +6278,19 @@ apiv1.bind(
         requestRoofMotion=requestRoofMotion,
         requestClearRoofFault=requestClearRoofFault,
         requestRoofEngaged=requestRoofEngaged,
+        # Three functions rather than the rainOverride flag itself, for the reason stated
+        # just above: the flag is rebound, and a bound copy of it would be a value that went
+        # stale for the life of the process. rainReason() and rainInterlockReason() are both
+        # here because the API has to be able to report the weather and the decision
+        # separately -- an override is only legible next to what it is overriding.
+        rainReason=rainReason,
+        rainInterlockReason=rainInterlockReason,
+        rainOverrideActive=rainOverrideActive,
+        setRainOverride=setRainOverride,
+        rainReading=rainReading,
+        # An int that is never rebound, so it goes over as a value like roofStateMaxAge
+        # does. It is the number the API has to quote when no threshold is configured.
+        rainThresholdDefault=rainThresholdDefault,
         switchNames=switch_names,
         getSwitchState=getSwitchState,
         setSwitchState=setSwitchState,
