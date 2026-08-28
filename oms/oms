@@ -6144,10 +6144,11 @@ fanModeCodes = {"off": 0, "on": 1, "auto": 2}
 def stateFields():
     """What the equipment is doing, as the fields of one InfluxDB point.
 
-    Every read here is of state a worker has already published -- roofDecisiveState() off
-    the last status word, getSwitchState() off the switch objects, the fan mode out of
-    settings. Nothing here touches a serial port or takes a lock, which is what makes it
-    safe to call on the cadence above rather than only when something asks.
+    Every read here is of state a worker has already published -- roofDecisiveState() and
+    the limit switches off the last status word, getSwitchState() off the switch objects,
+    the fan mode out of settings. Nothing here touches a serial port or takes a lock,
+    which is what makes it safe to call on the cadence above rather than only when
+    something asks.
 
     A value that is not known is left out rather than written as a placeholder. A switch
     with no pin configured reads UNKN, and no boolean means that: false would be a lie
@@ -6177,12 +6178,23 @@ def stateFields():
     if mode is not None:
         fields["fans_mode"] = mode
 
-    # The fans are on the roof board, so with no status word there is nothing to say about
-    # what they are doing -- which is a different thing from the mode above. Same guard
-    # fanDetail() uses in apiv1, and for the same reason.
+    # The fans and the eight limit switches are all read out of the roof board's status
+    # word, so with no reading there is nothing to say about any of them -- which is a
+    # different thing from the fan mode above, and is why that one is not in here. Same
+    # guard fanDetail() and roofDetail() use in apiv1, and for the same reason.
     word, _ = getRoofState()
     if word is not None and roof.Roof.isInitialized():
-        fields["fans_running"] = bool(roof.Roof.get().fansAreOn(status=word))
+        instance = roof.Roof.get()
+        fields["fans_running"] = bool(instance.fansAreOn(status=word))
+        # Named off RoofSwitch rather than listed again here, so the eight names stay
+        # written down in the one place that owns them -- the rule RoofSwitch.bit already
+        # keeps for the status bits, and RoofHalf.openSwitches for the pairs.
+        #
+        # All eight, not a summary. roof_state above is already the summary, and it is
+        # exactly the reading that produced it which says why a half stopped between its
+        # switches, or which switch was the one that stopped reporting.
+        for sw, engaged in instance.switchStates(status=word).items():
+            fields["limit_" + sw.name.lower()] = bool(engaged)
 
     return fields
 
