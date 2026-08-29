@@ -61,11 +61,15 @@ cases (healthy, roof held, reading stale).
 
 ## Driver — noise and hygiene
 
-**4. `Error accessing environment fields` logs every poll.** `oms.cpp:1074`
+**4. `Error accessing environment fields` logged every poll.** `oms.cpp`
 When the environment sensor has never answered, `getEnvironment()` returns the keys with
-`None` values, so the parse fails every two seconds. Measured 11 lines in 20 s — roughly
-43,000 a day. Log once, or only on a state change. Pre-existing, not a regression.
-**open**
+`None` values, so the parse failed every two seconds — 11 lines in 20 s, roughly 43,000 a
+day. Pre-existing, not a regression.
+**done** — rate limited to one line a minute (`ENVIRONMENT_ERROR_INTERVAL`), with the flag
+cleared on a readable reading so a sensor that breaks, recovers and breaks again reports
+the second failure straight away rather than waiting out an interval that started before
+the recovery. Measured after: 2 lines in 70 s of a steadily absent sensor, and an
+immediate line after a recovery.
 
 **5. Typo: `"Could query URL"` → `"Could not query URL"`.** `oms.cpp:1269`
 **open**

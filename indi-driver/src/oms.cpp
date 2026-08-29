@@ -74,6 +74,7 @@ bool OMS::Connect() {
     // finds as if it were the first thing this driver had ever seen - which it is, for
     // every client that has just attached.
     m_statusPollFailures = 0;
+    m_environmentErrorLogged = false;
     m_weatherHave = false;
     m_weatherReported = true;
     m_roofHeldShut = false;
@@ -1085,14 +1086,27 @@ void OMS::applyEnvironment(const json &data) {
         stale = data.value("stale", false);
     } catch ( json::exception &e ) {
         // Also the "no reading yet" case: getEnvironment() has nothing to report until the
-        // board has answered once, and neither field is there.
-        LOGF_ERROR("Error accessing environment fields: %s", e.what());
+        // board has answered once, and both fields come back null until it does. That is a
+        // condition rather than an event, and it used to be said once per poll for as long
+        // as it lasted - so it is rate limited, and the property below carries the state
+        // for anyone who wants it continuously.
+        const auto now = std::chrono::steady_clock::now();
+        if ( ! m_environmentErrorLogged
+                || now - m_lastEnvironmentError >= ENVIRONMENT_ERROR_INTERVAL ) {
+            m_environmentErrorLogged = true;
+            m_lastEnvironmentError = now;
+            LOGF_ERROR("Error accessing environment fields: %s", e.what());
+        }
         if ( environmentNP.s != IPS_ALERT ) {
             environmentNP.s = IPS_ALERT;
             IDSetNumber(&environmentNP, nullptr);
         }
         return;
     }
+
+    // Readable again, so the next failure is news rather than a continuation and says so
+    // straight away instead of waiting out the interval.
+    m_environmentErrorLogged = false;
 
     environmentN[0].value = temperature;
     environmentN[1].value = humidity;

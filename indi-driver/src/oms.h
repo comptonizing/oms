@@ -301,6 +301,13 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // away is reported while it still matters.
         static constexpr unsigned STATUS_POLL_FAILURES_BEFORE_ERROR {3};
 
+        // How often the inside reading may complain that it cannot be decoded. It is the
+        // one error on the poll path that a *steady* condition produces rather than a
+        // changing one - an environment sensor that has never answered leaves both fields
+        // null in every reply - so without a limit it is one line per poll for as long as
+        // the sensor stays away, which is 30 a minute and about 43,000 a day.
+        static constexpr std::chrono::seconds ENVIRONMENT_ERROR_INTERVAL {60};
+
         bool request(bool isPost, const std::string &url, std::string &response,
                 bool quiet = false, std::string *errorOut = nullptr);
         bool readURL(const std::string &url, std::string &response, bool quiet = false,
@@ -327,6 +334,13 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // Consecutive failed /api/v1/status polls, main thread only like m_roofHeldShut.
         // Reset by the first reply that arrives.
         unsigned m_statusPollFailures = 0;
+
+        // When the inside reading last complained, and whether it has at all since it was
+        // last readable. Both main thread only. The flag is what makes a reading that
+        // breaks, recovers and breaks again say so the second time rather than waiting out
+        // an interval that started before the recovery.
+        bool m_environmentErrorLogged = false;
+        std::chrono::steady_clock::time_point m_lastEnvironmentError {};
 
         // The station's last reading, taken from the same /api/v1/status poll as
         // everything else and read by updateWeather() instead of fetching: WeatherInterface
