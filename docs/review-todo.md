@@ -83,9 +83,14 @@ beats discarding it, but the comment now says that nothing reads an error body t
 that the case which made it load bearing went away with the move to `/api/v1/status`.
 
 **7. No connection reuse.** A fresh easy handle, TCP connection and DNS lookup for
-`oms.fritz.box` on every request. Matters less at one request per poll than it did at
-four, but a shared handle or `CURLOPT_DNS_CACHE_TIMEOUT` is nearly free.
-**open**
+`oms.fritz.box` on every request.
+**done** — one curl handle per thread, reused via `curl_easy_reset()`, which clears the
+options but keeps the live connections and the DNS cache. Per thread rather than shared
+because an easy handle cannot be used by two threads at once and a mutex would serialize
+the main thread behind the poll — the opposite of what the poll thread is for. Measured
+over 24 s: 12 requests → 12 TCP connections before, 12 requests → 0 after. Recovery from a
+dead cached connection checked by killing and restarting OMS: one new connection, no
+errors.
 
 ## Firmware
 

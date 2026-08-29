@@ -1195,9 +1195,42 @@ bool OMS::sendSwitchCommand(const std::string &id, const std::string &state, std
     return request(true, "/api/v1/switches/" + id + "/" + state, response);
 }
 
+// One curl handle per thread, reused for every request that thread makes.
+//
+// Reused because a fresh handle is a fresh everything: a new TCP connection and a new name
+// lookup for oms.fritz.box on every request, where the poll thread makes one every two
+// seconds and the answer has not moved. curl_easy_reset() clears the options but keeps the
+// live connections, the DNS cache and the session cache, which is exactly the part worth
+// keeping - so a poll now rides the connection the last one left open.
+//
+// Per thread rather than one shared handle because an easy handle may not be used by two
+// threads at once, and the two that make requests here are the poll thread and the main
+// thread. A mutex would serialize them, which is the opposite of what is wanted: the whole
+// reason the poll runs on its own thread is so that a command does not have to wait for it.
+//
+// thread_local with a real deleter, so a poll thread that ends on disconnect takes its
+// connections with it. The main thread's handle is destroyed at exit before OMS's own
+// destructor runs curl_global_cleanup(), because it is constructed after OMSDriver and
+// destruction runs in reverse order of construction.
+static CURL *threadCurl() {
+    thread_local std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(
+            nullptr, curl_easy_cleanup);
+    if ( ! handle ) {
+        handle.reset(curl_easy_init());
+    } else {
+        curl_easy_reset(handle.get());
+    }
+    return handle.get();
+}
+
 bool OMS::request(bool isPost, const std::string &url, std::string &response, bool quiet,
         std::string *errorOut) {
-    char curlErrorBuff[CURL_ERROR_SIZE] = ""; // Necessary, see curl docs
+    // static thread_local, not a plain local: CURLOPT_ERRORBUFFER keeps the pointer, and
+    // the handle now outlives this call. A stack buffer would leave the handle holding a
+    // dangling one between requests - harmless in practice, since the reset above clears
+    // it before the handle is next used, but not a thing to leave lying about.
+    static thread_local char curlErrorBuff[CURL_ERROR_SIZE];
+    curlErrorBuff[0] = '\0';
     std::string buff;
     std::string urlBase;
     {
@@ -1231,19 +1264,16 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
         return fail("Connection details not provided!");
     }
 
-    CURL *curl = curl_easy_init();
+    CURL *curl = threadCurl();
     if ( curl == NULL ) {
-        curl_easy_cleanup(curl);
         return fail("Could not initialize curl!");
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curlErrorBuff) ) {
-        curl_easy_cleanup(curl);
         return fail("Could not set curl error buffer!");
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_URL, address.c_str()) ) {
-        curl_easy_cleanup(curl);
         return fail(std::string("Could not use specified URL: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
@@ -1252,26 +1282,22 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
         // The roof/weather commands take no body - POSTFIELDS("") is enough to make curl
         // send POST rather than GET, and CURLOPT_POST makes that explicit either way.
         if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_POST, 1L) ) {
-            curl_easy_cleanup(curl);
             return fail(std::string("Could not set curl POST method: ") +
                     (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
         }
 
         if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "") ) {
-            curl_easy_cleanup(curl);
             return fail(std::string("Could not set curl POST body: ") +
                     (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
         }
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCB) ) {
-        curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl write callback: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buff) ) {
-        curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl data buffer: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
@@ -1294,19 +1320,16 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
     // One line, and it stops that being something this driver depends on another process
     // for. It also covers running the binary standalone, where SIGPIPE is not ignored.
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) ) {
-        curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl signal handling: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT) ) {
-        curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl connect timeout: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_TIMEOUT, TRANSFER_TIMEOUT) ) {
-        curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl timeout: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
@@ -1315,7 +1338,6 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
 
     long httpCode = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-    curl_easy_cleanup(curl);
 
     if ( CURLE_OK != res ) {
         return fail("Could not query URL " + address + ": " +
