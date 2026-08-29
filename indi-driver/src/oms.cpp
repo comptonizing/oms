@@ -1262,6 +1262,29 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
+    // Set because curl runs on two threads here - the poll thread's GET every two seconds
+    // and the main thread's commands - and libcurl's signal use is process-wide.
+    //
+    // Neither thing it guards is currently reachable, and it is worth writing down which.
+    // The SIGALRM-and-siglongjmp path libcurl uses to time out name resolution belongs to
+    // the synchronous resolver, and this libcurl reports AsynchDNS, so CONNECT_TIMEOUT
+    // below still works with this set. The other is SIGPIPE: libcurl otherwise saves the
+    // process's disposition, ignores it for the transfer and restores it afterwards, and
+    // two threads doing that at once can interleave so that one restores the original
+    // while the other is still transferring - a write to a closed socket in that window
+    // would take the default action and kill the driver. That cannot happen under
+    // indiserver, which calls noSIGPIPE() (sigaction, SIG_IGN) in main() before forking
+    // any driver, and POSIX keeps SIG_IGN across exec - so the disposition libcurl saves
+    // and restores is already SIG_IGN and every interleaving lands on ignored.
+    //
+    // One line, and it stops that being something this driver depends on another process
+    // for. It also covers running the binary standalone, where SIGPIPE is not ignored.
+    if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) ) {
+        curl_easy_cleanup(curl);
+        return fail(std::string("Could not set curl signal handling: ") +
+                (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
+    }
+
     if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT) ) {
         curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl connect timeout: ") +

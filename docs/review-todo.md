@@ -32,11 +32,19 @@ their own shorter budget: they hit endpoints that answer 202 as soon as the comm
 posted to a mailbox.
 **open**
 
-**2. `CURLOPT_NOSIGNAL` is not set** while curl runs on two threads (`oms.cpp:1205` onward).
-libcurl has AsynchDNS here, so the SIGALRM-for-timeouts path is gone, but libcurl still
-installs a SIGPIPE handler by default and installing one from a non-main thread is
-process-global.
-**open**
+**2. `CURLOPT_NOSIGNAL` was not set** while curl runs on two threads — the poll thread's
+GET every two seconds and the main thread's commands — and libcurl's signal use is
+process-wide.
+**done** — set, with the reasoning recorded at the call site. Neither thing it guards was
+actually reachable: the `SIGALRM`/`siglongjmp` name-resolution timeout belongs to the
+synchronous resolver and this libcurl reports `AsynchDNS`; and the SIGPIPE
+save/ignore/restore race cannot kill the driver under indiserver, which calls
+`noSIGPIPE()` (`sigaction`, `SIG_IGN`) in `main()` before forking any driver, with POSIX
+keeping `SIG_IGN` across `exec` — confirmed on the live process, `SigIgn` mask
+`0000000000001006`, bit 13 set. Set anyway so the driver does not depend on another
+process for it, and because running the binary standalone does *not* inherit that. Checked
+that `CONNECT_TIMEOUT` still works with it set: a connect to a black-holed address returns
+in 2.0 s, not at the 5 s transfer budget.
 
 **3. Per-connection state survived a disconnect/reconnect.** `oms.cpp`
 `m_statusPollFailures`, `m_weatherHave`, `m_weatherReported` and `m_roofHeldShut` all
