@@ -63,6 +63,21 @@ bool OMS::Connect() {
     // arriving in that window would see "already unparked" and silently no-op. Run
     // synchronously here, on the connection thread, rather than through the poll thread
     // below - that one may not have produced a first snapshot yet.
+    // Everything below is per-connection, and none of it survived a disconnect before.
+    // A session that ended with two failed polls left the counter at two, so the next
+    // one reached the error threshold after a single miss; a weather reading from the
+    // last session stayed usable for whatever was left of its age; and m_roofHeldShut
+    // holding true across the gap meant a roof that really was held shut on reconnect
+    // logged nothing, because the state had not changed as far as this driver knew.
+    //
+    // Cleared rather than carried, so the first poll of a connection reports what it
+    // finds as if it were the first thing this driver had ever seen - which it is, for
+    // every client that has just attached.
+    m_statusPollFailures = 0;
+    m_weatherHave = false;
+    m_weatherReported = true;
+    m_roofHeldShut = false;
+
     pollStatus();
     startPolling();
     SetTimer(ROOF_POLL_MS);

@@ -353,7 +353,14 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // measured against. Comparing against a sample taken earlier in the same poll
         // cannot see a reading that aged out between two polls: both sides of that
         // comparison are already false by the time it is made.
-        bool m_weatherReported = false;
+        //
+        // True before anything has been published, which is the whole of "nothing has been
+        // reported as wrong yet". It started out false, and a first connect to a perfectly
+        // healthy OMS then announced "The weather station is reporting again" - a recovery
+        // from a failure that never happened. Starting true is right in both directions: a
+        // driver that comes up healthy says nothing, and one whose first reading is already
+        // unusable says so, which is news.
+        bool m_weatherReported = true;
 
         std::string m_url = "";
         // Guards m_url: ISNewText() writes it from the main thread, request() reads it

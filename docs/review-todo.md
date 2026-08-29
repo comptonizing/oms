@@ -38,10 +38,18 @@ installs a SIGPIPE handler by default and installing one from a non-main thread 
 process-global.
 **open**
 
-**3. `m_statusPollFailures` and `m_weatherHave` survive a disconnect/reconnect.**
-A session that ended with two failures reaches the error threshold after one more. Reset
-them in `Connect()`.
-**open**
+**3. Per-connection state survived a disconnect/reconnect.** `oms.cpp`
+`m_statusPollFailures`, `m_weatherHave`, `m_weatherReported` and `m_roofHeldShut` all
+carried over, so a session that ended with two failed polls reached the error threshold
+after a single miss, and a roof that really was held shut on reconnect logged nothing
+because the flag had not changed as far as the driver knew.
+**done** — all four are cleared in `Connect()`. This also turned up a false recovery
+notice: `m_weatherReported` started `false`, meaning "the last publish said unusable",
+when nothing had been published at all — so a first connect to a healthy OMS announced
+*"The weather station is reporting again"* for a failure that never happened. It starts
+`true` now, which is right both ways: a driver that comes up healthy says nothing, one
+whose first reading is already unusable says so. Verified across all three first-connect
+cases (healthy, roof held, reading stale).
 
 ## Driver — noise and hygiene
 
