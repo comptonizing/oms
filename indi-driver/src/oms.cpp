@@ -245,13 +245,12 @@ bool OMS::updateProperties() {
         // their defs carry the primed values too, and nothing derives state from their sets
         // the way ISD::Dome does from this one.
         //
-        // It does not, on its own, put the roof's state into Ekos's Observatory tab. That
-        // field is set to "N/A" for any roll-off roof in Observatory::setDome(), which runs
-        // once the device is connected and ready - by which time everything here has
-        // already settled - and it is only ever repainted from a *change* signal
-        // afterwards. KStars initialises it from the current position for a dome with an
-        // azimuth but has no equivalent for a roof, so it reads N/A until the roof first
-        // moves. Nothing this driver publishes changes that.
+        // The Observatory tab is where this is visible. Observatory::setDome() fills its
+        // position field with the placeholder "N/A" for a roll-off roof, then ends by
+        // calling setDomeParkStatus(m_Dome->parkStatus()) to replace it with Open or
+        // Closed. PARK_UNKNOWN falls through that switch's default case, so the
+        // placeholder stayed on screen for the whole session - which is what a roof
+        // reported as "N/A" on a freshly launched driver meant.
         ParkSP.apply();
     } else {
         deleteProperty(engageSP.name);
