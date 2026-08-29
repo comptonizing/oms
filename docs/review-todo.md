@@ -75,11 +75,12 @@ immediate line after a recovery.
 **done** — now `"Could not query URL"`. It is the message an operator sees on every failed
 request, and the one quoted in the report that started this review.
 
-**6. Stale comment.** `oms.cpp:1274`
-Still explains that `response` is set before the status check because
-`/api/v1/environment` answers a handled 503 with the reading in the body. That endpoint is
-no longer fetched — everything comes from `/api/v1/status`, which is always 200.
-**open**
+**6. Stale comment.** `oms.cpp`
+It explained that `response` is set before the status check because `/api/v1/environment`
+answers a handled 503 with the reading in the body — an endpoint no longer fetched.
+**done** — replaced rather than deleted. The line stays, because handing back what arrived
+beats discarding it, but the comment now says that nothing reads an error body today and
+that the case which made it load bearing went away with the move to `/api/v1/status`.
 
 **7. No connection reuse.** A fresh easy handle, TCP connection and DNS lookup for
 `oms.fritz.box` on every request. Matters less at one request per poll than it did at

@@ -1322,10 +1322,16 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
                 (strlen(curlErrorBuff) ? curlErrorBuff : curl_easy_strerror(res)));
     }
 
-    // Set regardless of what httpCode turns out to be below: /api/v1/environment answers a
-    // handled 503 with the reading still in the body when it's merely stale (see its
-    // docstring), and a caller reading such a body on a false return should not have to
-    // duplicate the curl call to get it.
+    // Set regardless of what httpCode turns out to be below, so a caller that wants to
+    // look at an error body has it without repeating the request.
+    //
+    // This used to be load bearing: /api/v1/environment answered a handled 503 with the
+    // reading still in the body when it was merely stale, and applyEnvironment() read that
+    // body on a false return. Nothing does now -- everything comes from /api/v1/status,
+    // which is always 200 while OMS is up, and every caller here either returns straight
+    // away on a false or logs a message of its own. Kept because handing back what
+    // actually arrived is a better default than discarding it, and because the message
+    // fail() builds below quotes the same body either way.
     response = buff;
 
     if ( httpCode < 200 || httpCode >= 300 ) {
