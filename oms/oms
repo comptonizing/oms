@@ -1839,6 +1839,21 @@ lastRoofState = [False] * (max(c.value for c in roof.ResponseState) + 1)
 # otherwise make the loop either sleep for hours or fire a burst of catch-up polls.
 lastRoofIconUpdate = time.monotonic()
 roofIconUpdateInterval = 3
+# The floor under the same publishing, and the half that bounds the cost. The interval
+# above only ever *forces* an update the poll would not otherwise have sent, so it does
+# nothing at all while the roof is moving: rods, limit switches and relays are all shifting
+# then, so `changed` is true on nearly every poll and every one of them published. At
+# roofPollPeriod that is two events a second, each fanned out to every open browser and
+# each repainting a full set of indicators on the event loop -- the loop the API is served
+# from, which is why a driver polling this box saw its requests time out during a motion
+# and not otherwise.
+#
+# Nobody reads indicators twice a second, so the rate buys nothing to begin with. Updates
+# suppressed by the floor are held rather than dropped: pendingRoofIconUpdate makes the
+# next poll past the floor publish, so the state that lands is always the current one and
+# the end of a motion cannot go unpainted.
+roofIconMinInterval = 1.0
+pendingRoofIconUpdate = False
 # When the worker last published lastRoofState; 0.0 until the first poll lands, and
 # reset back to that whenever the roof goes away, so a state from a previous roof
 # instance can never be mistaken for a current one.
@@ -3646,6 +3661,7 @@ def serviceRoofOnce(roofInstance, generation):
     worker that is leaving would only delay its exit.
     """
     global lastRoofState, lastRoofStateTime, lastRoofIconUpdate, lastRoofDrive
+    global pendingRoofIconUpdate
     log = DeferredLog()
     event = DeferredEvents()
     if not roofLock.acquire(timeout=roofStopBudget()):
@@ -3830,9 +3846,16 @@ def serviceRoofOnce(roofInstance, generation):
     lastRoofDrive = drive
     lastRoofStateTime = time.monotonic()
     now = time.monotonic()
-    if changed or now - lastRoofIconUpdate > roofIconUpdateInterval:
+    if changed:
+        pendingRoofIconUpdate = True
+    # Two conditions, and they are not the same one. The floor is what a change has to
+    # clear; the interval is what publishes anyway when nothing has changed for a while,
+    # and it is longer than the floor, so an idle roof still repaints on its own schedule.
+    due = pendingRoofIconUpdate and now - lastRoofIconUpdate >= roofIconMinInterval
+    if due or now - lastRoofIconUpdate > roofIconUpdateInterval:
         triggerEvent("roofUpdate", status)
         lastRoofIconUpdate = now
+        pendingRoofIconUpdate = False
     return True
 
 def roofLoop(stopEvent, roofInstance, generation):
