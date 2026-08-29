@@ -80,18 +80,35 @@ struct weatherData {
     bool critical;
 };
 
+// minOK/maxOK are the range outside which WeatherInterface calls a value dangerous, and
+// percWarn is the width of the warning band at *each* end of that range, as a percentage
+// of (maxOK - minOK) - so widening a range widens its warning bands with it unless
+// percWarn comes down to match (see checkParameterState() in indiweatherinterface.cpp).
+// The band at the minOK end is only applied when minOK is non-zero, which is why the
+// one-sided readings below can sit at 0 all night without being called a warning.
+
 static const weatherData parameters[] = {
     weatherData {"env_temperature", "WEATHER_TEMPERATURE", "Temperature (C)", -20, 40, 15, false},
     weatherData {"env_pressure", "WEATHER_PRESSURE", "Pressure (mbar)", 900, 1100, 15, false},
     weatherData {"env_humidity", "WEATHER_HUMIDITY", "Humidity (%)", 0, 100, 15, false},
     weatherData {"env_dewpoint", "WEATHER_DEWPOINT", "Dewpoint (C)", -20, 40, 15, false},
     weatherData {"rain_percentage", "WEATHER_RAIN_PERCENTAGE", "Rain (%)", 0, 5, 15, true},
-    weatherData {"sqm_mpsas", "WEATHER_SQM_MPSAS", "SQM (mpsas)", 15, 23, 15, true},
+    // The ceiling here is a bound on the *possible*, not on the acceptable: more mpsas is
+    // a darker sky, which is the condition this observatory is for, and the old 23 called
+    // anything better than 21.8 a warning and anything better than 23 an alert. The
+    // darkest natural night sky is around 22, so 30 cannot be reached; what is left is the
+    // floor, where a bright sky really does mean daylight or moon.
+    weatherData {"sqm_mpsas", "WEATHER_SQM_MPSAS", "SQM (mpsas)", 12, 30, 5, true},
     weatherData {"wind_speed", "WEATHER_WIND_SPEED", "Wind (km/h)", 0, 20, 15, true},
     weatherData {"wind_gust", "WEATHER_WIND_GUST", "Gust (km/h)", 0, 40, 15, true},
     weatherData {"ir_sky", "WEATHER_IR_SKY", "Sky IR (C)", -30, -15, 15, false},
     weatherData {"ir_ambient", "WEATHER_IR_AMBIENT", "Sky ambient (C)", -20, 40, 15, false},
-    weatherData {"ir_diff", "WEATHER_IR_DIFF", "Sky difference (C)", 15, 40, 15, true},
+    // Same shape of mistake as SQM, and the one that mattered most: a bigger sky-to-ambient
+    // difference is a clearer sky, and a cold clear winter night reaches 40 easily - which
+    // the old ceiling reported as danger, on exactly the nights worth observing. 100 is
+    // past anything the sensor can produce. percWarn drops to 5 along with the widening,
+    // or the warning band would reach up to 27 and cover ordinary clear-sky readings.
+    weatherData {"ir_diff", "WEATHER_IR_DIFF", "Sky difference (C)", 15, 100, 5, true},
 };
 
 // The four plain on/off switches OMS drives as Pi GPIO pins. Fans are a fifth switch to an
