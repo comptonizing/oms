@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 
 #include <curl/curl.h>
 
@@ -39,7 +40,19 @@
 
 #include "json.hpp"
 
-#define TIMEOUT 2
+// Budgets for one HTTP request, in seconds. Two of them because they answer different
+// questions. Connecting is a LAN round trip and a name lookup, and if that is slow the
+// server is not there; transferring is OMS deciding what to say, which is work on a
+// Raspberry Pi that also has a roof to drive.
+//
+// The transfer budget used to be 2s as well, which is also ROOF_POLL_MS - so any reply
+// slower than the interval between polls failed outright. That is not much headroom on a
+// box where the API shares NiceGUI's event loop with the web UI: the UI's timers, its
+// websocket fan-out and any open camera stream all run on the loop a request has to be
+// answered from, and all of them are busiest while the roof is moving and somebody is
+// watching it move. A stalled reply now costs a slower poll rather than a failed one.
+#define CONNECT_TIMEOUT 2
+#define TRANSFER_TIMEOUT 5
 
 using json = nlohmann::json;
 
@@ -279,18 +292,28 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // notices a state change.
         static constexpr uint32_t ROOF_POLL_MS {2000};
 
+        // Consecutive failed status polls before the roof is called faulted. A reply that
+        // does not arrive says nothing about the roof, only about reaching OMS, and the
+        // two must not be conflated: DOME_ERROR is how this driver reports a roof that
+        // has told it something is wrong, and Ekos reads it as one. Three polls is six
+        // seconds of silence before that is claimed, which is long enough to ride out the
+        // stalls a busy OMS produces and short enough that a server which has really gone
+        // away is reported while it still matters.
+        static constexpr unsigned STATUS_POLL_FAILURES_BEFORE_ERROR {3};
+
         bool request(bool isPost, const std::string &url, std::string &response,
                 bool quiet = false, std::string *errorOut = nullptr);
         bool readURL(const std::string &url, std::string &response, bool quiet = false,
                 std::string *errorOut = nullptr);
         bool sendRoofCommand(const std::string &command, std::string &response);
         bool sendSwitchCommand(const std::string &id, const std::string &state, std::string &response);
-        void pollRoofState();
-        void pollSwitches();
-        void pollEnvironment();
-        void applyRoofState(bool ok, const std::string &response, const std::string &error);
-        void applySwitches(bool ok, const std::string &response, const std::string &error);
-        void applyEnvironment(const std::string &response, const std::string &error);
+        void pollStatus();
+        void applyStatus(bool ok, const std::string &response, const std::string &error);
+        void applyRoofState(const json &data);
+        void applySwitches(const json &data);
+        void applyEnvironment(const json &data);
+        void applyWeather(const json &data);
+        void publishWeatherIfChanged();
         int parsePort(const char *str);
         void markUnsafe();
 
@@ -301,12 +324,43 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // snapshot above this needs no lock.
         bool m_roofHeldShut = false;
 
+        // Consecutive failed /api/v1/status polls, main thread only like m_roofHeldShut.
+        // Reset by the first reply that arrives.
+        unsigned m_statusPollFailures = 0;
+
+        // The station's last reading, taken from the same /api/v1/status poll as
+        // everything else and read by updateWeather() instead of fetching: WeatherInterface
+        // calls that from the INDI event loop, so the fetch it used to do there was a
+        // blocking HTTP request on the thread that also has to answer commands from
+        // indiserver. Main thread only, like m_roofHeldShut.
+        //
+        // Kept with its age and OMS's own limit on that age rather than as one flag,
+        // because what makes a reading unusable is that it is old, not that a request for
+        // it failed. A poll that does not come back leaves this one exactly as valid as it
+        // was a moment ago; it stops being valid when it would have aged out anyway. That
+        // distinction is the difference between riding out a two-second stall and telling
+        // Ekos the weather is critical - which aborts the running job and shuts the
+        // observatory down - every time OMS is slow to answer once.
+        json m_weatherData;
+        bool m_weatherHave = false;
+        double m_weatherAgeAtPoll = 0.0;
+        double m_weatherMaxAge = 0.0;
+        std::chrono::steady_clock::time_point m_weatherStamp {};
+
+        bool weatherUsable() const;
+
+        // What updateWeather() last actually published, which is what a change has to be
+        // measured against. Comparing against a sample taken earlier in the same poll
+        // cannot see a reading that aged out between two polls: both sides of that
+        // comparison are already false by the time it is made.
+        bool m_weatherReported = false;
+
         std::string m_url = "";
         // Guards m_url: ISNewText() writes it from the main thread, request() reads it
         // from both the main thread (commands) and the poll thread below (GETs).
         std::mutex m_urlMutex;
 
-        // The three GETs TimerHit() used to run inline now run on this thread instead, so
+        // The GET TimerHit() used to run inline now runs on this thread instead, so
         // the main event loop - the same one that reads commands off the wire from
         // indiserver - is never blocked on OMS's network. libindi's IDSet*/LOGF_* calls
         // write that wire with no locking of their own (see IDMessage() and friends in
@@ -315,14 +369,9 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // for TimerHit() - main thread only - to parse, diff and publish.
         struct PollSnapshot {
             uint64_t generation = 0;
-            bool roofOk = false;
-            std::string roofResponse;
-            std::string roofError;
-            bool switchesOk = false;
-            std::string switchesResponse;
-            std::string switchesError;
-            std::string environmentResponse;
-            std::string environmentError;
+            bool ok = false;
+            std::string response;
+            std::string error;
         };
         std::mutex m_snapshotMutex;
         PollSnapshot m_snapshot;

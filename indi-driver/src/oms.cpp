@@ -63,9 +63,7 @@ bool OMS::Connect() {
     // arriving in that window would see "already unparked" and silently no-op. Run
     // synchronously here, on the connection thread, rather than through the poll thread
     // below - that one may not have produced a first snapshot yet.
-    pollRoofState();
-    pollSwitches();
-    pollEnvironment();
+    pollStatus();
     startPolling();
     SetTimer(ROOF_POLL_MS);
     return true;
@@ -361,35 +359,38 @@ void OMS::markUnsafe() {
 }
 
 IPState OMS::updateWeather() {
-    std::string response = "";
-    if ( ! readURL("/api/v1/weather", response) ) {
+    // Reads what the poll thread last brought back rather than fetching. WeatherInterface
+    // calls this from its own timer on the INDI event loop - the single thread that also
+    // has to read commands off the wire from indiserver - so the blocking HTTP request
+    // that used to be the first line of this function stalled that loop for as long as OMS
+    // took to answer, which on a busy OMS is exactly the wait this driver was seeing time
+    // out. The reading is at most one poll old, which is far fresher than the once-a-minute
+    // cadence this is called on.
+    //
+    // weatherUsable() is false for the three cases that mean the same thing here: no
+    // reading has arrived, OMS called the last one stale, or the last one has since aged
+    // past the limit OMS gave for it. None is a reading to publish, so none is
+    // distinguished.
+    // Recorded as it is read, so publishWeatherIfChanged() has something to compare a
+    // later poll against: this is the only place that knows what actually went out.
+    m_weatherReported = weatherUsable();
+    if ( ! m_weatherReported ) {
         markUnsafe();
         return IPS_ALERT;
     }
-    json data;
-    try {
-        data = json::parse(response);
-    } catch ( json::exception &e ) {
-        LOGF_ERROR("JSON parse error: %s\n%s", e.what(), response.c_str());
-        markUnsafe();
-        return IPS_ALERT;
-    } catch (...) {
-        LOGF_ERROR("Unknown JSON parse error\n%s", response.c_str());
-        markUnsafe();
-        return IPS_ALERT;
-    }
+    const json &data = m_weatherData;
 
     auto ret = IPS_OK;
     for ( const auto& v: parameters ) {
         double value;
         try {
-            value = data[v.id].template get<double>();
+            value = data.at(v.id).template get<double>();
         } catch ( json::exception &e ) {
-            LOGF_ERROR("Error accessing %s: %s\n%s", v.id.c_str(), e.what(), response.c_str());
+            LOGF_ERROR("Error accessing %s: %s", v.id.c_str(), e.what());
             ret = IPS_ALERT;
             continue;
         } catch (...) {
-            LOGF_ERROR("Unknown error accessing %s\n%s", v.id.c_str(), response.c_str());
+            LOGF_ERROR("Unknown error accessing %s", v.id.c_str());
             ret = IPS_ALERT;
             continue;
         }
@@ -543,9 +544,7 @@ void OMS::TimerHit() {
         snap = m_snapshot;
     }
     if ( snap.generation != m_appliedGeneration ) {
-        applyRoofState(snap.roofOk, snap.roofResponse, snap.roofError);
-        applySwitches(snap.switchesOk, snap.switchesResponse, snap.switchesError);
-        applyEnvironment(snap.environmentResponse, snap.environmentError);
+        applyStatus(snap.ok, snap.response, snap.error);
         m_appliedGeneration = snap.generation;
     }
     SetTimer(ROOF_POLL_MS);
@@ -559,23 +558,22 @@ void OMS::TimerHit() {
 // off-thread; everything fetched here is handed to TimerHit() as inert strings instead.
 void OMS::pollWorker() {
     while ( ! m_stopPoll.load() ) {
-        std::string roofResp, roofErr, switchResp, switchErr, envResp, envErr;
-        bool roofOk = readURL("/api/v1/roof", roofResp, true, &roofErr);
-        bool switchesOk = readURL("/api/v1/switches", switchResp, true, &switchErr);
-        // Return value ignored here too, same as applyEnvironment() ignores it below -
-        // a handled stale-503 still has its body in envResp either way.
-        readURL("/api/v1/environment", envResp, true, &envErr);
+        std::string response, error;
+        // One request for the roof, the switches, the environment and the weather, where
+        // this used to make three and updateWeather() a fourth. OMS serves its API from
+        // the same event loop as its own web UI, so every request has to wait its turn
+        // behind whatever the UI is doing - and the UI is busiest while the roof is
+        // moving and somebody is watching it move. Four chances a cycle to be caught
+        // behind that is four times the exposure of one, and /api/v1/status exists to be
+        // asked exactly this ("Everything in one request, for a dashboard that would
+        // otherwise poll four", see apiv1.py).
+        bool ok = readURL("/api/v1/status", response, true, &error);
 
         {
             std::lock_guard<std::mutex> lock(m_snapshotMutex);
-            m_snapshot.roofOk = roofOk;
-            m_snapshot.roofResponse = roofResp;
-            m_snapshot.roofError = roofErr;
-            m_snapshot.switchesOk = switchesOk;
-            m_snapshot.switchesResponse = switchResp;
-            m_snapshot.switchesError = switchErr;
-            m_snapshot.environmentResponse = envResp;
-            m_snapshot.environmentError = envErr;
+            m_snapshot.ok = ok;
+            m_snapshot.response = response;
+            m_snapshot.error = error;
             m_snapshot.generation++;
         }
 
@@ -597,32 +595,19 @@ void OMS::stopPolling() {
     }
     m_stopPoll.store(true);
     m_stopCv.notify_all();
-    // Worst case this waits out one in-flight request per endpoint (TIMEOUT each) - paid
+    // Worst case this waits out one in-flight request per endpoint (TRANSFER_TIMEOUT
+    // each) - paid
     // once, on disconnect, not on every tick the way it used to be paid on the main thread.
     m_pollThread.join();
 }
 
-// Fetches used only for the synchronous priming read in Connect() (see its comment) -
-// pollWorker() above does the three GETs itself from then on. Kept as their own functions,
-// rather than folded into Connect(), so the fetch-then-apply shape stays in one place.
-void OMS::pollRoofState() {
+// Used only for the synchronous priming read in Connect() (see its comment) - pollWorker()
+// above does the GET itself from then on. Kept as its own function, rather than folded into
+// Connect(), so the fetch-then-apply shape stays in one place.
+void OMS::pollStatus() {
     std::string response;
-    bool ok = readURL("/api/v1/roof", response);
-    applyRoofState(ok, response, "");
-}
-
-void OMS::pollSwitches() {
-    std::string response;
-    bool ok = readURL("/api/v1/switches", response);
-    applySwitches(ok, response, "");
-}
-
-void OMS::pollEnvironment() {
-    std::string response;
-    // Return value ignored, same as applyEnvironment() ignores it: a handled stale-503
-    // still has its body in response either way (see request()'s comment).
-    readURL("/api/v1/environment", response);
-    applyEnvironment(response, "");
+    bool ok = readURL("/api/v1/status", response);
+    applyStatus(ok, response, "");
 }
 
 // IUFillText() leaves .text as NULL rather than "" when the initial value is empty (see
@@ -633,15 +618,56 @@ static const char *textOrEmpty(const IText &t) {
     return t.text ? t.text : "";
 }
 
-void OMS::applyRoofState(bool ok, const std::string &response, const std::string &error) {
+void OMS::applyStatus(bool ok, const std::string &response, const std::string &error) {
     if ( ! ok ) {
-        // readURL() already logged this itself when it wasn't quiet (the Connect() priming
-        // read); when it was quiet (pollWorker(), off the main thread), error carries what
-        // it would have logged, for us to say here instead.
-        if ( ! error.empty() ) {
-            LOGF_ERROR("%s", error.c_str());
+        // A poll that did not come back is not a roof that has faulted. It used to be
+        // treated as one, and that had teeth: DOME_ERROR puts ParkSP into IPS_ALERT, Ekos
+        // reads that as PARK_ERROR, and SchedulerProcess::checkDomeParkingStatus() answers
+        // a PARK_ERROR during a park or an unpark by restarting the operation - so one
+        // timed-out poll in the middle of a perfectly good motion had Ekos re-issuing the
+        // park it was already carrying out, at a roof that answers a command mid-motion
+        // with "The roof is moving; stop it first", up to five times before giving up on
+        // the whole procedure. Which is to say the driver turned a slow reply into a
+        // failed shutdown, and the roof was moving correctly throughout.
+        //
+        // So a failure now costs the state nothing until there have been several in a row.
+        // Between them the roof keeps the state it last had, which is the best answer
+        // available: OMS was told to open or close, and nothing has said it stopped.
+        // Silence is still reported, just as silence - and only once, since the poll runs
+        // every two seconds and a server that is down is not news 30 times a minute.
+        //
+        // The switches and the inside readings keep their last state for the same reason,
+        // and for the same span. The weather is the one thing judged on its own terms
+        // rather than on this counter: OMS says how long its reading stays good for, so
+        // weatherUsable() ages it out on that schedule whether or not the polls are
+        // getting through, and the publish at the bottom reports it the moment it does.
+        m_statusPollFailures++;
+        if ( m_statusPollFailures == 1 && ! error.empty() ) {
+            // readURL() already logged this itself when it wasn't quiet (the Connect()
+            // priming read); when it was quiet (pollWorker(), off the main thread), error
+            // carries what it would have logged, for us to say here instead.
+            LOGF_WARN("%s", error.c_str());
         }
-        setDomeState(DOME_ERROR);
+        if ( m_statusPollFailures < STATUS_POLL_FAILURES_BEFORE_ERROR ) {
+            publishWeatherIfChanged();
+            return;
+        }
+        if ( environmentNP.s != IPS_ALERT ) {
+            environmentNP.s = IPS_ALERT;
+            IDSetNumber(&environmentNP, nullptr);
+        }
+        if ( m_statusPollFailures == STATUS_POLL_FAILURES_BEFORE_ERROR ) {
+            LOGF_ERROR("No answer from OMS for %u status polls; the roof state is unknown.",
+                    m_statusPollFailures);
+        }
+        // Guarded because Dome::setDomeState() applies ParkSP unconditionally on
+        // DOME_ERROR, and an outage that lasts is one failed poll every two seconds -
+        // the same "only push when something changed" the light and text blocks below
+        // are written to.
+        if ( getDomeState() != DOME_ERROR ) {
+            setDomeState(DOME_ERROR);
+        }
+        publishWeatherIfChanged();
         return;
     }
 
@@ -649,20 +675,51 @@ void OMS::applyRoofState(bool ok, const std::string &response, const std::string
     try {
         data = json::parse(response);
     } catch ( json::exception &e ) {
-        LOGF_ERROR("Roof state JSON parse error: %s\n%s", e.what(), response.c_str());
+        LOGF_ERROR("Status JSON parse error: %s\n%s", e.what(), response.c_str());
         setDomeState(DOME_ERROR);
+        publishWeatherIfChanged();
         return;
     } catch (...) {
-        LOGF_ERROR("Unknown roof state JSON parse error\n%s", response.c_str());
+        LOGF_ERROR("Unknown status JSON parse error\n%s", response.c_str());
         setDomeState(DOME_ERROR);
+        publishWeatherIfChanged();
         return;
     }
 
+    if ( m_statusPollFailures > 0 ) {
+        if ( m_statusPollFailures >= STATUS_POLL_FAILURES_BEFORE_ERROR ) {
+            LOGF_INFO("OMS is answering again after %u missed status polls.",
+                    m_statusPollFailures);
+        }
+        m_statusPollFailures = 0;
+    }
+
+    // Each of the four is missing rather than malformed when OMS has nothing to say about
+    // it, so each applier is handed what there is and decides for itself - the roof is the
+    // only one whose absence is a fault, since /api/v1/status cannot answer at all without
+    // it (roofDetail() is not optional in there).
+    if ( ! data.contains("roof") || data["roof"].is_null() ) {
+        LOGF_ERROR("Status reply carries no roof state\n%s", response.c_str());
+        setDomeState(DOME_ERROR);
+        publishWeatherIfChanged();
+        return;
+    }
+    // Weather first, though it publishes nothing: applyRoofState() re-runs the weather
+    // update itself when the rain interlock changes, and it should judge that on this
+    // poll's reading rather than on the one before it.
+    applyWeather(data.contains("weather") ? data["weather"] : json());
+    applyRoofState(data["roof"]);
+    applySwitches(data.contains("switches") ? data["switches"] : json::object());
+    applyEnvironment(data.contains("environment") ? data["environment"] : json::object());
+    publishWeatherIfChanged();
+}
+
+void OMS::applyRoofState(const json &data) {
     std::string state;
     try {
-        state = data["state"].template get<std::string>();
+        state = data.at("state").template get<std::string>();
     } catch ( json::exception &e ) {
-        LOGF_ERROR("Roof state missing \"state\": %s\n%s", e.what(), response.c_str());
+        LOGF_ERROR("Roof state missing \"state\": %s", e.what());
         setDomeState(DOME_ERROR);
         return;
     }
@@ -929,29 +986,7 @@ void OMS::applyRoofState(bool ok, const std::string &response, const std::string
     }
 }
 
-void OMS::applySwitches(bool ok, const std::string &response, const std::string &error) {
-    if ( ! ok ) {
-        // Transport failure already gets a log line out of readURL() itself when it isn't
-        // quiet; the background poller passes its captured message through here instead
-        // (see applyRoofState()'s comment) - either way, nothing more useful to say here
-        // than leaving the last-known switch states in place.
-        if ( ! error.empty() ) {
-            LOGF_ERROR("%s", error.c_str());
-        }
-        return;
-    }
-
-    json data;
-    try {
-        data = json::parse(response);
-    } catch ( json::exception &e ) {
-        LOGF_ERROR("Switches JSON parse error: %s\n%s", e.what(), response.c_str());
-        return;
-    } catch (...) {
-        LOGF_ERROR("Unknown switches JSON parse error\n%s", response.c_str());
-        return;
-    }
-
+void OMS::applySwitches(const json &data) {
     for ( size_t i = 0; i < NUM_SWITCHES; i++ ) {
         const auto& sw = switchDevices[i];
         if ( ! data.contains(sw.id) ) {
@@ -1013,45 +1048,24 @@ void OMS::applySwitches(bool ok, const std::string &response, const std::string 
     }
 }
 
-void OMS::applyEnvironment(const std::string &response, const std::string &error) {
-    // response.empty(), not ok/error, is what says nothing came back: /api/v1/environment
-    // answers 503-with-a-body when the reading is merely stale (see its docstring), and
-    // request() leaves that body in response either way.
-    if ( response.empty() ) {
-        // Genuinely nothing came back (host unreachable, etc.), as opposed to the handled
-        // stale-503-with-a-body case above - surface it once, here, since the background
-        // poller that fetched it may not log directly (see applyRoofState()'s comment).
-        if ( ! error.empty() ) {
-            LOGF_ERROR("%s", error.c_str());
-        }
-        if ( environmentNP.s != IPS_ALERT ) {
-            environmentNP.s = IPS_ALERT;
-            IDSetNumber(&environmentNP, nullptr);
-        }
-        return;
-    }
-
-    json data;
-    try {
-        data = json::parse(response);
-    } catch ( json::exception &e ) {
-        LOGF_ERROR("Environment JSON parse error: %s\n%s", e.what(), response.c_str());
-        return;
-    } catch (...) {
-        LOGF_ERROR("Unknown environment JSON parse error\n%s", response.c_str());
-        return;
-    }
-
+void OMS::applyEnvironment(const json &data) {
+    // "stale" comes from OMS rather than being worked out here, and that is the point of
+    // reading it from /api/v1/status: the endpoints this replaced answered 503 once a
+    // reading was too old to act on, and the rule behind that (environmentStateMaxAge, and
+    // weather_refresh for the weather below) is the server's - it is the one that can see
+    // the settings it is derived from. Re-deriving it here would be a second copy of a
+    // rule that lives there, free to disagree with it.
     double temperature, humidity;
     bool stale;
     try {
-        temperature = data["inside_temperature"].template get<double>();
-        humidity = data["inside_humidity"].template get<double>();
+        const auto &reading = data.at("data");
+        temperature = reading.at("inside_temperature").template get<double>();
+        humidity = reading.at("inside_humidity").template get<double>();
         stale = data.value("stale", false);
     } catch ( json::exception &e ) {
-        // Also the "no reading yet" case: problem() answers {"error": ...}, with neither
-        // field present.
-        LOGF_ERROR("Error accessing environment fields: %s\n%s", e.what(), response.c_str());
+        // Also the "no reading yet" case: getEnvironment() has nothing to report until the
+        // board has answered once, and neither field is there.
+        LOGF_ERROR("Error accessing environment fields: %s", e.what());
         if ( environmentNP.s != IPS_ALERT ) {
             environmentNP.s = IPS_ALERT;
             IDSetNumber(&environmentNP, nullptr);
@@ -1063,6 +1077,68 @@ void OMS::applyEnvironment(const std::string &response, const std::string &error
     environmentN[1].value = humidity;
     environmentNP.s = stale ? IPS_ALERT : IPS_OK;
     IDSetNumber(&environmentNP, nullptr);
+}
+
+bool OMS::weatherUsable() const {
+    if ( ! m_weatherHave ) {
+        return false;
+    }
+    if ( m_weatherMaxAge <= 0.0 ) {
+        // An OMS that does not report the limit is one this driver cannot age a reading
+        // against, so it trusts the "stale" flag alone - which is what it did before the
+        // limit was reported at all.
+        return true;
+    }
+    const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m_weatherStamp).count();
+    return m_weatherAgeAtPoll + elapsed <= m_weatherMaxAge;
+}
+
+void OMS::applyWeather(const json &data) {
+    // Stored, not published. WeatherInterface owns the publishing and does it on its own
+    // timer by calling updateWeather(), which reads what this leaves here.
+    //
+    // "weather" is null until the station has been scraped once, and carries OMS's own
+    // verdict on the age once it has. Taking that verdict rather than working it out here
+    // is the point of reading this from /api/v1/status: the rule behind it is
+    // weather_refresh, a setting only the server can see, and a second copy of it in this
+    // driver would be free to disagree with the one that decides whether /api/v1/weather
+    // answers 200 or 503.
+    m_weatherHave = false;
+    if ( data.is_null() ) {
+        return;
+    }
+    try {
+        if ( data.value("stale", true) ) {
+            return;
+        }
+        m_weatherData = data.at("data");
+        m_weatherAgeAtPoll = data.value("age", 0.0);
+        m_weatherMaxAge = data.value("maxAge", 0.0);
+    } catch ( json::exception &e ) {
+        LOGF_ERROR("Error accessing weather fields: %s", e.what());
+        return;
+    }
+    m_weatherStamp = std::chrono::steady_clock::now();
+    m_weatherHave = true;
+}
+
+void OMS::publishWeatherIfChanged() {
+    const bool usable = weatherUsable();
+    if ( usable == m_weatherReported ) {
+        return;
+    }
+    if ( usable ) {
+        LOG_INFO("The weather station is reporting again.");
+    } else {
+        LOG_WARN("No usable weather reading from OMS; reporting the observatory unsafe.");
+    }
+    // Same reasoning as the rain interlock's re-run in applyRoofState(): this driver knows
+    // within one poll that the reading has aged out, and WeatherInterface would not say so
+    // until its own timer came round, up to WEATHER_UPDATE seconds later. A client deciding
+    // whether to keep observing should not have to wait out that gap for an answer this
+    // already has.
+    checkWeatherUpdate();
 }
 
 // --- HTTP --------------------------------------------------------------------------------
@@ -1165,13 +1241,13 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
-    if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, TIMEOUT) ) {
+    if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT) ) {
         curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl connect timeout: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
     }
 
-    if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT) ) {
+    if ( CURLE_OK != curl_easy_setopt(curl, CURLOPT_TIMEOUT, TRANSFER_TIMEOUT) ) {
         curl_easy_cleanup(curl);
         return fail(std::string("Could not set curl timeout: ") +
                 (strlen(curlErrorBuff) ? curlErrorBuff : "Unknown error"));
