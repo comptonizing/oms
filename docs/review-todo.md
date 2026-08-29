@@ -71,8 +71,9 @@ the second failure straight away rather than waiting out an interval that starte
 the recovery. Measured after: 2 lines in 70 s of a steadily absent sensor, and an
 immediate line after a recovery.
 
-**5. Typo: `"Could query URL"` → `"Could not query URL"`.** `oms.cpp:1269`
-**open**
+**5. Typo: `"Could query URL"`.** `oms.cpp`
+**done** — now `"Could not query URL"`. It is the message an operator sees on every failed
+request, and the one quoted in the report that started this review.
 
 **6. Stale comment.** `oms.cpp:1274`
 Still explains that `response` is set before the status check because

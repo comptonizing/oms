@@ -1318,7 +1318,7 @@ bool OMS::request(bool isPost, const std::string &url, std::string &response, bo
     curl_easy_cleanup(curl);
 
     if ( CURLE_OK != res ) {
-        return fail("Could query URL " + address + ": " +
+        return fail("Could not query URL " + address + ": " +
                 (strlen(curlErrorBuff) ? curlErrorBuff : curl_easy_strerror(res)));
     }
 
