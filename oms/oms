@@ -4547,9 +4547,54 @@ def main():
 
     settings = {}
 
+    # The tab the plots live on, named once rather than spelled out at the ui.tab() call
+    # and again at every place that asks whether the plots are on screen.
+    WEATHER_TAB = "Weather"
+
+    def plotsVisible():
+        """Whether the tab the plots are on is the one being looked at.
+
+        The plots are the most expensive thing this page does -- fifteen queries and five
+        figure serializations a pass, and the serialization is synchronous work on the
+        event loop the API is answered from. Measured against the observatory's own OMS:
+        with the page closed, 206 consecutive API samples came back in under 21ms; with it
+        open on any tab, a stall of 200ms to 2.9s appeared on the plot interval, every
+        time, whether or not the roof was moving.
+
+        None of that work is worth doing for a tab nobody is looking at. Cheap to ask, and
+        the answer changes only when the operator clicks.
+
+        ui.tabs is a ValueElement[str | Tab | TabPanel | None], so its value is whatever
+        was last assigned to it: a name when the client reports a click or when set_value()
+        is given one, but the element itself if somebody ever passes a ui.tab. Converted
+        the way NiceGUI converts it internally rather than compared as a string, because a
+        comparison that is merely usually right would fail silently here -- the plots would
+        simply stop refreshing, with nothing to say why.
+        """
+        value = tabs.value
+        if hasattr(value, "props"):
+            value = value.props.get("name")
+        return value == WEATHER_TAB
+
     def onTabChange(e):
         header_label.set_text(e.value)
         drawer.hide()
+        # plotsVisible() rather than e.value, so the one conversion lives in one place.
+        # ValueElement assigns self.value before it calls this, so the answer is already
+        # about the tab being arrived at.
+        if plotsVisible():
+            # Arriving at the tab is the gesture that asks for the plots, so this is where
+            # the pass the timer has been skipping gets run. Superseding, like the range
+            # selector and unlike the timer: it is a person asking for something other
+            # than what is on screen.
+            spawn(updatePlots())
+        else:
+            # Leaving takes effect at once rather than after the pass in flight finishes
+            # painting a tab nobody is on. It matters because switching away is what an
+            # operator does when the page feels heavy, and the remaining figure pushes are
+            # the heavy part. Half-drawn figures are not a problem: coming back runs a
+            # fresh pass through the branch above.
+            cancelPlots()
 
     # How long to let the loop breathe after pushing a figure to the browser. Five pushes
     # per pass, so this is the entire cost of being polite now that the per-query sleeps
@@ -4892,7 +4937,7 @@ def main():
         ui.button(icon='close', on_click=drawer.hide).props('flat round')
         with ui.tabs(on_change=onTabChange).props("vertical") as tabs:
             tab_status = ui.tab("Status")
-            tab_weather = ui.tab("Weather")
+            tab_weather = ui.tab(WEATHER_TAB)
             tab_log = ui.tab("Log")
             tab_settings = ui.tab("Settings")
 
@@ -5832,7 +5877,16 @@ def main():
         figures rather than raising. Anything that does escape it lands in asyncio's
         handler, the same way it already does for the two spawn(updatePlots()) callers
         below.
+
+        Skipped outright while the plots are not on screen, which is the cheapest possible
+        version of the pass and the usual case: this page is normally left on Status. The
+        timer is left running rather than started and stopped with the tab, so there is one
+        place that decides and no state to get out of step -- and onTabChange() runs a pass
+        on the way in, so arriving at the tab does not mean waiting out an interval to see
+        anything.
         """
+        if not plotsVisible():
+            return
         spawn(updatePlots(supersede=False))
 
     def cancelPlots():
@@ -6272,7 +6326,10 @@ def main():
         updateRoofStaleness()
         # A database entered (or cleared) just now changes what the plots should say, and
         # they would otherwise keep the old message until their next tick a minute away.
-        spawn(updatePlots())
+        # Only worth doing if they are being looked at; a save is made from the Settings
+        # tab, so normally they are not, and the pass runs when the operator goes to see.
+        if plotsVisible():
+            spawn(updatePlots())
 
 
     def onConnect():
@@ -6294,11 +6351,18 @@ def main():
         # once the timestamp is zeroed, and updateRoofIcons handles None.
         updateRoofIcons(getRoofState()[0])
         updateRoofStaleness()
-        # Drawn once here rather than left blank until the first timer tick, which is a
-        # whole plot interval away -- a minute of empty plots on a page that has just
-        # loaded looks like a fault. Cheap to do: a pass this early is the only one
-        # running, and a range change moments later simply cancels it.
-        spawn(updatePlots())
+        # Not drawn on connect any more. The page loads on Status (see the set_value at
+        # the end of this function), so this pass was fifteen queries and five figure
+        # pushes for plots behind another tab -- and it was the most expensive moment of
+        # the whole session, because it lands while the rest of the page is still being
+        # built. It measured 2.9s of blocked event loop on the observatory's OMS, the
+        # single worst API sample of a 1005-sample run.
+        #
+        # What it was for still holds -- blank plots on arrival look like a fault -- but
+        # onTabChange() is the better place for it: the plots are drawn when somebody goes
+        # to look at them, which is the first moment they can be seen at all.
+        if plotsVisible():
+            spawn(updatePlots())
         updateCallbacks[ui.context.client.id] = update
     ui.context.client.on_connect(onConnect)
 
