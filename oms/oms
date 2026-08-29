@@ -1979,6 +1979,11 @@ rainOverride = False
 # atomic under the GIL, exactly as lastFanChange.
 lastRainCloseRequest = 0.0
 
+# When the disengaged-and-raining warning was last said. Same writer, same atomicity, and
+# the same interval as the close retry below: it is a condition that persists, so saying it
+# every weather pass would bury it in its own repetitions.
+lastRainDisengagedWarning = 0.0
+
 # Long enough that a close which was accepted has had its whole travel to finish: one half's
 # travel budget alone starts at 60s, so a re-ask inside that would be made about a roof that
 # is still shutting perfectly well. Short enough that a roof which *cannot* close -- latched
@@ -2177,6 +2182,41 @@ def setRainOverride(override: bool):
     triggerEvent("rainOverride", override)
     return True
 
+def warnDisengagedInTheRain():
+    """Says that a disengaged roof is standing open in the rain, about once a minute.
+
+    Everything here is reporting: it commands nothing, and it must not. See
+    enforceRainInterlock(), which is where the reasoning for that lives.
+
+    Judged on rainReason() rather than rainInterlockReason(), so an override does not
+    silence it. The two switches mean different things and neither means "stop telling me
+    what the weather is doing": an override says OMS may not close the roof on rain, a
+    disengage says OMS may not touch the roof at all. Somebody who has set both, over a
+    roof standing open in the rain, is the one who most needs the reminder.
+
+    Silent on a roof that is already shut, which is most disengaged roofs: there is nothing
+    to warn about, and a disengage left set for weeks over a closed roof would otherwise
+    warn for weeks.
+    """
+    global lastRainDisengagedWarning
+    reason = rainReason()
+    if reason is None:
+        lastRainDisengagedWarning = 0.0
+        return
+    state, _ = roofDecisiveState()
+    if state is RoofStatus.CLOSED:
+        lastRainDisengagedWarning = 0.0
+        return
+    now = time.monotonic()
+    if (lastRainDisengagedWarning != 0.0
+            and now - lastRainDisengagedWarning < rainCloseRetryInterval):
+        return
+    lastRainDisengagedWarning = now
+    message = ("The roof is disengaged and not closed while {} -- OMS will not close it "
+               "until it is engaged again".format(reason))
+    logger.warning(message)
+    triggerEvent("warning", message)
+
 def enforceRainInterlock():
     """Closes the roof if the station is reporting rain. Runs on the weather thread.
 
@@ -2190,15 +2230,25 @@ def enforceRainInterlock():
     the operator once per weather pass, and somebody who has disengaged to work on the
     hardware has said that OMS is to keep its hands off the roof. Rain does not revoke
     that: a roof with somebody standing at it is not one to drive shut underneath them.
+
+    It does say so, though. A disengage is a deliberate act with a person behind it, and
+    the risk in it is not the rule but forgetting: a roof left open and disengaged while it
+    rains is a decision nobody is making any more. So the one thing that happens on that
+    path is that OMS keeps saying it, rather than having said it once at the disengage and
+    then gone quiet.
     """
-    global lastRainCloseRequest
+    global lastRainCloseRequest, lastRainDisengagedWarning
     if roofUnavailableReason() is not None:
         # Nothing would execute the command, and the state that follows is not worth
         # reasoning about. Deliberately without touching the retry stamp: this says nothing
         # about whether an earlier ask was carried out.
         return
     if not roofEngaged:
+        warnDisengagedInTheRain()
         return
+    # Nothing to warn about while OMS is minding the roof: from here on it either has no
+    # reason to act, or it acts.
+    lastRainDisengagedWarning = 0.0
     reason = rainInterlockReason()
     state, _ = roofDecisiveState()
     if reason is None or state in (RoofStatus.CLOSED, RoofStatus.CLOSING):
