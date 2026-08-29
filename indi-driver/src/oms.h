@@ -93,12 +93,16 @@ static const weatherData parameters[] = {
     weatherData {"env_humidity", "WEATHER_HUMIDITY", "Humidity (%)", 0, 100, 15, false},
     weatherData {"env_dewpoint", "WEATHER_DEWPOINT", "Dewpoint (C)", -20, 40, 15, false},
     weatherData {"rain_percentage", "WEATHER_RAIN_PERCENTAGE", "Rain (%)", 0, 5, 15, true},
-    // The ceiling here is a bound on the *possible*, not on the acceptable: more mpsas is
-    // a darker sky, which is the condition this observatory is for, and the old 23 called
-    // anything better than 21.8 a warning and anything better than 23 an alert. The
-    // darkest natural night sky is around 22, so 30 cannot be reached; what is left is the
-    // floor, where a bright sky really does mean daylight or moon.
-    weatherData {"sqm_mpsas", "WEATHER_SQM_MPSAS", "SQM (mpsas)", 12, 30, 5, true},
+    // Reported, not judged. Sky brightness says whether the night is worth observing, not
+    // whether the observatory is in danger, and the critical parameters are the ones a
+    // client shuts the observatory down over: a bright sky is dawn or the moon, and Ekos
+    // already keeps jobs off both through the scheduler's twilight and moon-separation
+    // constraints, which know where the sun and the moon actually are rather than
+    // inferring it from one number. Left non-critical so it cannot abort a job or park the
+    // roof - the ceiling below is only a bound on the possible (the darkest natural sky is
+    // around 22, so 30 cannot be reached) and, with nothing critical reading it, the range
+    // now only bounds how the value is displayed.
+    weatherData {"sqm_mpsas", "WEATHER_SQM_MPSAS", "SQM (mpsas)", 12, 30, 5, false},
     weatherData {"wind_speed", "WEATHER_WIND_SPEED", "Wind (km/h)", 0, 20, 15, true},
     weatherData {"wind_gust", "WEATHER_WIND_GUST", "Gust (km/h)", 0, 40, 15, true},
     weatherData {"ir_sky", "WEATHER_IR_SKY", "Sky IR (C)", -30, -15, 15, false},
