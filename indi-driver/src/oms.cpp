@@ -994,7 +994,13 @@ void OMS::applySwitches(const json &data) {
         }
         std::string apiState;
         try {
-            apiState = data[sw.id]["state"].template get<std::string>();
+            // at(), not operator[]. This is a const json &, and nlohmann's const
+            // operator[] does not throw on a missing key - it asserts, and the driver is
+            // not built with NDEBUG, so a switch reported without a "state" would abort
+            // the process rather than raise something this catch could handle. at() is
+            // what the rest of this file uses on a key it has not already tested with
+            // contains(), and it throws.
+            apiState = data.at(sw.id).at("state").template get<std::string>();
         } catch ( json::exception &e ) {
             continue;
         }
