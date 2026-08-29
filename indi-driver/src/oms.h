@@ -130,6 +130,12 @@ static const switchData switchDevices[] = {
 static constexpr size_t NUM_SWITCHES = sizeof(switchDevices) / sizeof(switchDevices[0]);
 static constexpr const char *FAN_ID = "fans";
 
+// A twelfth critical weather parameter, and the only one that is not a reading from the
+// station: 1 while OMS is holding the roof shut on its own rain interlock, 0 otherwise.
+// See initProperties() for why it is registered without a range, and applyRoofState() for
+// where the value comes from.
+static constexpr const char *ROOF_HELD_PARAM = "WEATHER_ROOF_HELD";
+
 // The board and relay detail roofDetail() (see apiv1.py) reports each tick, beyond the
 // six-word summary pollRoofState() already reduces "state" to. All read-only: nothing here
 // is a command, it is what the state machine used to decide the six-word summary.
@@ -283,6 +289,13 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         void applyEnvironment(const std::string &response, const std::string &error);
         int parsePort(const char *str);
         void markUnsafe();
+
+        // 1:1 with rain.holdingClosed from /api/v1/roof: whether OMS is refusing to open
+        // the roof because its own rain interlock says so. Written by applyRoofState() and
+        // read by updateWeather(), both of which run on the main thread only (TimerHit()
+        // and WeatherInterface's update timer are the same event loop), so unlike the poll
+        // snapshot above this needs no lock.
+        bool m_roofHeldShut = false;
 
         std::string m_url = "";
         // Guards m_url: ISNewText() writes it from the main thread, request() reads it

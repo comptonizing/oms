@@ -180,6 +180,17 @@ bool OMS::initProperties() {
         setCriticalParameter(v.name);
     }
 
+    // Registered with minOK == maxOK == 0, which is not a degenerate range but a documented
+    // second mode of addParameter(): it creates no WEATHER_ROOF_HELD range property at all,
+    // and checkParameterState() then reports a parameter with no range as danger whenever
+    // its value is non-zero (see indiweatherinterface.cpp). That is exactly the semantics
+    // wanted - the value is a flag, not a measurement, so there is no threshold to pick -
+    // and it has the property none of the readings above have: there is nothing on the
+    // Weather tab for an operator to widen, and nothing saved to the driver config that
+    // could come back wrong. OMS's interlock cannot be talked out of by INDI configuration.
+    addParameter(ROOF_HELD_PARAM, "Roof held shut", 0, 0, 0);
+    setCriticalParameter(ROOF_HELD_PARAM);
+
     // Dome::initProperties() already calls addDebugControl() and sets DOME_INTERFACE;
     // add Configuration ourselves and fold WEATHER_INTERFACE into what Dome just set.
     addConfigurationControl();
@@ -352,6 +363,17 @@ IPState OMS::updateWeather() {
         }
         setParameterValue(v.name, value);
     }
+
+    // Folded in here, as one more critical parameter, rather than forced onto the light
+    // after the fact. syncCriticalParameters() recomputes the whole of WEATHER_STATUS from
+    // these values every time the weather updates, so anything applied on top of it would
+    // be undone on the next tick - and a WEATHER_STATUS that goes green for even one tick
+    // is not a cosmetic problem here. Ekos reads a green tick during a weather shutdown as
+    // "Safety has improved", wakes the scheduler, and runs the startup procedure, whose
+    // first act is to unpark the dome: the roof-open attempt this parameter exists to
+    // prevent. Reading the flag rather than fetching it keeps this off the roof endpoint;
+    // applyRoofState() has it fresh from the poll thread within ROOF_POLL_MS.
+    setParameterValue(ROOF_HELD_PARAM, m_roofHeldShut ? 1.0 : 0.0);
 
     if ( ret == IPS_ALERT ) {
         markUnsafe();
@@ -670,6 +692,56 @@ void OMS::applyRoofState(bool ok, const std::string &response, const std::string
             }
         } catch ( json::exception &e ) {
         }
+    }
+
+    // OMS's rain interlock. rainInterlockReason() in oms/oms is what actually decides
+    // whether the roof may open - the buttons, the API and the automatic close all arrive
+    // at it - so mirroring it here is what keeps WEATHER_STATUS reporting OMS's own
+    // decision instead of a second opinion. The two used to be able to disagree: the
+    // thresholds on the Weather tab are configured separately from roof_rain_threshold,
+    // and when they said "clear" while OMS was holding the roof shut, nothing told Ekos to
+    // stop - no client watches a dome for parking itself, so a running job would carry on
+    // exposing at a closed roof, abort on a failed solve, and come back round to the
+    // startup procedure to ask for the roof again.
+    //
+    // A reply with no usable "rain" block leaves this false rather than latching the alert
+    // on. An OMS that does not report the interlock is one this driver can only judge by
+    // WEATHER_RAIN_PERCENTAGE, which is what it did before this existed; a reply that does
+    // not arrive at all returned above, keeping the last known answer, and takes the
+    // weather endpoint on the same server down with it, which markUnsafe()s anyway.
+    bool held = false;
+    std::string heldReason;
+    if ( data.contains("rain") && ! data["rain"].is_null() ) {
+        const auto &rain = data["rain"];
+        try {
+            held = rain.at("holdingClosed").template get<bool>();
+        } catch ( json::exception &e ) {
+            held = false;
+        }
+        if ( held && rain.contains("reason") && ! rain["reason"].is_null() ) {
+            try {
+                heldReason = rain.at("reason").template get<std::string>();
+            } catch ( json::exception &e ) {
+                heldReason = "";
+            }
+        }
+    }
+    if ( held != m_roofHeldShut ) {
+        m_roofHeldShut = held;
+        if ( held ) {
+            LOGF_WARN("OMS is holding the roof shut: %s. Reporting the observatory unsafe.",
+                    heldReason.empty() ? "rain interlock" : heldReason.c_str());
+        } else {
+            LOG_INFO("OMS has released the roof: the rain interlock is no longer holding it shut.");
+        }
+        // WeatherInterface recomputes the light on its own update timer, which is up to
+        // WEATHER_UPDATE seconds away - too late to be worth much to a client deciding
+        // whether to keep observing, and far behind the two seconds it took this poll to
+        // notice. Re-run the update here, on the transition only, so the light follows the
+        // interlock at roof-poll speed rather than weather-poll speed. A no-op on the
+        // priming call from Connect(), where isConnected() is still false: WI's own
+        // updateProperties() runs the first update a moment later regardless.
+        checkWeatherUpdate();
     }
 
     // "motion" is always present, unlike the detail below - roofDetail() sets it before
