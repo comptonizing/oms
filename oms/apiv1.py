@@ -475,6 +475,18 @@ async def setSwitch(name: str, state: str):
 
 # --- weather and environment --------------------------------------------------------
 
+def weatherMaxAge():
+    """How old a weather reading may be before it counts as stale.
+
+    Three refresh periods, so a station that misses a scrape or two is not called stale for
+    it. Written once and read by both the endpoints that judge the age -- /weather, which
+    answers 503 past it, and /status, which reports it -- because two copies of a rule this
+    small is exactly how they come to disagree, and a client that polls one and trusts the
+    other would then be told the reading is current and stale at the same time.
+    """
+    return oms.numericSetting("weather_refresh", 5) * 3
+
+
 @app.get(__base + "weather")
 async def weather():
     """The weather station's own last reading, served from OMS's cache.
@@ -497,7 +509,7 @@ async def weather():
     payload, age = oms.getWeatherCache()
     if payload is None or age is None:
         return problem("No weather data has been fetched yet")
-    maxAge = oms.numericSetting("weather_refresh", 5) * 3
+    maxAge = weatherMaxAge()
     if age > maxAge:
         return problem("The weather data is {:.0f}s old (limit {:.0f}s)".format(age, maxAge))
     return JSONResponse(content=jsonSafe(payload), status_code=status.OK)
@@ -544,15 +556,27 @@ async def overallStatus():
         return down
     payload, weatherAge = oms.getWeatherCache()
     data, environmentAge = oms.getEnvironment()
+    # stale and maxAge alongside the age, for both readings and on the same terms roof
+    # already reports them. Without them this endpoint is not a substitute for the ones it
+    # aggregates: /weather and /environment answer 503 once a reading is too old to act on,
+    # and that verdict is the server's to make -- it is the one that knows weather_refresh
+    # and environmentStateMaxAge. A client given only the age would have to re-derive both,
+    # which is a second copy of a rule that lives here, in a process that cannot see the
+    # settings it is derived from.
+    weatherLimit = weatherMaxAge()
     return JSONResponse(content=jsonSafe({
             "roof": roofDetail(),
             "switches": {name: switchDetail(name) for name in switchNames()},
             "weather": None if payload is None else {
                 "age": None if weatherAge is None else round(weatherAge, 2),
+                "stale": weatherAge is None or weatherAge > weatherLimit,
+                "maxAge": weatherLimit,
                 "data": payload,
                 },
             "environment": {
                 "age": None if environmentAge is None else round(environmentAge, 2),
+                "stale": environmentAge is None or environmentAge > oms.environmentStateMaxAge,
+                "maxAge": oms.environmentStateMaxAge,
                 "data": data,
                 },
             }), status_code=status.OK)
