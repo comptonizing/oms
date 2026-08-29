@@ -203,6 +203,7 @@ def roofDetail():
     # ignores the override on purpose, for the same reason the UI shows both.
     interlock = oms.rainInterlockReason()
     detected = oms.rainReason()
+    refused = oms.rainOpenRefusalReason()
     detail["rain"] = {
             "reading": oms.rainReading(),
             "threshold": oms.numericSetting("roof_rain_threshold", oms.rainThresholdDefault),
@@ -211,6 +212,13 @@ def roofDetail():
             "override": oms.rainOverrideActive(),
             "holdingClosed": interlock is not None,
             "reason": interlock,
+            # Reported next to holdingClosed rather than folded into it, because they are
+            # different claims and a client acting on them differs. holdingClosed says the
+            # roof is being kept shut and would be shut again if it opened; openRefused
+            # says only that no open will be accepted -- which is also true whenever the
+            # station has stopped reporting, a case in which nothing is being held at all.
+            "openRefused": refused is not None,
+            "openRefusedReason": refused,
             }
     motion = oms.roofMotion
     detail["motion"] = {
@@ -308,7 +316,7 @@ async def roofCommand(command: str):
         # roof that makes it impossible, and it will succeed once the motion ends.
         return problem("The roof is moving; stop it first", status.CONFLICT)
     if command == "open":
-        held = oms.rainInterlockReason()
+        held = oms.rainOpenRefusalReason()
         if held is not None:
             # Answered here as well as refused in requestRoofMotion(), which is the guard.
             # This exists so the caller gets 409 and the reason rather than the flat 503 the

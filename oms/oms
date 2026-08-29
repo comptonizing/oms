@@ -2109,6 +2109,36 @@ def rainInterlockReason():
         return None
     return rainReason()
 
+def rainOpenRefusalReason():
+    """Why the roof may not be opened on the rain interlock's account, or None.
+
+    Wider than rainInterlockReason(), and only on the opening side. That one answers "must
+    the roof be shut", and it says no when there is no usable reading -- rainReason()'s
+    asymmetry, which is deliberate and stays: a station that has stopped answering is not
+    grounds to slam a roof that is already open, and Ekos is told the observatory is unsafe
+    by the driver in that case anyway.
+
+    Opening is the other question, and it deserves the other answer. There is no state in
+    which OMS knows less about the weather than one where the station is not reporting, and
+    committing the roof to open is exactly the thing not to do while knowing nothing. So an
+    absent reading refuses an open while never causing a close.
+
+    The override still lifts it, and that is the whole design rather than a loophole: it is
+    the operator saying they have looked outside themselves, which is the only thing that
+    can substitute for a station that is not talking. It is a switch on the page for the
+    reason roof_rain_threshold's comment gives -- an interlock disabled by a setting looks
+    identical to one that is armed.
+    """
+    held = rainInterlockReason()
+    if held is not None:
+        return held
+    if rainOverride:
+        return None
+    if rainReading() is None:
+        return ("the weather station is not reporting a usable rain reading, so there is "
+                "nothing to judge the weather on")
+    return None
+
 def rainOverrideActive():
     """Whether the rain interlock has been switched off by hand.
 
@@ -3418,7 +3448,7 @@ def requestRoofMotion(action):
         triggerEvent("roofMotionError", reason)
         return False
     if action == "open":
-        held = rainInterlockReason()
+        held = rainOpenRefusalReason()
         if held is not None:
             # The second half of the interlock, and the half that is actually load bearing.
             # Closing the roof on rain is worth little if anything can open it again a
@@ -5179,7 +5209,12 @@ def main():
         # deeper down is a control that lies about what it will do -- the refusal in
         # requestRoofMotion() is what enforces the rule, this is what tells the operator.
         rainHeld = rainInterlockReason()
-        roof_open_button.set_enabled(not blocked and roofEngaged and rainHeld is None)
+        # The button answers the open question, so it asks the open question. The label
+        # below still separates the two cases, because "held closed because it is raining"
+        # and "not opening because nobody knows whether it is" are different situations to
+        # be in and the operator's next move differs.
+        openRefused = rainOpenRefusalReason()
+        roof_open_button.set_enabled(not blocked and roofEngaged and openRefused is None)
         roof_engage_button.set_enabled(not blocked)
         # Disabled while a motion runs, exactly as the engage button is. Overriding the
         # interlock mid-close would not stop that close in any case -- setRainOverride()
@@ -5195,6 +5230,14 @@ def main():
         elif rainHeld is not None:
             roof_rain_label.set_text("Held closed: {}".format(rainHeld))
             roof_rain_label.classes("text-sm text-center text-red-500",
+                                    remove=roof_rain_label_colors)
+            roof_rain_label.set_visibility(True)
+        elif openRefused is not None:
+            # Amber rather than red, and worded as a refusal to open rather than as a hold:
+            # the roof is not being shut, it is being left where it is until somebody can
+            # say what the weather is doing.
+            roof_rain_label.set_text("Will not open: {}".format(openRefused))
+            roof_rain_label.classes("text-sm text-center text-orange-400",
                                     remove=roof_rain_label_colors)
             roof_rain_label.set_visibility(True)
         else:
@@ -6890,6 +6933,7 @@ apiv1.bind(
         # separately -- an override is only legible next to what it is overriding.
         rainReason=rainReason,
         rainInterlockReason=rainInterlockReason,
+        rainOpenRefusalReason=rainOpenRefusalReason,
         rainOverrideActive=rainOverrideActive,
         setRainOverride=setRainOverride,
         rainReading=rainReading,
