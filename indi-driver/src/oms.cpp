@@ -220,6 +220,39 @@ bool OMS::updateProperties() {
         defineProperty(&faultReasonTP);
         defineProperty(&motionPhaseTP);
         defineProperty(&environmentNP);
+
+        // Re-send the roof's park state now that ParkSP has been defined to the client.
+        //
+        // Connect() primes the roof state before this runs, and has to: Park()/UnPark()
+        // read m_DomeState to decide whether there is anything to do, so a command arriving
+        // before the first TimerHit() would see a roof that is still DOME_UNKNOWN (see
+        // there). But updateProperties() is what defines ParkSP to the client, so the
+        // apply() that priming triggers goes out as a setSwitchVector for a property this
+        // client has not been sent a defSwitchVector for yet - and a client drops a set for
+        // a property it does not know about.
+        //
+        // The def that follows a moment later carries the right value, so the INDI Control
+        // Panel shows the roof correctly and nothing looked wrong. Ekos is where it hurt:
+        // ISD::Dome tracks park status in processSwitch(), which runs for set-events only,
+        // while registerProperty() takes nothing from a def but the fact that the dome can
+        // park. With no set to act on, Ekos held the roof at PARK_UNKNOWN for the whole
+        // session - and SchedulerProcess::isDomeParked() answers PARK_UNKNOWN with false,
+        // so a closed roof read as not parked, and unParkDome() would ask an already open
+        // one to open again.
+        //
+        // One apply() after the def fixes it, and re-applying a value the def already
+        // carried costs a client nothing. The other polled properties need no equivalent:
+        // their defs carry the primed values too, and nothing derives state from their sets
+        // the way ISD::Dome does from this one.
+        //
+        // It does not, on its own, put the roof's state into Ekos's Observatory tab. That
+        // field is set to "N/A" for any roll-off roof in Observatory::setDome(), which runs
+        // once the device is connected and ready - by which time everything here has
+        // already settled - and it is only ever repainted from a *change* signal
+        // afterwards. KStars initialises it from the current position for a dome with an
+        // azimuth but has no equivalent for a roof, so it reads N/A until the roof first
+        // moves. Nothing this driver publishes changes that.
+        ParkSP.apply();
     } else {
         deleteProperty(engageSP.name);
         deleteProperty(faultClearSP.name);
