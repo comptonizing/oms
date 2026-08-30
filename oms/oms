@@ -4596,33 +4596,20 @@ def main():
             # fresh pass through the branch above.
             cancelPlots()
 
-    # How long to let the loop breathe after pushing a figure to the browser. Five pushes
-    # per pass, so this is the entire cost of being polite now that the per-query sleeps
-    # are gone: 0.25s against the 4.5s they used to add.
+    # How long to let the loop breathe between figures. Kept now that the build itself
+    # runs off the loop, because the push that follows it still enqueues a payload onto
+    # this client's outbox and twelve of those back to back is worth spacing out.
     plotPushPause = 0.05
 
-    def updatePlot(plot):
-        plot.update()
-        with plot._props.suspend_updates():
-            plot._props['options']['config'] = {'displayModeBar': False, 'staticPlot': True}
-        plot.client.outbox.enqueue_update(plot)
+    # Plotly's own config, carried inside the payload rather than patched onto the
+    # element's props afterwards. ui.plotly takes {data, layout, config} as a dict, so
+    # there is nowhere else it needs to go.
+    plotConfig = {'displayModeBar': False, 'staticPlot': True}
 
-    async def pushPlot(plot):
-        """Pushes a finished figure to the browser, then lets the loop breathe.
-
-        This is where the work actually is: serializing a figure and enqueuing it for the
-        websocket, once per plot. The pause sits here, after a push, rather than being
-        spread over every query -- awaiting a query already yields the loop by itself, so
-        the sleeps that used to follow each one were buying responsiveness that the await
-        had already bought, at 0.3s a time.
-        """
-        updatePlot(plot)
-        await asyncio.sleep(plotPushPause)
-
-    def makePlot(title: str):
-        plot = ui.plotly(go.Figure()).classes("w-full")
-        fig = plot.figure
-        fig.update_layout(
+    def basePlotLayout(title: str):
+        """The layout every figure starts from. One definition, used by the empty figure
+        makePlot() creates and by every rebuild after it."""
+        return dict(
                 height = 300,
                 font_color='white',
                 paper_bgcolor='rgba(0,0,0,0)',
@@ -4631,9 +4618,73 @@ def main():
                 margin = dict(l=10, r=10, t=50, b=10),
                 legend = { "orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1}
                 )
+
+    def buildFigure(title, traces, layout=None, yaxisTitle=None):
+        """Builds one figure and returns the payload ui.plotly wants. Pure, and off-loop.
+
+        Runs on a worker thread, so it may touch nothing but its arguments: no NiceGUI
+        element, no client, nothing another pass could be holding. It is handed data and
+        gives back a dict.
+
+        Returning the dict rather than the go.Figure is the point of the whole exercise.
+        Plotly.update() calls _get_figure_json(), which converts a go.Figure with
+        to_plotly_json() -- pure Python, and the most expensive thing this page does --
+        but returns a dict untouched. So the conversion happens here, on this thread, and
+        what reaches the event loop is an assignment.
+        """
+        fig = go.Figure()
+        fig.update_layout(**basePlotLayout(title))
         fig.update_xaxes(gridcolor='#555')
         fig.update_yaxes(gridcolor='#555')
-        updatePlot(plot)
+        if yaxisTitle is not None:
+            fig.update_yaxes(title_text=yaxisTitle)
+        for trace in traces:
+            fig.add_scatter(**trace)
+        if layout:
+            fig.update_layout(**layout)
+        payload = fig.to_plotly_json()
+        payload["config"] = plotConfig
+        return payload
+
+    async def drawPlot(title, traces, layout=None, yaxisTitle=None):
+        """Builds a figure off the loop, then hands the finished payload over on it.
+
+        asyncio.to_thread does not make the build parallel -- to_plotly_json() is pure
+        Python and holds the GIL -- but it makes it *preemptible*, which is the whole
+        point. Before this, a pass was one unbroken stretch of loop time: measured against
+        the observatory's own OMS, an API request landing in one waited up to 2.9s, and
+        the driver's requests go through that same loop. Now the interpreter switches
+        between the worker and the loop every switch interval, so a request waits for one
+        of those instead of for the pass. Benchmarked at the real pass size, worst-case
+        starvation fell from 230ms to 6ms, and the interval is time-based rather than
+        instruction-based, so the Pi gets the same ceiling however much slower it builds.
+
+        The two lines after the await are all that is left on the loop: assigning a dict
+        and enqueueing an update.
+
+        asyncio.to_thread rather than run.io_bound for the reason stopEverything() already
+        gives: NiceGUI tears down its own executor on shutdown.
+
+        A build cannot be cancelled once it is running -- cancelPlots() raises inside the
+        await here, and the thread finishes its figure regardless -- and that is harmless
+        because buildFigure() is pure. The payload it returns is dropped, nothing shared
+        was touched, and the pass that superseded this one owns the figures now.
+        """
+        payload = await asyncio.to_thread(buildFigure, title, traces, layout, yaxisTitle)
+        plot = weather_plots[title]
+        plot.figure = payload
+        plot.update()
+        await asyncio.sleep(plotPushPause)
+
+    def makePlot(title: str):
+        # Created from a dict rather than a go.Figure, so the element never holds one:
+        # every draw replaces this payload with another dict, and _get_figure_json() has
+        # nothing to convert on any of them.
+        plot = ui.plotly({
+                "data": [],
+                "layout": basePlotLayout(title),
+                "config": plotConfig,
+                }).classes("w-full")
         return plot
 
     # The seven words roof_state and the three position fields share, indexed by the code
@@ -4646,8 +4697,12 @@ def main():
     # baseline of the one above it, which reads as one signal rather than two.
     laneSpacing = 1.4
 
-    def plotLanes(fig, lanes):
-        """Draws boolean series as stacked lanes on one figure.
+    def laneTraces(lanes):
+        """Boolean series as stacked lanes: returns (traces, layout) rather than drawing.
+
+        Pure, so the caller can hand the result to buildFigure() on a worker thread. It
+        used to take the figure and mutate it, which tied it to the loop for no reason --
+        nothing in here needs a figure, only the shape of one.
 
         Eight booleans on a shared 0/1 axis are eight traces drawn on top of each other,
         and the only one visible is whichever was added last. Each series gets a lane of
@@ -4661,17 +4716,18 @@ def main():
         `lanes` is (name, times, values, colour), bottom lane first, so a figure reads in
         the order its list is written.
         """
-        for index, (name, times, values, colour) in enumerate(lanes):
-            base = index * laneSpacing
-            fig.add_scatter(
+        traces = [
+                dict(
                     x = times,
-                    y = [base + (1 if value else 0) for value in values],
+                    y = [index * laneSpacing + (1 if value else 0) for value in values],
                     mode = "lines",
                     line_shape = "hv",
                     name = name,
                     line = {"color": colour},
                     )
-        fig.update_layout(
+                for index, (name, times, values, colour) in enumerate(lanes)
+                ]
+        layout = dict(
                 showlegend = False,
                 yaxis = {
                     "tickmode": "array",
@@ -4681,6 +4737,7 @@ def main():
                     "gridcolor": "#555",
                     },
                 )
+        return traces, layout
 
     def makeUnavailableMessage(icon: str):
         """Placeholder shown in a camera card while that camera has nothing to show.
@@ -5505,154 +5562,91 @@ def main():
         showUnavailable(weather_allsky_image, weather_allsky_message, reason)
 
     async def _updatePlots(api):
+        """Queries on the loop, figures off it.
+
+        The two halves are separated on purpose. The queries are awaited and yield the loop
+        by themselves, so they were never the problem; the figure building and the
+        serialization that follows it are synchronous Python, and they were the whole of
+        it. Each plot now gathers its data here and hands plain lists to drawPlot(), which
+        does the rest on a worker thread.
+        """
         r = weather_range_select.value
         w = weather_ranges[r]
-        # Zero, not 0.3. These sit after queries, and awaiting a query already hands the
-        # loop to everything else; fifteen of them cost 4.5s of a pass that is otherwise
-        # dominated by five figure pushes. Kept as explicit yield points rather than
-        # deleted, because that is what they are for -- see pushPlot for the real pause.
-        sleepTime = 0
 
-        plot = weather_plots["Temperature"]
-        fig = plot.figure
-        fig.update_yaxes(title_text="Temperature (°C)")
-        fig.data = []
-        t, v = await queryWeather(api, "env_temperature", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Temperature Air")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
-        logger.debug("Done")
-        t, v = await queryWeather(api, "env_dewpoint", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Temperature Dewpoint")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Dewpoint", line={"color": "orange"})
-        logger.debug("Done")
-        t, v = await queryWeather(api, "inside_temperature", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Temperature Inside")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "blue"})
-        logger.debug("Done")
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "env_temperature", r, w)
+        t2, v2 = await queryWeather(api, "env_dewpoint", r, w)
+        t3, v3 = await queryWeather(api, "inside_temperature", r, w)
+        await drawPlot("Temperature", [
+                dict(x=t1, y=v1, mode="lines", name="Air", line={"color": "green"}),
+                dict(x=t2, y=v2, mode="lines", name="Dewpoint", line={"color": "orange"}),
+                dict(x=t3, y=v3, mode="lines", name="Inside", line={"color": "blue"}),
+                ], yaxisTitle="Temperature (°C)")
 
-        plot = weather_plots["Sky"]
-        fig = plot.figure
-        fig.update_yaxes(title_text="Temperature (°C)")
-        fig.data = []
-        t, v = await queryWeather(api, "ir_sky", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Sky Sky")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Sky", line={"color": "green"})
-        logger.debug("Done")
-        t, v = await queryWeather(api, "ir_diff", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Sky Difference")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Difference", line={"color": "orange"})
-        logger.debug("Done")
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "ir_sky", r, w)
+        t2, v2 = await queryWeather(api, "ir_diff", r, w)
+        await drawPlot("Sky", [
+                dict(x=t1, y=v1, mode="lines", name="Sky", line={"color": "green"}),
+                dict(x=t2, y=v2, mode="lines", name="Difference", line={"color": "orange"}),
+                ], yaxisTitle="Temperature (°C)")
 
-        plot = weather_plots["Wind"]
-        fig = plot.figure
-        fig.update_yaxes(title_text="Speed (km/h)")
-        fig.data = []
-        t, v = await queryWeather(api, "wind_speed", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Wind Speed")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Speed", line={"color": "green"})
-        logger.debug("Done")
-        t, v = await queryWeather(api, "wind_gust", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Wind Gust")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Gust", line={"color": "orange"})
-        logger.debug("Done")
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "wind_speed", r, w)
+        t2, v2 = await queryWeather(api, "wind_gust", r, w)
+        await drawPlot("Wind", [
+                dict(x=t1, y=v1, mode="lines", name="Speed", line={"color": "green"}),
+                dict(x=t2, y=v2, mode="lines", name="Gust", line={"color": "orange"}),
+                ], yaxisTitle="Speed (km/h)")
 
-        plot = weather_plots["Humidity"]
-        fig = plot.figure
-        fig.update_yaxes(title_text="Humidity (%)")
-        fig.data = []
-        t, v = await queryWeather(api, "env_humidity", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Humidity Air")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Air", line={"color": "green"})
-        logger.debug("Done")
-        t, v = await queryWeather(api, "inside_humidity", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Humidity Inside")
-        fig.add_scatter(x=t, y=v, mode="lines", name="Inside", line={"color": "orange"})
-        logger.debug("Done")
-        fig.update_layout(yaxis={"range": [0,100]})
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "env_humidity", r, w)
+        t2, v2 = await queryWeather(api, "inside_humidity", r, w)
+        await drawPlot("Humidity", [
+                dict(x=t1, y=v1, mode="lines", name="Air", line={"color": "green"}),
+                dict(x=t2, y=v2, mode="lines", name="Inside", line={"color": "orange"}),
+                ], layout=dict(yaxis={"range": [0, 100]}), yaxisTitle="Humidity (%)")
 
-        plot = weather_plots["SQM"]
-        fig = plot.figure
-        fig.update_yaxes(title_text="SQM (mag/arcsec^2)")
-        fig.data = []
-        t, v = await queryWeather(api, "sqm_mpsas", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting SQM SQM")
-        fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
-        logger.debug("Done")
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "sqm_mpsas", r, w)
+        await drawPlot("SQM", [
+                dict(x=t1, y=v1, mode="lines", line={"color": "green"}),
+                ], yaxisTitle="SQM (mag/arcsec^2)")
 
-        plot = weather_plots["Rain"]
-        fig = plot.figure
-        fig.data = []
-        t, v = await queryWeather(api, "rain_percentage", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Rain Amount")
-        fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Amount", line={"color": "green"})
-        logger.debug("Done")
-        t, v = await queryWeather(api, "rain_capacitance", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Rain Capacitance")
-        fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Capacitance", line={"color": "orange"})
-        logger.debug("Done")
-        fig.update_layout(
-                yaxis={"title": "Rain", "range": [0,100]},
-                yaxis2={
-                    "title": "Capacitance",
-                    "overlaying": "y",
-                    "side": "right",
-                    "range": [0,None],
-                    "gridcolor": '#555'
-                    }
-                )
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "rain_percentage", r, w)
+        t2, v2 = await queryWeather(api, "rain_capacitance", r, w)
+        await drawPlot("Rain", [
+                dict(x=t1, y=v1, yaxis="y", mode="lines", name="Amount",
+                     line={"color": "green"}),
+                dict(x=t2, y=v2, yaxis="y2", mode="lines", name="Capacitance",
+                     line={"color": "orange"}),
+                ], layout=dict(
+                    yaxis={"title": "Rain", "range": [0, 100]},
+                    yaxis2={
+                        "title": "Capacitance",
+                        "overlaying": "y",
+                        "side": "right",
+                        "range": [0, None],
+                        "gridcolor": '#555',
+                        },
+                    ))
 
-        plot = weather_plots["Pressure"]
-        fig = plot.figure
-        fig.update_yaxes(title_text="Pressure (hPa)")
-        fig.data = []
-        t, v = await queryWeather(api, "env_pressure", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Pressure Pressue")
-        fig.add_scatter(x=t, y=v, mode="lines", line={"color": "green"})
-        logger.debug("Done")
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "env_pressure", r, w)
+        await drawPlot("Pressure", [
+                dict(x=t1, y=v1, mode="lines", line={"color": "green"}),
+                ], yaxisTitle="Pressure (hPa)")
 
-        plot = weather_plots["Rain Heating"]
-        fig = plot.figure
-        fig.data = []
-        t, v = await queryWeather(api, "rain_dutycycle", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting RainHeating Dutycycle")
-        fig.add_scatter(x=t, y=v, yaxis="y", mode="lines", name="Dutycycle", line={"color": "green"})
-        logger.debug("Done")
-        t, v = await queryWeather(api, "rain_temperature", r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting RainHeating Temperature")
-        fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", name="Temperature", line={"color": "blue"})
-        logger.debug("Done")
-        fig.update_layout(
-                yaxis={"title": "Heating (%)", "range": [0,100]},
-                yaxis2={
-                    "title": "Temperature (°C)",
-                    "overlaying": "y",
-                    "side": "right",
-                    "gridcolor": '#555'
-                    }
-                )
-        await pushPlot(plot)
+        t1, v1 = await queryWeather(api, "rain_dutycycle", r, w)
+        t2, v2 = await queryWeather(api, "rain_temperature", r, w)
+        await drawPlot("Rain Heating", [
+                dict(x=t1, y=v1, yaxis="y", mode="lines", name="Dutycycle",
+                     line={"color": "green"}),
+                dict(x=t2, y=v2, yaxis="y2", mode="lines", name="Temperature",
+                     line={"color": "blue"}),
+                ], layout=dict(
+                    yaxis={"title": "Heating (%)", "range": [0, 100]},
+                    yaxis2={
+                        "title": "Temperature (°C)",
+                        "overlaying": "y",
+                        "side": "right",
+                        "gridcolor": '#555',
+                        },
+                    ))
 
         # --- equipment ------------------------------------------------------------
         #
@@ -5660,41 +5654,31 @@ def main():
         # are twenty-five fields against the weather's fifteen, and one call per field
         # would have roughly tripled the length of a pass.
 
-        plot = weather_plots["Roof"]
-        fig = plot.figure
-        fig.data = []
-        series = await queryState(api, ["roof_state", "position_west", "position_east"], r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Roof")
         # Step lines: the roof is in one state and then in another, and a slope between
         # two samples would draw a transition that never happened.
         #
         # position_roof is left out on purpose. It is UNKN whenever the halves disagree,
         # which on a chart showing both halves is the one thing already visible.
-        for field, label, colour in (
-                ("roof_state", "Roof", "white"),
-                ("position_west", "West", "green"),
-                ("position_east", "East", "orange"),
-                ):
-            t, v = series[field]
-            fig.add_scatter(x=t, y=v, mode="lines", line_shape="hv", name=label,
-                            line={"color": colour})
-        fig.update_layout(
-                showlegend = True,
-                yaxis = {
-                    "tickmode": "array",
-                    "tickvals": list(range(len(stateWords))),
-                    "ticktext": stateWords,
-                    "range": [-0.4, len(stateWords) - 0.6],
-                    "gridcolor": "#555",
-                    },
-                )
-        logger.debug("Done")
-        await pushPlot(plot)
+        series = await queryState(api, ["roof_state", "position_west", "position_east"], r, w)
+        await drawPlot("Roof", [
+                dict(x=series[field][0], y=series[field][1], mode="lines", line_shape="hv",
+                     name=label, line={"color": colour})
+                for field, label, colour in (
+                    ("roof_state", "Roof", "white"),
+                    ("position_west", "West", "green"),
+                    ("position_east", "East", "orange"),
+                    )
+                ], layout=dict(
+                    showlegend = True,
+                    yaxis = {
+                        "tickmode": "array",
+                        "tickvals": list(range(len(stateWords))),
+                        "ticktext": stateWords,
+                        "range": [-0.4, len(stateWords) - 0.6],
+                        "gridcolor": "#555",
+                        },
+                    ))
 
-        plot = weather_plots["Limit Switches"]
-        fig = plot.figure
-        fig.data = []
         # Ordered so a half's two ends sit together and the two halves mirror each other:
         # a roof closing evenly draws four lanes stepping in step, and one half lagging is
         # visible as exactly that rather than as four unrelated signals.
@@ -5709,16 +5693,10 @@ def main():
                 ("limit_east_open_south", "E open S", "orange"),
                 ]
         series = await queryState(api, [field for field, _, _ in limitFields], r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Limit Switches")
-        plotLanes(fig, [(label, series[field][0], series[field][1], colour)
-                        for field, label, colour in limitFields])
-        logger.debug("Done")
-        await pushPlot(plot)
+        traces, layout = laneTraces([(label, series[field][0], series[field][1], colour)
+                                     for field, label, colour in limitFields])
+        await drawPlot("Limit Switches", traces, layout=layout)
 
-        plot = weather_plots["Relays and Rods"]
-        fig = plot.figure
-        fig.data = []
         # The relays are what OMS did and the rods are what the firmware answered, so they
         # belong on one figure: a relay energized with a rod still out is the picture of a
         # motion that should not have started, and it takes both to see it.
@@ -5733,16 +5711,10 @@ def main():
                 ("rod_east_retracted", "E rod back", "cyan"),
                 ]
         series = await queryState(api, [field for field, _, _ in driveFields], r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Relays and Rods")
-        plotLanes(fig, [(label, series[field][0], series[field][1], colour)
-                        for field, label, colour in driveFields])
-        logger.debug("Done")
-        await pushPlot(plot)
+        traces, layout = laneTraces([(label, series[field][0], series[field][1], colour)
+                                     for field, label, colour in driveFields])
+        await drawPlot("Relays and Rods", traces, layout=layout)
 
-        plot = weather_plots["Switches and Fans"]
-        fig = plot.figure
-        fig.data = []
         switchFields = [
                 ("switch_pier", "Pier", "green"),
                 ("switch_cctv", "CCTV", "green"),
@@ -5752,18 +5724,17 @@ def main():
                 ]
         series = await queryState(
                 api, [field for field, _, _ in switchFields] + ["fans_mode"], r, w)
-        await asyncio.sleep(sleepTime)
-        logger.debug("Plotting Switches and Fans")
-        plotLanes(fig, [(label, series[field][0], series[field][1], colour)
-                        for field, label, colour in switchFields])
+        traces, layout = laneTraces([(label, series[field][0], series[field][1], colour)
+                                     for field, label, colour in switchFields])
         # fans_mode on its own axis rather than as a sixth lane: it has three values where
         # every lane has two, and it is the one series here that says what OMS was told
         # rather than what the hardware did. The same second-axis shape the Rain Heating
         # plot already uses.
         t, v = series["fans_mode"]
-        fig.add_scatter(x=t, y=v, yaxis="y2", mode="lines", line_shape="hv",
-                        name="Fan mode", line={"color": "yellow"})
-        fig.update_layout(
+        traces.append(dict(x=t, y=v, yaxis="y2", mode="lines", line_shape="hv",
+                           name="Fan mode", line={"color": "yellow"}))
+        layout = dict(layout)
+        layout.update(
                 showlegend = True,
                 yaxis2 = {
                     "tickmode": "array",
@@ -5775,8 +5746,7 @@ def main():
                     "gridcolor": "#555",
                     },
                 )
-        logger.debug("Done")
-        await pushPlot(plot)
+        await drawPlot("Switches and Fans", traces, layout=layout)
 
     # The plot pass currently in flight for this client, if any, and the lock that makes
     # replacing it one indivisible step.
@@ -5906,24 +5876,23 @@ def main():
 
         The axes are hidden along with the data: an empty grid with a note floating over
         it reads as a plot that failed to draw, rather than as one with nothing to draw.
-        Pushed through pushPlot() like any other pass, so blanking eight figures does not
-        stall the page any more than filling them does.
+        Built through drawPlot() like any other figure, so blanking twelve of them does not
+        stall the loop any more than filling them does.
         """
-        for plot in weather_plots.values():
-            plot.figure.data = []
-            plot.figure.update_layout(
-                    annotations=[dict(
-                        text=message,
-                        xref='paper', yref='paper',
-                        x=0.5, y=0.5,
-                        xanchor='center', yanchor='middle',
-                        showarrow=False,
-                        font=dict(size=16, color='gray'),
-                    )],
-                    xaxis=dict(visible=False),
-                    yaxis=dict(visible=False),
-                )
-            await pushPlot(plot)
+        layout = dict(
+                annotations=[dict(
+                    text=message,
+                    xref='paper', yref='paper',
+                    x=0.5, y=0.5,
+                    xanchor='center', yanchor='middle',
+                    showarrow=False,
+                    font=dict(size=16, color='gray'),
+                )],
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+            )
+        for title in weather_plots:
+            await drawPlot(title, [], layout=layout)
 
     async def _drawPlots():
         # One API for the whole pass, so the fifteen queries below are answered by one
@@ -5935,10 +5904,9 @@ def main():
                 # that swallowed its own error, so say what is missing and where to fix it.
                 await blankPlots('No database configured (see Settings)')
                 return
-            for plot in weather_plots.values():
-                plot.figure.layout.annotations = []
-                plot.figure.update_xaxes(visible=True)
-                plot.figure.update_yaxes(visible=True)
+            # No annotation to clear before drawing any more: every figure is built from
+            # scratch by buildFigure(), so a pass that follows a blanked one simply does
+            # not carry the message or the hidden axes forward.
             await _updatePlots(api)
             lastPlotDraw.set(time.monotonic())
         except Exception as e:
