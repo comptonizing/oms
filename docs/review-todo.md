@@ -27,10 +27,13 @@ by a `contains()` on the same key in the same expression.
 `sendRoofCommand`/`sendSwitchCommand` run on the main thread from `ISNewSwitch`
 (`oms.cpp:283`), `Move`, `Park`, `UnPark` and `Abort` — the same loop that has to read an
 Abort off the wire from indiserver. The poll thread exists precisely to keep that loop
-free, and this path was widened from 2 s to 5 s while fixing the poll timeouts. Give POSTs
-their own shorter budget: they hit endpoints that answer 202 as soon as the command is
-posted to a mailbox.
-**open**
+free, and this path was widened from 2 s to 5 s while fixing the poll timeouts.
+**open — but now sized by measurement rather than guesswork.** See the measurements below.
+A shorter budget for POSTs is still the change; 2 s is the defensible number now (3× the
+worst observed reply, 10× the p99) where before the fixes it would have been wrong,
+because the tail then reached 2.9 s and 2 s would have failed commands OMS was carrying
+out. Left open deliberately rather than closed: with the tail where it is, nothing is
+being harmed by the 5 s ceiling.
 
 **2. `CURLOPT_NOSIGNAL` was not set** while curl runs on two threads — the poll thread's
 GET every two seconds and the main thread's commands — and libcurl's signal use is
@@ -196,3 +199,46 @@ record cannot be clobbered. `drive()` is genuinely break-before-make with a dead
 `stopHalf()`/`stopMotion()` attempt every relay before reporting failures. The API
 validates every path parameter before use. `Motor::extend()`/`retract()` are
 break-before-make and the millis arithmetic is rollover-safe.
+
+
+---
+
+## Measurements against the real observatory, 2026-08-29/30
+
+Taken from konrad — the machine the driver runs on — so the numbers are over the driver's
+own network path. 1005 samples across a roof open and close, then three controlled runs
+after the fixes. `/api/v1/id` does no real work, so its latency is the queueing delay on
+OMS's event loop; `/api/v1/status` is the aggregate the driver actually polls.
+
+**What caused the original timeouts.** Not the roof. The tail was a stall every ~30 s,
+matching `weather_plot_refresh`, and it appeared the moment a browser opened the OMS page
+— before that, 206 consecutive samples came back under 21 ms. It went on at exactly that
+cadence whether the roof was moving or standing still, and the *closing* phase had the
+lowest maximum of any phase in the run. The single worst sample, 2932 ms, was the plot
+pass that runs when a client connects.
+
+**Roof motion, measured.** Both motions completed cleanly with the driver logging only
+`Dome is unparked.` / `Dome is parked.` — no timeouts, the three-poll tolerance never
+fired, `WEATHER_STATUS` green throughout. Open took ~95 s, close ~65 s, west-then-east and
+east-then-west as documented.
+
+**After the two plotting changes**, same driver, same OMS, only the browser differing:
+
+| | n | p50 | p99 | max | over 100 ms |
+|---|---|---|---|---|---|
+| browser closed | 235 | 9.3 | 22.1 | 27.1 ms | 0 |
+| open, Status tab | 468 | 8.7 | 94.1 | 385.7 ms | 4 |
+| open, Weather tab | 464 | 9.1 | 196.6 | 610.3 ms | 8 |
+
+Zero failed requests in every run. Worst case with the plots refreshing went from 2932 ms
+to 610 ms, and the clusters of three to five consecutive slow samples became isolated
+singles.
+
+**What remains, if it is ever worth chasing.** Having the page open at all costs up to
+~386 ms even with no plots drawing, so the residual is no longer figure building. It is
+spread across the query decoding (`queryWeather`/`queryState` build their lists on the
+loop, two `list()` copies per row, ~11,400 rows a pass), NiceGUI's outbox serialising each
+payload onto the websocket, and the non-plot timers. The structural answer — serving the
+API from its own event loop on its own port, so the driver cannot be affected by anything
+the UI does — was raised and deliberately not taken: at 610 ms worst against a 5 s budget,
+nothing is being harmed.
