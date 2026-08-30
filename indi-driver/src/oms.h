@@ -301,6 +301,17 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // away is reported while it still matters.
         static constexpr unsigned STATUS_POLL_FAILURES_BEFORE_ERROR {3};
 
+        // How long a motion this driver has just asked for may go unconfirmed by OMS
+        // before a settled reading is believed over the command. See m_pendingMotion for
+        // what is being waited out; this only bounds the wait, for the case where OMS
+        // never starts the motion at all - a command dropped as stale by
+        // executeMotionCommand(), or one refused by a check the POST did not run. Ten
+        // seconds is five polls of this driver and twenty of OMS's roof worker, which is
+        // far longer than the half-second it normally takes a posted command to reach the
+        // state machine, and short enough that a roof which is not going to move says so
+        // while the client that asked is still acting on the answer.
+        static constexpr std::chrono::seconds MOTION_START_GRACE {10};
+
         // How often the inside reading may complain that it cannot be decoded. It is the
         // one error on the poll path that a *steady* condition produces rather than a
         // changing one - an environment sensor that has never answered leaves both fields
@@ -334,6 +345,34 @@ class OMS : public INDI::Dome, public INDI::WeatherInterface {
         // Consecutive failed /api/v1/status polls, main thread only like m_roofHeldShut.
         // Reset by the first reply that arrives.
         unsigned m_statusPollFailures = 0;
+
+        // The motion this driver has asked OMS for and not yet seen in OMS's own answer,
+        // and when it was asked for. Main thread only, like the two above: Move() sets it,
+        // applyRoofState() clears it.
+        //
+        // It exists because a command and a reading race, and the reading is older. The
+        // poll thread fetches /api/v1/status every ROOF_POLL_MS and TimerHit() applies
+        // whatever it last fetched, so the first reading applied after a command left on
+        // the main thread can be one taken up to a full poll period *before* it - and OMS
+        // needs a moment of its own besides, since requestRoofMotion() posts to the roof
+        // worker's mailbox rather than driving anything on the API's thread. Both windows
+        // report the roof exactly as it was: still closed when an open has just been
+        // asked for, still open when a close has.
+        //
+        // Reported straight through, that reading is not merely stale, it is a *settled*
+        // state - and this driver's whole contract with a client is that closed means
+        // parked and open means unparked, which is to say "the roof is where you asked it
+        // to be, go ahead". So an unpark that was correctly reported as busy flipped back
+        // to parked (and a park to unparked) for one tick, immediately after the command,
+        // which is the worst possible moment: it is the tick every client is watching to
+        // learn whether the roof moved.
+        //
+        // So a settled reading that contradicts a command this driver has just issued is
+        // held to be what it is - a picture taken before the shutter was pressed - and the
+        // roof is reported as moving until OMS confirms one way or the other.
+        enum class PendingMotion { NONE, OPEN, CLOSE };
+        PendingMotion m_pendingMotion {PendingMotion::NONE};
+        std::chrono::steady_clock::time_point m_pendingSince {};
 
         // When the inside reading last complained, and whether it has at all since it was
         // last readable. Both main thread only. The flag is what makes a reading that

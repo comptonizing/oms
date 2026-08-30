@@ -62,6 +62,46 @@ when nothing had been published at all — so a first connect to a healthy OMS a
 whose first reading is already unusable says so. Verified across all three first-connect
 cases (healthy, roof held, reading stale).
 
+**3a. A settled roof state could be reported for one tick immediately after a motion was
+commanded.** `oms.cpp` `applyRoofState()`
+Found on the first live run under Ekos, 2026-08-30: an open was issued and the roof was
+reported as at rest a moment later, while it was in fact still travelling.
+
+A command and a reading race, and the reading is older. The poll thread fetches
+`/api/v1/status` every `ROOF_POLL_MS` and `TimerHit()` applies whatever it last fetched,
+so the first reading applied after a command has left the main thread can be one taken up
+to a full poll period *before* it — and OMS needs a moment of its own besides, since
+`requestRoofMotion()` posts to the roof worker's mailbox rather than driving anything on
+the API's thread. Both windows report the roof exactly as it was: still `closed` when an
+open has just been asked for, still `open` when a close has.
+
+Reported straight through, that reading is not merely stale, it is a *settled* state — and
+`closed` means `DOME_PARKED` and `open` means `DOME_UNPARKED`, which is `ParkSP` in
+`IPS_OK`, which is this driver telling every client the roof is where it was asked to be.
+So an unpark correctly reported as `IPS_BUSY` flipped back to parked (and a park to
+unparked) for one tick at the worst possible moment: the tick every client is watching to
+learn whether the roof moved.
+
+**done** — `Move()` records what it asked for in `m_pendingMotion`; `applyRoofState()`
+holds a settled reading that contradicts it, reporting `opening`/`closing` instead, until
+OMS's own answer catches up (`opening`/`closing`, or the target position for a motion that
+finished inside the window). `fault` and `disengaged` clear the flag at once — neither can
+be mistaken for the roof having arrived, and both are things a client must hear
+immediately. `Abort()` clears it, and so does `Connect()`, per **3**. A motion OMS never
+starts is bounded by `MOTION_START_GRACE` (10 s, five of this driver's polls and twenty of
+OMS's roof worker's), after which the reading is believed and the write-off logged.
+
+Two adjacent fixes went in with it. `DomeMotionSP` was left in `IPS_BUSY` after a motion
+that ended on the `setDomeState()` branch rather than through `SetParked()` — the latter
+clears it on its way through `DOME_IDLE`, the former does not — and `ISD::Dome::isMoving()`
+is exactly that property's state, which the scheduler holds a job on after every slew. And
+every branch now re-publishes only when what the client has been told does not already
+match — `setDomeState()` applies `ParkSP` unconditionally, and a roof takes 65–95 s to
+travel, so the unguarded `opening`/`closing` branches were a set on the wire every two
+seconds for the whole of a motion saying nothing the first one didn't. The guard tests the
+dome state *and* `ParkSP`, because a failed `Abort()` resets `ParkSP` without touching the
+dome state, and the wrong one to trust there is the one the client cannot see.
+
 ## Driver — noise and hygiene
 
 **4. `Error accessing environment fields` logged every poll.** `oms.cpp`

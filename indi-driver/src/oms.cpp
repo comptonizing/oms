@@ -78,6 +78,7 @@ bool OMS::Connect() {
     m_weatherHave = false;
     m_weatherReported = true;
     m_roofHeldShut = false;
+    m_pendingMotion = PendingMotion::NONE;
 
     pollStatus();
     startPolling();
@@ -507,6 +508,10 @@ IPState OMS::Move(DomeDirection dir, DomeMotionCommand operation) {
         LOGF_ERROR("Could not request roof %s", command.c_str());
         return IPS_ALERT;
     }
+    // Remembered until a poll shows OMS acting on it, so that the readings taken before
+    // it are not reported as the roof having arrived. See m_pendingMotion in oms.h.
+    m_pendingMotion = dir == DOME_CW ? PendingMotion::OPEN : PendingMotion::CLOSE;
+    m_pendingSince = std::chrono::steady_clock::now();
     LOGF_INFO("Roof %s requested.", command.c_str());
     return IPS_BUSY;
 }
@@ -537,6 +542,12 @@ bool OMS::Abort() {
         LOG_ERROR("Could not request roof stop");
         return false;
     }
+    // Whatever was asked for is not going to happen now, so nothing about the roof's own
+    // state may be suppressed on its account any more. Cleared even though the stop may
+    // land mid-travel and leave the roof between its switches - OMS reports that as a
+    // fault, which the client needs to be told about promptly rather than after a grace
+    // period spent waiting for a motion that was just cancelled.
+    m_pendingMotion = PendingMotion::NONE;
     LOG_INFO("Roof stop requested.");
     return true;
 }
@@ -749,26 +760,96 @@ void OMS::applyRoofState(const json &data) {
         }
     }
 
+    // What the roof is reported as doing, which is the reading unless this driver knows
+    // something about it that the reading cannot: that a motion was commanded after it was
+    // taken. See m_pendingMotion in oms.h for why that case exists and why it matters.
+    std::string motion = state;
+    if ( m_pendingMotion != PendingMotion::NONE ) {
+        const bool opening = m_pendingMotion == PendingMotion::OPEN;
+        const char *asked = opening ? "open" : "close";
+        // OMS has picked the command up: it is either moving the roof or has already
+        // finished. Either way its own answer is now newer than the command, and there is
+        // nothing left to hold back.
+        if ( state == (opening ? "opening" : "closing") || state == (opening ? "open" : "closed") ) {
+            m_pendingMotion = PendingMotion::NONE;
+        } else if ( state == "open" || state == "closed" ) {
+            // Settled at the end the roof is being asked to leave. Either the reading
+            // predates the command or OMS has not started on it yet, and in neither case
+            // has the roof arrived anywhere - so it is reported as moving, which is what
+            // it is about to be doing.
+            auto waited = std::chrono::steady_clock::now() - m_pendingSince;
+            if ( waited < MOTION_START_GRACE ) {
+                motion = opening ? "opening" : "closing";
+            } else {
+                // Long enough that OMS would have started by now if it were going to.
+                // The command is written off and the roof reported where it actually is,
+                // which is where it was when it was asked to move.
+                LOGF_WARN("OMS has not started the roof %s after %d seconds; "
+                        "reporting the roof as %s.", asked,
+                        static_cast<int>(MOTION_START_GRACE.count()), state.c_str());
+                m_pendingMotion = PendingMotion::NONE;
+            }
+        } else {
+            // "fault", "disengaged", or a word this driver doesn't know. None of those is
+            // a settled position that could be mistaken for the roof having arrived, and
+            // all of them are things the client has to hear about at once rather than
+            // after a grace period - a disengaged roof is not going to move at all.
+            m_pendingMotion = PendingMotion::NONE;
+        }
+    }
+
     // roofDecisiveState() on the OMS side already reduces everything the board and the
     // relays can say to one of six words (see RoofStatus in oms/oms); mirror that directly
     // rather than re-deriving it from limit switches, which the driver never sees.
-    if ( state == "open" ) {
+    //
+    // Only "open" and "closed" - the roof at rest on its switches - are reported as
+    // unparked and parked. A roof in motion is DOME_UNPARKING/DOME_PARKING, which is
+    // ParkSP in IPS_BUSY: Ekos reads that as PARK_UNPARKING/PARK_PARKING and holds off
+    // until it clears, where an OK would tell it the roof was where it asked for and the
+    // observation could start over a roof that is still half shut.
+    //
+    // Each branch re-publishes only when what the client has been told does not already
+    // match, since setDomeState() applies ParkSP unconditionally and a roof takes 65-95 s
+    // to travel - unguarded, that is a set on the wire every two seconds for the whole of
+    // a motion, saying nothing the first one didn't. Both halves of the condition are
+    // needed: they normally move together, but a failed Abort() resets ParkSP without
+    // touching the dome state, and the wrong one to trust there is the one the client
+    // cannot see.
+    if ( motion == "open" ) {
         if ( isParked() ) {
             SetParked(false);
-        } else if ( getDomeState() != DOME_UNPARKED ) {
+        } else if ( getDomeState() != DOME_UNPARKED || ParkSP.getState() != IPS_OK ) {
             setDomeState(DOME_UNPARKED);
         }
-    } else if ( state == "closed" ) {
+        // SetParked() clears this on its way through DOME_IDLE, but the branch above it
+        // does not, and DomeMotionSP left in IPS_BUSY is a roof Ekos never stops waiting
+        // for - ISD::Dome::isMoving() is exactly that property's state, and the scheduler
+        // holds a job at "the dome is still moving" on it after every slew.
+        if ( DomeMotionSP.getState() == IPS_BUSY ) {
+            DomeMotionSP.reset();
+            DomeMotionSP.setState(IPS_IDLE);
+            DomeMotionSP.apply();
+        }
+    } else if ( motion == "closed" ) {
         if ( ! isParked() ) {
             SetParked(true);
-        } else if ( getDomeState() != DOME_PARKED ) {
+        } else if ( getDomeState() != DOME_PARKED || ParkSP.getState() != IPS_OK ) {
             setDomeState(DOME_PARKED);
         }
-    } else if ( state == "opening" ) {
-        setDomeState(DOME_UNPARKING);
-    } else if ( state == "closing" ) {
-        setDomeState(DOME_PARKING);
-    } else if ( state == "disengaged" ) {
+        if ( DomeMotionSP.getState() == IPS_BUSY ) {
+            DomeMotionSP.reset();
+            DomeMotionSP.setState(IPS_IDLE);
+            DomeMotionSP.apply();
+        }
+    } else if ( motion == "opening" ) {
+        if ( getDomeState() != DOME_UNPARKING || ParkSP.getState() != IPS_BUSY ) {
+            setDomeState(DOME_UNPARKING);
+        }
+    } else if ( motion == "closing" ) {
+        if ( getDomeState() != DOME_PARKING || ParkSP.getState() != IPS_BUSY ) {
+            setDomeState(DOME_PARKING);
+        }
+    } else if ( motion == "disengaged" ) {
         if ( getDomeState() != DOME_UNKNOWN ) {
             LOGF_WARN("Roof is disengaged: %s", reason.empty() ? "safety checks are off" : reason.c_str());
         }
